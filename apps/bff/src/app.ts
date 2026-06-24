@@ -1,0 +1,198 @@
+import cors from '@fastify/cors';
+import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
+import { ZodError, z } from 'zod';
+import { buildAuthenticator, requireActor } from './auth.js';
+import type { Config } from './config.js';
+import { Database } from './db.js';
+import { AppError } from './errors.js';
+import { TenderPrepDatabase } from './tenderPrepDb.js';
+
+const uuid = z.string().uuid();
+
+function body<T extends z.ZodTypeAny>(request: FastifyRequest, schema: T): z.infer<T> {
+  return schema.parse(request.body);
+}
+
+function query<T extends z.ZodTypeAny>(request: FastifyRequest, schema: T): z.infer<T> {
+  return schema.parse(request.query);
+}
+
+function params<T extends z.ZodTypeAny>(request: FastifyRequest, schema: T): z.infer<T> {
+  return schema.parse(request.params);
+}
+
+declare module 'fastify' {
+  interface FastifyInstance {
+    tps: { config: Config; db: Database; tpDb: TenderPrepDatabase };
+  }
+}
+
+export async function createApp(config: Config): Promise<FastifyInstance> {
+  const app = Fastify({ logger: { level: config.LOG_LEVEL } });
+  const db = new Database(config);
+  const tpDb = new TenderPrepDatabase(db);
+
+  app.decorate('tps', { config, db, tpDb });
+  await app.register(cors, { origin: config.WEB_ORIGIN, credentials: false });
+
+  app.setErrorHandler((error, _request, reply) => {
+    if (error instanceof ZodError) return reply.status(422).send({ error: 'VALIDATION_FAILED', message: error.issues.map((i) => i.message).join('; ') });
+    if (error instanceof AppError) return reply.status(error.statusCode).send({ error: error.code, message: error.message });
+    const statusCode = (error as { statusCode?: unknown }).statusCode;
+    if (typeof statusCode === 'number' && statusCode >= 400 && statusCode < 500) {
+      return reply.status(statusCode).send({ error: 'REQUEST_FAILED', message: error instanceof Error ? error.message : 'Invalid request' });
+    }
+    app.log.error(error);
+    return reply.status(500).send({ error: 'INTERNAL_ERROR', message: 'An unexpected error occurred' });
+  });
+
+  app.addHook('onClose', async () => { await db.close(); });
+  app.get('/health', async () => ({ status: 'ok', service: 'tps-bff' }));
+
+  await app.register(async (protectedApi) => {
+    protectedApi.addHook('preHandler', buildAuthenticator(config, db));
+
+    // ── Workflow lifecycle ──────────────────────────────────────────────────
+
+    protectedApi.post('/api/packages/:packageId/tender-prep', async (request, reply) => {
+      const { packageId } = params(request, z.object({ packageId: uuid }));
+      return reply.status(201).send(await tpDb.createWorkflow(requireActor(request), packageId));
+    });
+
+    protectedApi.get('/api/tender-prep/:workflowId', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.getWorkflow(requireActor(request), workflowId);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/advance', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.advanceStep(requireActor(request), workflowId);
+    });
+
+    // ── Step 2: RFIs ────────────────────────────────────────────────────────
+
+    protectedApi.get('/api/tender-prep/:workflowId/rfis', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.listRfis(requireActor(request), workflowId);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/rfis', async (request, reply) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const input = body(request, z.object({ description: z.string().trim().min(1).max(2000) }));
+      return reply.status(201).send(await tpDb.createRfi(requireActor(request), workflowId, input));
+    });
+
+    protectedApi.patch('/api/tender-prep/rfis/:rfiId', async (request) => {
+      const { rfiId } = params(request, z.object({ rfiId: uuid }));
+      const patch = body(request, z.object({
+        status: z.enum(['open', 'responded', 'closed']).optional(),
+        employerResponse: z.string().trim().max(4000).optional()
+      }));
+      return tpDb.updateRfi(requireActor(request), rfiId, patch);
+    });
+
+    // ── Step 3: SoA RAG ─────────────────────────────────────────────────────
+
+    protectedApi.get('/api/tender-prep/:workflowId/soa-rag', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.getSoaRag(requireActor(request), workflowId);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/soa-rag', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const { rows } = body(request, z.object({
+        rows: z.array(z.object({
+          clauseRef: z.string().trim().min(1).max(120),
+          amendmentText: z.string().trim().max(4000).optional(),
+          ragStatus: z.enum(['red', 'amber', 'green']),
+          jctNec4Ref: z.string().trim().max(120).optional(),
+          commentary: z.string().trim().max(4000).optional()
+        }))
+      }));
+      return tpDb.upsertSoaRag(requireActor(request), workflowId, rows);
+    });
+
+    // ── Step 4: Shortlist ───────────────────────────────────────────────────
+
+    protectedApi.get('/api/tender-prep/:workflowId/shortlist', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.getShortlists(requireActor(request), workflowId);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/shortlist/confirm', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const input = body(request, z.object({
+        tradeCategory: z.string().trim().min(1).max(120),
+        boardOverrideNotes: z.string().trim().max(2000).optional(),
+        entries: z.array(z.object({
+          subcontractorId: uuid,
+          rank: z.number().int().min(1).max(5),
+          performanceScore: z.number().min(0).max(100).optional(),
+          complianceFlags: z.record(z.unknown()).optional()
+        })).min(1).max(5)
+      }));
+      return tpDb.confirmShortlist(requireActor(request), workflowId, input);
+    });
+
+    // ── Step 5: ITT Dispatch ────────────────────────────────────────────────
+
+    protectedApi.get('/api/tender-prep/:workflowId/itt', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.listIttDispatch(requireActor(request), workflowId);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/itt/dispatch', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.dispatchItt(requireActor(request), workflowId);
+    });
+
+    protectedApi.patch('/api/tender-prep/itt/:dispatchId', async (request) => {
+      const { dispatchId } = params(request, z.object({ dispatchId: uuid }));
+      const { response } = body(request, z.object({ response: z.enum(['will_tender', 'decline', 'considering', 'no_response']) }));
+      return tpDb.recordIttResponse(requireActor(request), dispatchId, response);
+    });
+
+    // ── Step 6: Comparative ─────────────────────────────────────────────────
+
+    protectedApi.get('/api/tender-prep/:workflowId/comparative', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.listComparative(requireActor(request), workflowId);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/comparative', async (request, reply) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const input = body(request, z.object({
+        tendererName: z.string().trim().min(1).max(240),
+        tenderedSum: z.number().min(0).optional(),
+        estimateSum: z.number().min(0).optional(),
+        scopeCompliance: z.record(z.unknown()).optional(),
+        qualifications: z.string().trim().max(4000).optional(),
+        recommendation: z.string().trim().max(2000).optional()
+      }));
+      return reply.status(201).send(await tpDb.upsertComparative(requireActor(request), workflowId, input));
+    });
+
+    // ── Step 7: Submission ──────────────────────────────────────────────────
+
+    protectedApi.get('/api/tender-prep/:workflowId/submission', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.getSubmission(requireActor(request), workflowId);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/submission', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const input = body(request, z.object({
+        packages: z.array(z.record(z.unknown())),
+        aggregateTotal: z.number().min(0).optional()
+      }));
+      return tpDb.saveSubmission(requireActor(request), workflowId, input);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/submission/approve', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.boardApproveSubmission(requireActor(request), workflowId);
+    });
+  });
+
+  return app;
+}

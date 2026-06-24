@@ -1,0 +1,28 @@
+{
+  "name": "@tps/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "24.13.1" },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.66.0",
+    "oidc-client-ts": "^3.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.1.5"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.8",
+    "@types/react-dom": "^19.0.3",
+    "@vitejs/plugin-react": "^4.4.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.1.0",
+    "vitest": "^3.0.5"
+  }
+}
