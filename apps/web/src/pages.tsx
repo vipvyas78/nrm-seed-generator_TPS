@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { FormEvent, useState } from 'react';
 import { Outlet, useNavigate, useParams } from 'react-router-dom';
-import { api, type IttDispatch, type SoaRagRow, type TenderComparative, type TenderPrepWorkflow } from './api';
+import { api, type IttDispatch, type ShortlistCandidate, type SoaRagRow, type TenderComparative, type TenderPrepWorkflow } from './api';
 import { oidc, signIn } from './auth';
 
 function ErrorMessage({ error }: { error: unknown }) {
@@ -246,19 +246,67 @@ function Step3SoaRag({ workflowId }: { workflowId: string }) {
 
 // ── Step 4: Tender Launch Pack ─────────────────────────────────────────────
 
+const MAX_SHORTLIST = 5;
+
+/** PQQ state and insurance cover are shown, not enforced — the buyer weighs them. */
+function ComplianceBadges({ flags }: { flags: ShortlistCandidate['compliance_flags'] }) {
+  const pqqTone = flags.pqq_status === 'approved' ? 'green' : flags.pqq_status === 'submitted' ? 'amber' : 'grey';
+  return <span className="badge-row">
+    <span className={`badge badge-${pqqTone}`}>PQQ {flags.pqq_status.replace('_', ' ')}</span>
+    <span className={`badge badge-${flags.cis_status === 'UNKNOWN' ? 'grey' : 'green'}`}>CIS {flags.cis_status}</span>
+    <span className={`badge badge-${flags.pl_active ? 'green' : 'red'}`} title={flags.pl_expiry ? `Expires ${flags.pl_expiry}` : 'No expiry recorded'}>
+      PL {flags.pl_active ? 'active' : 'lapsed'}
+    </span>
+    <span className={`badge badge-${flags.el_active ? 'green' : 'red'}`} title={flags.el_expiry ? `Expires ${flags.el_expiry}` : 'No expiry recorded'}>
+      EL {flags.el_active ? 'active' : 'lapsed'}
+    </span>
+    {flags.at_risk && <span className="badge badge-red">At risk</span>}
+    {flags.accreditations.map((a) => <span key={a} className="badge badge-blue">{a}</span>)}
+  </span>;
+}
+
 function Step4TenderLaunchPack({ workflowId }: { workflowId: string }) {
   const queryClient = useQueryClient();
+  const [search, setSearch] = useState('');
+  const [trade, setTrade] = useState<string | null>(null);
+  // Selection order is the ranking: first picked is rank 1.
+  const [picked, setPicked] = useState<string[]>([]);
+  const [notes, setNotes] = useState('');
+
+  const trades = useQuery({ queryKey: ['trades', search], queryFn: () => api.listTrades(search || undefined) });
   const shortlists = useQuery({ queryKey: ['shortlists', workflowId], queryFn: () => api.getShortlists(workflowId) });
+  const candidates = useQuery({
+    queryKey: ['candidates', workflowId, trade],
+    queryFn: () => api.getShortlistCandidates(workflowId, trade!),
+    enabled: Boolean(trade)
+  });
 
   const lock = useMutation({
-    mutationFn: (tradeCategory: string) => api.confirmShortlist(workflowId, {
-      tradeCategory,
-      entries: shortlists.data?.find((s) => s.trade_category === tradeCategory)?.entries.map((e) => ({
-        subcontractorId: e.subcontractor_id, rank: e.rank, performanceScore: e.performance_score
-      })) ?? []
+    mutationFn: () => api.confirmShortlist(workflowId, {
+      tradeCategory: trade!,
+      boardOverrideNotes: notes.trim() || undefined,
+      entries: picked.map((id, i) => {
+        const c = candidates.data?.find((x) => x.subcontractor_id === id);
+        return {
+          subcontractorId: id,
+          rank: i + 1,
+          // NUMERIC arrives as a string, and stays absent when the firm is unrated.
+          performanceScore: c?.performance_score != null ? Number(c.performance_score) : undefined,
+          complianceFlags: c?.compliance_flags
+        };
+      })
     }),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['shortlists', workflowId] })
+    onSuccess: () => {
+      setPicked([]); setTrade(null); setNotes(''); setSearch('');
+      void queryClient.invalidateQueries({ queryKey: ['shortlists', workflowId] });
+    }
   });
+
+  const toggle = (id: string) => setPicked((p) =>
+    p.includes(id) ? p.filter((x) => x !== id) : p.length >= MAX_SHORTLIST ? p : [...p, id]);
+
+  const selectTrade = (t: string) => { setTrade(t); setPicked([]); };
+  const alreadyLocked = new Set(shortlists.data?.map((s) => s.trade_category));
 
   return <div>
     <div className="panel">
@@ -266,27 +314,90 @@ function Step4TenderLaunchPack({ workflowId }: { workflowId: string }) {
       <p className="muted">Tender programme Gantt — phase milestones will be displayed here.</p>
       <div className="gantt-placeholder">Programme chart will be rendered here in a future release.</div>
     </div>
+
     <div className="panel">
-      <h3>SCMS Shortlists by Trade</h3>
+      <h3>Select a Trade</h3>
+      <p className="muted">Trades are read from SCMS. The count is the number of firms eligible to be invited.</p>
+      <div className="inline-form" style={{ marginBottom: 12 }}>
+        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search trades, e.g. Groundworks…" />
+      </div>
+      {trades.isLoading ? <Busy />
+        : trades.error ? <ErrorMessage error={trades.error} />
+        : trades.data?.length === 0 ? <p className="muted">No trades match “{search}”.</p>
+        : <div className="trade-chips">
+            {trades.data?.map((t) => <button
+              key={t.trade_category}
+              className={`trade-chip ${trade === t.trade_category ? 'active' : ''}`}
+              onClick={() => selectTrade(t.trade_category)}>
+              {t.trade_category}
+              <span className="trade-count">{t.candidate_count}</span>
+              {alreadyLocked.has(t.trade_category) && <span className="badge badge-green">locked</span>}
+            </button>)}
+          </div>}
+    </div>
+
+    {trade && <div className="panel">
+      <div className="shortlist-header">
+        <h3>{trade} — Candidates</h3>
+        <span className="muted">{picked.length} of {MAX_SHORTLIST} selected</span>
+      </div>
+      {candidates.isLoading ? <Busy />
+        : candidates.error ? <ErrorMessage error={candidates.error} />
+        : candidates.data?.length === 0 ? <p className="muted">No eligible firms carry this trade in SCMS.</p>
+        : <>
+          <table className="data-table">
+            <thead><tr><th>Rank</th><th>Subcontractor</th><th>Performance</th><th>Profile</th><th>Compliance</th></tr></thead>
+            <tbody>{candidates.data?.map((c) => {
+              const at = picked.indexOf(c.subcontractor_id);
+              return <tr key={c.subcontractor_id} className={at >= 0 ? 'row-done' : ''}>
+                <td>
+                  <button
+                    className={`rank-toggle ${at >= 0 ? 'active' : ''}`}
+                    disabled={at < 0 && picked.length >= MAX_SHORTLIST}
+                    onClick={() => toggle(c.subcontractor_id)}>
+                    {at >= 0 ? `#${at + 1}` : 'Add'}
+                  </button>
+                </td>
+                <td>
+                  <strong>{c.name}</strong>
+                  {c.trading_as && <span className="muted"> t/a {c.trading_as}</span>}
+                </td>
+                <td>{c.performance_score != null
+                  ? <>{Number(c.performance_score).toFixed(1)} <span className="muted">({c.ratings_count})</span></>
+                  : <span className="muted">Unrated</span>}</td>
+                <td>{c.profile_completeness_pct}%</td>
+                <td><ComplianceBadges flags={c.compliance_flags} /></td>
+              </tr>;
+            })}</tbody>
+          </table>
+          <div className="inline-form" style={{ marginTop: 12 }}>
+            <input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Board override notes (optional)…" />
+            <button onClick={() => lock.mutate()} disabled={picked.length === 0 || lock.isPending}>
+              {lock.isPending ? 'Locking…' : `Lock Shortlist (${picked.length})`}
+            </button>
+          </div>
+          <ErrorMessage error={lock.error} />
+        </>}
+    </div>}
+
+    <div className="panel">
+      <h3>Locked Shortlists</h3>
       {shortlists.isLoading ? <Busy />
-        : shortlists.data?.length === 0 ? <p className="muted">No shortlists available. Ensure subcontractors in SCMS have approved PQQ status.</p>
+        : shortlists.data?.length === 0 ? <p className="muted">Nothing locked yet. Pick a trade above to build a shortlist.</p>
         : shortlists.data?.map((sl) => <div key={sl.trade_category} className="shortlist-card">
           <div className="shortlist-header">
             <h4>{sl.trade_category}</h4>
-            {sl.confirmed_at
-              ? <span className="badge badge-green">Locked {new Date(sl.confirmed_at).toLocaleDateString()}</span>
-              : <button className="small" onClick={() => lock.mutate(sl.trade_category)} disabled={lock.isPending}>Lock Shortlist</button>}
+            {sl.confirmed_at && <span className="badge badge-green">Locked {new Date(sl.confirmed_at).toLocaleDateString()}</span>}
           </div>
-          {sl.entries.length > 0
-            ? <table className="data-table"><thead><tr><th>Rank</th><th>Subcontractor ID</th><th>Performance Score</th><th>Board Approved</th></tr></thead>
-                <tbody>{sl.entries.map((e) => <tr key={e.id}>
-                  <td>#{e.rank}</td>
-                  <td><code>{e.subcontractor_id}</code></td>
-                  <td>{e.performance_score ?? '—'}</td>
-                  <td>{e.board_approved ? <span className="badge badge-green">Yes</span> : <span className="badge badge-grey">Pending</span>}</td>
-                </tr>)}</tbody>
-              </table>
-            : <p className="muted" style={{ fontSize: '0.8rem' }}>No ranked entries — shortlist data populated from SCMS.</p>}
+          {sl.board_override_notes && <p className="muted" style={{ fontSize: '0.8rem' }}>{sl.board_override_notes}</p>}
+          <table className="data-table"><thead><tr><th>Rank</th><th>Subcontractor ID</th><th>Performance Score</th><th>Board Approved</th></tr></thead>
+            <tbody>{sl.entries.map((e) => <tr key={e.id}>
+              <td>#{e.rank}</td>
+              <td><code>{e.subcontractor_id}</code></td>
+              <td>{e.performance_score ?? <span className="muted">Unrated</span>}</td>
+              <td>{e.board_approved ? <span className="badge badge-green">Yes</span> : <span className="badge badge-grey">Pending</span>}</td>
+            </tr>)}</tbody>
+          </table>
         </div>)}
     </div>
   </div>;

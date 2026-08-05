@@ -7,6 +7,13 @@ const schema = z.object({
   PORT: z.coerce.number().int().positive().default(3200),
   HOST: z.string().default('0.0.0.0'),
   DATABASE_URL: z.string().min(1),
+  // Interpolated into a connection startup string and into CREATE SCHEMA, so it is
+  // constrained to a bare SQL identifier rather than accepting arbitrary text.
+  DATABASE_SCHEMA: z.string().regex(/^[a-z_][a-z0-9_]*$/, 'DATABASE_SCHEMA must be a bare SQL identifier').default('tps'),
+  // SCMS owns this schema in the same database. TPS reads it directly (Step 4 shortlist
+  // candidates) rather than calling the SCMS BFF, so the name is interpolated into SQL
+  // and carries the same bare-identifier constraint as DATABASE_SCHEMA above.
+  SCMS_SCHEMA: z.string().regex(/^[a-z_][a-z0-9_]*$/, 'SCMS_SCHEMA must be a bare SQL identifier').default('scms'),
   WEB_ORIGIN: z.string().url().default('http://localhost:5175'),
   OIDC_ISSUER: optionalUrl,
   OIDC_AUDIENCE: z.string().optional(),
@@ -14,7 +21,6 @@ const schema = z.object({
   OIDC_ORGANIZATION_CLAIM: z.string().default('organization_id'),
   AUTH_DISABLED: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
   TOKEN_ENCRYPTION_KEY: z.string().min(1),
-  SCMS_BFF_URL: z.string().url().default('http://localhost:3100'),
   ENGINE_INTERNAL_URL: optionalUrl,
   ENGINE_INTERNAL_TOKEN: z.string().optional(),
   LOG_LEVEL: z.string().default('info')

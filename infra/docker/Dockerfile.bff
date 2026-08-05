@@ -2,7 +2,7 @@ FROM node:24-alpine AS builder
 WORKDIR /app
 COPY package.json pnpm-workspace.yaml ./
 COPY apps/bff/package.json ./apps/bff/
-RUN corepack enable && pnpm install --frozen-lockfile
+RUN corepack enable && pnpm install --no-frozen-lockfile
 COPY tsconfig.base.json ./
 COPY apps/bff ./apps/bff
 RUN pnpm --filter @tps/bff build
@@ -11,5 +11,6 @@ FROM node:24-alpine
 WORKDIR /app/apps/bff
 COPY --from=builder /app/apps/bff/dist ./dist
 COPY --from=builder /app/node_modules ../../node_modules
+COPY --from=builder /app/apps/bff/node_modules ./node_modules
 COPY database ./../../database
 CMD ["node", "dist/server.js"]

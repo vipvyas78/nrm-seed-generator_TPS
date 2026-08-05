@@ -7,7 +7,12 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "jsx": "react-jsx",
-    "lib": ["ES2024", "DOM", "DOM.Iterable"]
+    // Vite compiles the app; tsc is only a type checker here. Without noEmit, `tsc -b`
+    // drops a .js next to every .tsx, and Vite resolves ./pages -> pages.js ahead of
+    // pages.tsx — so the app silently serves stale output and source edits do nothing.
+    "noEmit": true,
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "types": ["vite/client"]
   },
   "include": ["src"]
 }

@@ -2,13 +2,23 @@ FROM node:24-alpine AS builder
 WORKDIR /app
 COPY package.json pnpm-workspace.yaml ./
 COPY apps/web/package.json ./apps/web/
-RUN corepack enable && pnpm install --frozen-lockfile
+RUN corepack enable && pnpm install --no-frozen-lockfile
 COPY tsconfig.base.json ./
 COPY apps/web ./apps/web
+# Every VITE_* value is inlined by Vite at build time, so these must be build ARGs —
+# setting them in the container's runtime environment has no effect on the shipped bundle.
 ARG VITE_API_URL=http://localhost:3200
 ARG VITE_MAIN_APP_URL=http://localhost:5173
-ENV VITE_API_URL=$VITE_API_URL
-ENV VITE_MAIN_APP_URL=$VITE_MAIN_APP_URL
+# With AUTH_DISABLED the BFF rejects any request without these headers, and the web
+# client only sends them when the values are present. Without them the app 401s on load.
+ARG VITE_DEV_SUBJECT=dev-user-001
+ARG VITE_DEV_ORGANIZATION=dev-org-001
+ARG VITE_DEV_EMAIL=dev@example.com
+ENV VITE_API_URL=$VITE_API_URL \
+    VITE_MAIN_APP_URL=$VITE_MAIN_APP_URL \
+    VITE_DEV_SUBJECT=$VITE_DEV_SUBJECT \
+    VITE_DEV_ORGANIZATION=$VITE_DEV_ORGANIZATION \
+    VITE_DEV_EMAIL=$VITE_DEV_EMAIL
 RUN pnpm --filter @tps/web build
 
 FROM nginx:alpine

@@ -95,3 +95,17 @@ code { font-family: monospace; font-size: 0.85em; background: #f3f4f6; padding: 
 
 .text-red { color: #dc2626; }
 .text-green { color: #16a34a; }
+
+/* Step 4 — trade picker and candidate selection */
+.trade-chips { display: flex; flex-wrap: wrap; gap: 8px; max-height: 220px; overflow-y: auto; }
+.trade-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; background: #fff; color: #374151; border: 1px solid #d1d5db; border-radius: 9999px; font-size: 0.8rem; font-weight: 500; }
+.trade-chip:hover:not(:disabled) { background: #f9fafb; }
+.trade-chip.active { background: #2563eb; color: #fff; border-color: #2563eb; }
+.trade-chip.active:hover:not(:disabled) { background: #1d4ed8; }
+.trade-count { background: #f3f4f6; color: #6b7280; border-radius: 9999px; padding: 0 6px; font-size: 0.7rem; font-weight: 600; }
+.trade-chip.active .trade-count { background: rgba(255, 255, 255, 0.25); color: #fff; }
+
+.badge-row { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.rank-toggle { padding: 3px 10px; min-width: 48px; background: #fff; color: #374151; border: 1px solid #d1d5db; font-size: 0.75rem; }
+.rank-toggle:hover:not(:disabled) { background: #f9fafb; }
+.rank-toggle.active { background: #2563eb; color: #fff; border-color: #2563eb; }

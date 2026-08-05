@@ -5,6 +5,7 @@ import { buildAuthenticator, requireActor } from './auth.js';
 import type { Config } from './config.js';
 import { Database } from './db.js';
 import { AppError } from './errors.js';
+import { ScmsReadDatabase } from './scmsReadDb.js';
 import { TenderPrepDatabase } from './tenderPrepDb.js';
 
 const uuid = z.string().uuid();
@@ -23,16 +24,17 @@ function params<T extends z.ZodTypeAny>(request: FastifyRequest, schema: T): z.i
 
 declare module 'fastify' {
   interface FastifyInstance {
-    tps: { config: Config; db: Database; tpDb: TenderPrepDatabase };
+    tps: { config: Config; db: Database; tpDb: TenderPrepDatabase; scmsDb: ScmsReadDatabase };
   }
 }
 
 export async function createApp(config: Config): Promise<FastifyInstance> {
   const app = Fastify({ logger: { level: config.LOG_LEVEL } });
   const db = new Database(config);
-  const tpDb = new TenderPrepDatabase(db);
+  const scmsDb = new ScmsReadDatabase(db, config.SCMS_SCHEMA);
+  const tpDb = new TenderPrepDatabase(db, scmsDb);
 
-  app.decorate('tps', { config, db, tpDb });
+  app.decorate('tps', { config, db, tpDb, scmsDb });
   await app.register(cors, { origin: config.WEB_ORIGIN, credentials: false });
 
   app.setErrorHandler((error, _request, reply) => {
@@ -113,6 +115,24 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     });
 
     // ── Step 4: Shortlist ───────────────────────────────────────────────────
+
+    // Trades a shortlist can be built for, read from SCMS. Static segment, so it takes
+    // precedence over GET /api/tender-prep/:workflowId — no route conflict.
+    protectedApi.get('/api/tender-prep/trades', async (request) => {
+      const { search } = query(request, z.object({ search: z.string().trim().max(120).optional() }));
+      return scmsDb.listTradeCategories(requireActor(request), search);
+    });
+
+    protectedApi.get('/api/tender-prep/:workflowId/shortlist/candidates', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const { trade, limit } = query(request, z.object({
+        trade: z.string().trim().min(1).max(120),
+        // A shortlist holds at most 5 (tps.shortlist_entries CHECK rank BETWEEN 1 AND 5),
+        // so offer a slightly wider pool to choose from.
+        limit: z.coerce.number().int().min(1).max(50).default(10)
+      }));
+      return tpDb.listShortlistCandidates(requireActor(request), workflowId, trade, limit);
+    });
 
     protectedApi.get('/api/tender-prep/:workflowId/shortlist', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));

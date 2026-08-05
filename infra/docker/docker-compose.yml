@@ -1,12 +1,12 @@
-services:
-  # Shared PostgreSQL — same instance as nrm-seed-generator.
-  # postgres:
-  #   image: pgvector/pgvector:pg16
-  #   environment: { POSTGRES_USER: buildflow, POSTGRES_PASSWORD: buildflow, POSTGRES_DB: buildflow }
-  #   ports: ["5433:5432"]
-  #   volumes: [postgres_data:/var/lib/postgresql/data]
+# Explicit project name. Without this, Compose derives it from this file's parent
+# directory ("docker"), which is the same name the parent platform derives — and a
+# `docker compose down -v` here would then destroy the parent's database volume.
+name: tps
 
-  migrate:
+# PostgreSQL is owned solely by the parent platform (nrm-seed-generator). TPS shares
+# that instance and keeps its own objects in the `tps` schema. Start the parent first.
+services:
+  migrate-tps:
     build:
       context: ../..
       dockerfile: infra/docker/Dockerfile.bff
@@ -14,14 +14,16 @@ services:
     working_dir: /app/apps/bff
     environment:
       DATABASE_URL: postgresql://buildflow:buildflow@postgres:5432/buildflow
+      DATABASE_SCHEMA: ${DATABASE_SCHEMA:-tps}
       TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-tps-dev-token-key-32-chars-min}
       AUTH_DISABLED: "true"
-    depends_on:
-      - postgres
+    # The parent owns postgres, so a `depends_on` condition cannot reach it across
+    # compose projects; retry instead until it accepts connections.
+    restart: on-failure
     networks:
-      - buildflow
+      - parent
 
-  bff:
+  bff-tps:
     build:
       context: ../..
       dockerfile: infra/docker/Dockerfile.bff
@@ -30,32 +32,40 @@ services:
     ports:
       - "3200:3200"
     environment:
-      NODE_ENV: production
+      NODE_ENV: ${NODE_ENV:-development}
       PORT: "3200"
       DATABASE_URL: postgresql://buildflow:buildflow@postgres:5432/buildflow
+      DATABASE_SCHEMA: ${DATABASE_SCHEMA:-tps}
       WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:5175}
       TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-tps-dev-token-key-32-chars-min}
       AUTH_DISABLED: ${AUTH_DISABLED:-true}
-      SCMS_BFF_URL: ${SCMS_BFF_URL:-http://scms-bff:3100}
+      # TPS reads the SCMS module's schema directly for Step 4 shortlist candidates —
+      # same database, no HTTP hop to bff-scms.
+      SCMS_SCHEMA: ${SCMS_SCHEMA:-scms}
       LOG_LEVEL: info
     depends_on:
-      - migrate
+      - migrate-tps
     networks:
-      - buildflow
+      - parent
 
-  web:
+  web-tps:
     build:
       context: ../..
       dockerfile: infra/docker/Dockerfile.web
+      args:
+        # Build args, not `environment`: Vite bakes these into the bundle at build time, so
+        # runtime env vars would be silently ignored. Changing any of them needs `--build`.
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:3200}
+        VITE_MAIN_APP_URL: ${VITE_MAIN_APP_URL:-http://localhost:5173}
+        VITE_DEV_SUBJECT: ${VITE_DEV_SUBJECT:-dev-user-001}
+        VITE_DEV_ORGANIZATION: ${VITE_DEV_ORGANIZATION:-dev-org-001}
+        VITE_DEV_EMAIL: ${VITE_DEV_EMAIL:-dev@example.com}
     ports:
       - "5175:8080"
-    environment:
-      VITE_API_URL: ${VITE_API_URL:-http://localhost:3200}
-      VITE_MAIN_APP_URL: ${VITE_MAIN_APP_URL:-http://localhost:5173}
     networks:
-      - buildflow
+      - parent
 
-  api:
+  api-tps:
     build:
       context: ../..
       dockerfile: infra/docker/Dockerfile.api
@@ -63,10 +73,13 @@ services:
       - "8200:8200"
     environment:
       DATABASE_URL: postgresql://buildflow:buildflow@postgres:5432/buildflow
+      DATABASE_SCHEMA: ${DATABASE_SCHEMA:-tps}
     networks:
-      - buildflow
+      - parent
 
 networks:
-  buildflow:
+  # The parent platform's network, joined by name. The parent's postgres carries the
+  # DNS alias `postgres` on it.
+  parent:
     external: true
-    name: nrm-seed-generator_buildflow
+    name: ${PARENT_NETWORK:-buildflow}

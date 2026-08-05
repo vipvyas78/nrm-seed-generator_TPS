@@ -34,6 +34,14 @@ export type SoaRagRow = {
   reviewed_by?: string;
 };
 
+export type SoaRagUpsert = {
+  clauseRef: string;
+  amendmentText?: string;
+  ragStatus: 'red' | 'amber' | 'green';
+  jctNec4Ref?: string;
+  commentary?: string;
+};
+
 export type TenderPrepShortlist = {
   id: string;
   workflow_id: string;
@@ -51,6 +59,37 @@ export type TenderPrepShortlistEntry = {
   performance_score?: number;
   compliance_flags?: Record<string, unknown>;
   board_approved: boolean;
+};
+
+export type TradeCategory = {
+  trade_category: string;
+  candidate_count: number;
+};
+
+/**
+ * A candidate read from SCMS — not yet a shortlist entry. `performance_score` is a string
+ * because Postgres returns NUMERIC that way, and null when the firm has never been rated,
+ * which is different from scoring zero.
+ */
+export type ShortlistCandidate = {
+  subcontractor_id: string;
+  name: string;
+  trading_as?: string;
+  status: string;
+  profile_completeness_pct: number;
+  performance_score: string | null;
+  ratings_count: number;
+  compliance_flags: {
+    pqq_status: string;
+    cis_status: string;
+    at_risk: boolean;
+    profile_completeness_pct: number;
+    pl_expiry: string | null;
+    pl_active: boolean;
+    el_expiry: string | null;
+    el_active: boolean;
+    accreditations: string[];
+  };
 };
 
 export type IttDispatch = {
@@ -126,12 +165,17 @@ export const api = {
 
   // Step 3: SoA RAG
   getSoaRag: (workflowId: string) => request<SoaRagRow[]>(`/api/tender-prep/${workflowId}/soa-rag`),
-  upsertSoaRag: (workflowId: string, rows: Omit<SoaRagRow, 'id' | 'workflow_id' | 'reviewed_by'>[]) =>
+  // camelCase, matching the BFF's request schema — the response comes back snake_case as SoaRagRow.
+  upsertSoaRag: (workflowId: string, rows: SoaRagUpsert[]) =>
     request<SoaRagRow[]>(`/api/tender-prep/${workflowId}/soa-rag`, { method: 'POST', body: JSON.stringify({ rows }) }),
 
   // Step 4: Shortlist
+  listTrades: (search?: string) =>
+    request<TradeCategory[]>(`/api/tender-prep/trades${search ? `?search=${encodeURIComponent(search)}` : ''}`),
+  getShortlistCandidates: (workflowId: string, trade: string, limit?: number) =>
+    request<ShortlistCandidate[]>(`/api/tender-prep/${workflowId}/shortlist/candidates?trade=${encodeURIComponent(trade)}${limit ? `&limit=${limit}` : ''}`),
   getShortlists: (workflowId: string) => request<TenderPrepShortlist[]>(`/api/tender-prep/${workflowId}/shortlist`),
-  confirmShortlist: (workflowId: string, input: { tradeCategory: string; boardOverrideNotes?: string; entries: Array<{ subcontractorId: string; rank: number; performanceScore?: number }> }) =>
+  confirmShortlist: (workflowId: string, input: { tradeCategory: string; boardOverrideNotes?: string; entries: Array<{ subcontractorId: string; rank: number; performanceScore?: number; complianceFlags?: Record<string, unknown> }> }) =>
     request<TenderPrepShortlist>(`/api/tender-prep/${workflowId}/shortlist/confirm`, { method: 'POST', body: JSON.stringify(input) }),
 
   // Step 5: ITT
