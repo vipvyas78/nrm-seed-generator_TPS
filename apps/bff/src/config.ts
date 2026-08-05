@@ -23,10 +23,36 @@ const schema = z.object({
   TOKEN_ENCRYPTION_KEY: z.string().min(1),
   ENGINE_INTERNAL_URL: optionalUrl,
   ENGINE_INTERNAL_TOKEN: z.string().optional(),
+  // Optional here on purpose: migrate.ts calls loadConfig() and migrate-tps has no Redis.
+  // The worker requires it through loadWorkerConfig below.
+  REDIS_URL: z.string().min(1).optional(),
   LOG_LEVEL: z.string().default('info')
 });
 
 export type Config = z.infer<typeof schema>;
+
+/**
+ * The worker's own config.
+ *
+ * Not a subset of loadConfig() — that one requires TOKEN_ENCRYPTION_KEY and throws
+ * unless OIDC is configured or AUTH_DISABLED is set, which is itself illegal in
+ * production. A headless queue consumer serves no requests and authenticates nobody, so
+ * none of that applies to it. What it does need, REDIS_URL, is required here and
+ * optional there.
+ */
+const workerSchema = z.object({
+  DATABASE_URL: z.string().min(1),
+  DATABASE_SCHEMA: z.string().regex(/^[a-z_][a-z0-9_]*$/, 'DATABASE_SCHEMA must be a bare SQL identifier').default('tps'),
+  SCMS_SCHEMA: z.string().regex(/^[a-z_][a-z0-9_]*$/, 'SCMS_SCHEMA must be a bare SQL identifier').default('scms'),
+  REDIS_URL: z.string().min(1),
+  LOG_LEVEL: z.string().default('info')
+});
+
+export type WorkerConfig = z.infer<typeof workerSchema>;
+
+export function loadWorkerConfig(input: NodeJS.ProcessEnv = process.env): WorkerConfig {
+  return workerSchema.parse(input);
+}
 
 export function loadConfig(input: NodeJS.ProcessEnv = process.env): Config {
   const config = schema.parse(input);

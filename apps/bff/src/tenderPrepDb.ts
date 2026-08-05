@@ -1,6 +1,7 @@
 import type { Database, Row } from './db.js';
 import { conflict, notFound } from './errors.js';
 import type { ScmsReadDatabase } from './scmsReadDb.js';
+import type { TakeoffCompletion } from './takeoffCompletion.js';
 import type { Actor } from './types.js';
 
 export class TenderPrepDatabase {
@@ -33,72 +34,66 @@ export class TenderPrepDatabase {
       [workflowId, actor.organizationId]
     );
     if (wf.locked_at) throw conflict('Workflow is locked');
-    if (Number(wf.current_step) >= 7) throw conflict('Already at final step');
+    if (Number(wf.current_step) >= 4) throw conflict('Already at final step');
     return this.db.one(
       `UPDATE workflows SET current_step = current_step + 1, updated_at = NOW() WHERE id = $1 RETURNING *`,
       [workflowId]
     );
   }
 
-  // ── Step 2: RFIs ──────────────────────────────────────────────────────────
-
-  async listRfis(actor: Actor, workflowId: string): Promise<Row[]> {
-    await this.assertWorkflowAccess(actor, workflowId);
-    return this.db.query(`SELECT * FROM rfis WHERE workflow_id = $1 ORDER BY created_at`, [workflowId]);
-  }
-
-  async createRfi(actor: Actor, workflowId: string, input: { description: string }): Promise<Row> {
-    await this.assertWorkflowAccess(actor, workflowId);
-    return this.db.one(
-      `INSERT INTO rfis (workflow_id, description) VALUES ($1, $2) RETURNING *`,
-      [workflowId, input.description]
+  /**
+   * The workflow for a package, or null. The take-off consumer creates workflows without
+   * anyone visiting the app, so the UI has to be able to find one it never started.
+   */
+  async findWorkflowByPackage(actor: Actor, packageId: string): Promise<Row | null> {
+    const rows = await this.db.query(
+      `SELECT * FROM workflows WHERE package_id = $1 AND organization_id = $2 AND archived_at IS NULL`,
+      [packageId, actor.organizationId]
     );
+    return rows[0] ?? null;
   }
 
-  async updateRfi(actor: Actor, rfiId: string, patch: { status?: string; employerResponse?: string }): Promise<Row> {
-    const rfi = await this.db.one<{ workflow_id: string }>(
-      `SELECT workflow_id FROM rfis WHERE id = $1`, [rfiId]
-    );
-    await this.assertWorkflowAccess(actor, String(rfi.workflow_id));
-    const sets: string[] = ['updated_at = NOW()'];
-    const values: unknown[] = [];
-    let idx = 1;
-    if (patch.status) { sets.push(`status = $${idx++}`); values.push(patch.status); }
-    if (patch.employerResponse !== undefined) { sets.push(`employer_response = $${idx++}`); values.push(patch.employerResponse); }
-    if (patch.status === 'closed') { sets.push(`resolved_at = NOW()`); }
-    values.push(rfiId);
-    return this.db.one(`UPDATE rfis SET ${sets.join(', ')} WHERE id = $${idx} RETURNING *`, values);
+  /**
+   * Launch tender preparation from a completed BuildFlow take-off.
+   *
+   * Called by the queue consumer, never from an HTTP route — the actor is built from the
+   * message, so this bypasses the request authenticator by design.
+   *
+   * Three things are deliberate:
+   *
+   *  - `ON CONFLICT (package_id)` rather than createWorkflow's read-then-insert, which
+   *    races against the unique index under at-least-once delivery.
+   *  - **`current_step` is never written.** A new row takes DEFAULT 1 — Tender Launch
+   *    Pack. A workflow already at step 3 stays at step 3: a take-off re-run refreshes
+   *    the data it carries, it does not rewind whoever is working through the wizard.
+   *  - `step_data` is merged, not replaced, so a redelivery is a no-op in effect.
+   */
+  async launchFromTakeoff(actor: Actor, message: TakeoffCompletion): Promise<Row> {
+    return this.db.transaction(async (client) => {
+      const workflow = await this.db.one<{ id: string; organization_id: string }>(
+        `INSERT INTO workflows (package_id, organization_id, created_by)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (package_id) DO UPDATE SET updated_at = NOW()
+         RETURNING *`,
+        [message.packageId, actor.organizationId, actor.userId], client
+      );
+      // The package already belongs to someone else's workflow. Refuse rather than
+      // quietly writing another organisation's take-off into it.
+      if (String(workflow.organization_id) !== actor.organizationId) {
+        throw conflict('A workflow for this package belongs to another organization');
+      }
+      return this.db.one(
+        `UPDATE workflows
+         SET step_data = COALESCE(step_data, '{}'::jsonb)
+                         || jsonb_build_object('takeoff', $2::jsonb, 'takeoffReceivedAt', to_jsonb(NOW())),
+             updated_at = NOW()
+         WHERE id = $1 RETURNING *`,
+        [workflow.id, JSON.stringify(message)], client
+      );
+    });
   }
 
-  // ── Step 3: SoA RAG ───────────────────────────────────────────────────────
-
-  async getSoaRag(actor: Actor, workflowId: string): Promise<Row[]> {
-    await this.assertWorkflowAccess(actor, workflowId);
-    return this.db.query(`SELECT * FROM soa_rag WHERE workflow_id = $1 ORDER BY clause_ref`, [workflowId]);
-  }
-
-  async upsertSoaRag(actor: Actor, workflowId: string, rows: Array<{
-    clauseRef: string;
-    amendmentText?: string;
-    ragStatus: 'red' | 'amber' | 'green';
-    jctNec4Ref?: string;
-    commentary?: string;
-  }>): Promise<Row[]> {
-    await this.assertWorkflowAccess(actor, workflowId);
-    return Promise.all(rows.map((row) => this.db.one(
-      `INSERT INTO soa_rag (workflow_id, clause_ref, amendment_text, rag_status, jct_nec4_ref, commentary, reviewed_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (workflow_id, clause_ref) DO UPDATE SET
-         amendment_text = EXCLUDED.amendment_text, rag_status = EXCLUDED.rag_status,
-         jct_nec4_ref = EXCLUDED.jct_nec4_ref, commentary = EXCLUDED.commentary,
-         reviewed_by = EXCLUDED.reviewed_by, updated_at = NOW()
-       RETURNING *`,
-      [workflowId, row.clauseRef, row.amendmentText ?? null, row.ragStatus,
-       row.jctNec4Ref ?? null, row.commentary ?? null, actor.userId]
-    )));
-  }
-
-  // ── Step 4: Shortlist ─────────────────────────────────────────────────────
+  // ── Step 1: Shortlist (Tender Launch Pack) ────────────────────────────────
 
   async getShortlists(actor: Actor, workflowId: string): Promise<Row[]> {
     await this.assertWorkflowAccess(actor, workflowId);
@@ -152,7 +147,7 @@ export class TenderPrepDatabase {
     });
   }
 
-  // ── Step 5: ITT Dispatch ──────────────────────────────────────────────────
+  // ── Step 2: ITT Dispatch ──────────────────────────────────────────────────
 
   async dispatchItt(actor: Actor, workflowId: string): Promise<Row[]> {
     await this.assertWorkflowAccess(actor, workflowId);
@@ -198,7 +193,7 @@ export class TenderPrepDatabase {
     );
   }
 
-  // ── Step 6: Comparative ───────────────────────────────────────────────────
+  // ── Step 3: Comparative ───────────────────────────────────────────────────
 
   async listComparative(actor: Actor, workflowId: string): Promise<Row[]> {
     await this.assertWorkflowAccess(actor, workflowId);
@@ -224,7 +219,7 @@ export class TenderPrepDatabase {
     );
   }
 
-  // ── Step 7: Submission ────────────────────────────────────────────────────
+  // ── Step 4: Submission ────────────────────────────────────────────────────
 
   async getSubmission(actor: Actor, workflowId: string): Promise<Row | null> {
     await this.assertWorkflowAccess(actor, workflowId);

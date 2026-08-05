@@ -48,6 +48,34 @@ services:
     networks:
       - parent
 
+  # Consumes buildflow_takeoff_completion_queue and launches tender preparation. Its own
+  # process rather than a thread inside bff-tps, so the API does not gain a Redis
+  # dependency at boot and the two restart independently. No `networks` change is needed:
+  # this stack already joins the parent's network, where `redis` is the parent's own.
+  worker-tps:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.bff
+    command: ["node", "dist/worker.js"]
+    working_dir: /app/apps/bff
+    environment:
+      DATABASE_URL: postgresql://buildflow:buildflow@postgres:5432/buildflow
+      DATABASE_SCHEMA: ${DATABASE_SCHEMA:-tps}
+      SCMS_SCHEMA: ${SCMS_SCHEMA:-scms}
+      # Hardcoded, not `${REDIS_URL:-...}`, for the same reason DATABASE_URL above is:
+      # .env holds the HOST value (redis://localhost:6379), and interpolating it here
+      # points the container at itself. BullMQ retries a dead connection silently, so the
+      # symptom is a worker that starts, logs nothing, and consumes nothing.
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: info
+    depends_on:
+      - migrate-tps
+    # The parent owns redis, so a depends_on condition cannot reach it across compose
+    # projects; retry until it accepts connections.
+    restart: on-failure
+    networks:
+      - parent
+
   web-tps:
     build:
       context: ../..
@@ -57,8 +85,10 @@ services:
         # runtime env vars would be silently ignored. Changing any of them needs `--build`.
         VITE_API_URL: ${VITE_API_URL:-http://localhost:3200}
         VITE_MAIN_APP_URL: ${VITE_MAIN_APP_URL:-http://localhost:5173}
-        VITE_DEV_SUBJECT: ${VITE_DEV_SUBJECT:-dev-user-001}
-        VITE_DEV_ORGANIZATION: ${VITE_DEV_ORGANIZATION:-dev-org-001}
+        # Must match the parent platform's dev identity, or provisionActor mints a second
+        # organization and every take-off-launched workflow is filtered out of view.
+        VITE_DEV_SUBJECT: ${VITE_DEV_SUBJECT:-local-user}
+        VITE_DEV_ORGANIZATION: ${VITE_DEV_ORGANIZATION:-local-org}
         VITE_DEV_EMAIL: ${VITE_DEV_EMAIL:-dev@example.com}
     ports:
       - "5175:8080"

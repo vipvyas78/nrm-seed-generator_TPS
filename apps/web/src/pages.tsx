@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { FormEvent, useState } from 'react';
 import { Outlet, useNavigate, useParams } from 'react-router-dom';
-import { api, type IttDispatch, type ShortlistCandidate, type SoaRagRow, type TenderComparative, type TenderPrepWorkflow } from './api';
+import { api, type IttDispatch, type ShortlistCandidate, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
 import { oidc, signIn } from './auth';
 
 function ErrorMessage({ error }: { error: unknown }) {
@@ -9,7 +9,10 @@ function ErrorMessage({ error }: { error: unknown }) {
 }
 function Busy({ children = 'Loading…' }: { children?: string }) { return <p className="muted">{children}</p>; }
 
-const STEP_TITLES = ['Parsed Outputs', 'Employer RFIs', 'SoA RAG', 'Tender Launch Pack', 'ITT Dispatch', 'Comparative Analysis', 'Tender Submission'];
+// Parsed Outputs, Employer RFIs and SoA RAG live in the take-off module, not here. A
+// completed take-off launches a workflow straight onto Tender Launch Pack.
+const STEP_TITLES = ['Tender Launch Pack', 'ITT Dispatch', 'Comparative Analysis', 'Tender Submission'];
+const FINAL_STEP = STEP_TITLES.length;
 
 // ── AppShell ───────────────────────────────────────────────────────────────
 
@@ -41,31 +44,38 @@ export function TenderPrepPage() {
   const { packageId = '' } = useParams();
   const queryClient = useQueryClient();
 
-  const workflowQuery = useQuery({ queryKey: ['workflow', packageId], queryFn: () => api.getWorkflow(packageId), enabled: false });
-  const [workflowId, setWorkflowId] = useState<string | null>(null);
+  // A completed take-off launches the workflow with nobody in the app, so the page has
+  // to look for one it never started. Polling while none exists means a page left open
+  // during a pipeline run picks the launch up on its own.
+  const existing = useQuery({
+    queryKey: ['workflow-by-package', packageId],
+    queryFn: () => api.getWorkflowByPackage(packageId),
+    refetchInterval: (query) => (query.state.data ? false : 15_000)
+  });
 
   const createWorkflow = useMutation({
     mutationFn: () => api.createWorkflow(packageId),
-    onSuccess: (wf) => { setWorkflowId(wf.id); void queryClient.invalidateQueries({ queryKey: ['workflow', packageId] }); }
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['workflow-by-package', packageId] })
   });
 
-  const workflow = useQuery({
-    queryKey: ['workflow-detail', workflowId],
-    queryFn: () => api.getWorkflow(workflowId!),
-    enabled: Boolean(workflowId),
-    refetchInterval: false
-  });
+  const workflowId = existing.data?.id ?? null;
 
   const advance = useMutation({
     mutationFn: () => api.advanceStep(workflowId!),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['workflow-detail', workflowId] })
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['workflow-by-package', packageId] })
   });
+
+  if (existing.isLoading) return <Busy />;
 
   if (!workflowId) {
     return <section className="centered">
       <h1>Tender Preparation</h1>
       <p className="muted">Package: {packageId}</p>
-      <p style={{ marginBottom: 16 }}>Start the 7-step tender preparation workflow for this package.</p>
+      <p style={{ marginBottom: 16 }}>
+        Tender preparation starts on its own once the take-off for this package completes.
+        Start it now to work ahead of that.
+      </p>
+      <ErrorMessage error={existing.error} />
       <ErrorMessage error={createWorkflow.error} />
       <button onClick={() => createWorkflow.mutate()} disabled={createWorkflow.isPending}>
         {createWorkflow.isPending ? 'Starting…' : 'Start Tender Preparation →'}
@@ -73,11 +83,9 @@ export function TenderPrepPage() {
     </section>;
   }
 
-  if (workflow.isLoading) return <Busy />;
-  if (!workflow.data) return <ErrorMessage error={workflow.error} />;
-
-  const wf = workflow.data as TenderPrepWorkflow;
+  const wf = existing.data as TenderPrepWorkflow;
   const currentStep = wf.current_step;
+  const takeoff = wf.step_data?.takeoff;
 
   return <div className="wizard-layout">
     <aside className="wizard-sidebar">
@@ -98,153 +106,55 @@ export function TenderPrepPage() {
     <section className="wizard-content">
       <div className="step-header">
         <h2>Step {currentStep}: {STEP_TITLES[currentStep - 1]}</h2>
-        {currentStep < 7 && <button className="secondary small" onClick={() => advance.mutate()} disabled={advance.isPending}>
+        {currentStep < FINAL_STEP && <button className="secondary small" onClick={() => advance.mutate()} disabled={advance.isPending}>
           Next: {STEP_TITLES[currentStep]} →
         </button>}
       </div>
       <ErrorMessage error={advance.error} />
 
-      {currentStep === 1 && <Step1ParsedOutputs packageId={packageId} />}
-      {currentStep === 2 && <Step2Rfis workflowId={workflowId} />}
-      {currentStep === 3 && <Step3SoaRag workflowId={workflowId} />}
-      {currentStep === 4 && <Step4TenderLaunchPack workflowId={workflowId} />}
-      {currentStep === 5 && <Step5IttDispatch workflowId={workflowId} />}
-      {currentStep === 6 && <Step6Comparative workflowId={workflowId} />}
-      {currentStep === 7 && <Step7Submission workflowId={workflowId} />}
+      {currentStep === 1 && takeoff && <TakeoffSummary takeoff={takeoff} packageId={packageId} />}
+      {currentStep === 1 && <Step1TenderLaunchPack workflowId={workflowId} />}
+      {currentStep === 2 && <Step2IttDispatch workflowId={workflowId} />}
+      {currentStep === 3 && <Step3Comparative workflowId={workflowId} />}
+      {currentStep === 4 && <Step4Submission workflowId={workflowId} />}
     </section>
   </div>;
 }
 
-// ── Step 1: Parsed Outputs ─────────────────────────────────────────────────
+// ── Step 1: Tender Launch Pack ─────────────────────────────────────────────
 
-function Step1ParsedOutputs({ packageId }: { packageId: string }) {
+/**
+ * Where this workflow came from. Shown only when the take-off launched it — a workflow
+ * started by hand carries no `step_data.takeoff`. The numbers are BuildFlow's, reported
+ * as at the moment it published, so the back-link is how you get the live view.
+ */
+function TakeoffSummary({ takeoff, packageId }: { takeoff: TakeoffCompletion; packageId: string }) {
   const mainAppUrl = import.meta.env.VITE_MAIN_APP_URL ?? 'http://localhost:5173';
+  const gifa = takeoff.gifaM2 == null ? null : Number(takeoff.gifaM2);
   return <div className="panel">
-    <h3>BOQ / QTO Summary</h3>
-    <p className="muted">This step provides a read-only view of the analysis outputs for the package.</p>
+    <h3>Launched from take-off</h3>
     <div className="info-row">
-      <div className="info-item"><span className="info-label">Package ID</span><code>{packageId}</code></div>
+      <div className="info-item">
+        <span className="info-label">Tender</span>
+        {takeoff.tenderName ?? <span className="muted">not assigned to a tender</span>}
+        {takeoff.tenderReference && <> · <code>{takeoff.tenderReference}</code></>}
+      </div>
+      <div className="info-item">
+        <span className="info-label">Package</span>
+        {takeoff.packageName ?? packageId}
+        {takeoff.versionNumber != null && <> · v{takeoff.versionNumber}.{takeoff.revision ?? 1}</>}
+      </div>
+      <div className="info-item"><span className="info-label">Take-off</span><code>{takeoff.takeoffId}</code></div>
+      {takeoff.itemCount != null && <div className="info-item"><span className="info-label">Items</span>{takeoff.itemCount}</div>}
+      {gifa != null && Number.isFinite(gifa) && <div className="info-item"><span className="info-label">GIFA</span>{gifa.toLocaleString()} m²</div>}
     </div>
     <p style={{ marginTop: 12 }}>
       <a href={`${mainAppUrl}/packages/${packageId}`} target="_blank" rel="noreferrer" className="button-link">
-        View full analysis in BuildFlow →
+        View the take-off in BuildFlow →
       </a>
     </p>
-    <p className="muted" style={{ marginTop: 12, fontSize: '0.8rem' }}>
-      Review the Classification and TOQ tabs in the main app, then advance to Step 2 when ready.
-    </p>
   </div>;
 }
-
-// ── Step 2: Employer RFIs ─────────────────────────────────────────────────
-
-function Step2Rfis({ workflowId }: { workflowId: string }) {
-  const queryClient = useQueryClient();
-  const [description, setDescription] = useState('');
-  const rfis = useQuery({ queryKey: ['rfis', workflowId], queryFn: () => api.listRfis(workflowId) });
-  const createRfi = useMutation({
-    mutationFn: () => api.createRfi(workflowId, description),
-    onSuccess: () => { setDescription(''); void queryClient.invalidateQueries({ queryKey: ['rfis', workflowId] }); }
-  });
-  const updateRfi = useMutation({
-    mutationFn: ({ rfiId, patch }: { rfiId: string; patch: { status?: string } }) => api.updateRfi(rfiId, patch),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['rfis', workflowId] })
-  });
-
-  const submit = (e: FormEvent) => { e.preventDefault(); if (description.trim()) createRfi.mutate(); };
-
-  return <div>
-    <div className="panel">
-      <h3>Add RFI Item</h3>
-      <form className="inline-form" onSubmit={submit}>
-        <input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Describe the conflict or clarification required…" />
-        <button disabled={createRfi.isPending}>Add</button>
-      </form>
-    </div>
-    <div className="panel">
-      <h3>RFI Schedule ({rfis.data?.length ?? 0} items)</h3>
-      {rfis.isLoading ? <Busy /> : rfis.data?.length === 0 ? <p className="muted">No RFI items yet.</p>
-        : <table className="data-table">
-            <thead><tr><th>Description</th><th>Status</th><th>Response</th><th>Actions</th></tr></thead>
-            <tbody>{rfis.data?.map((rfi) => <tr key={rfi.id} className={rfi.status === 'closed' ? 'row-done' : ''}>
-              <td>{rfi.description}</td>
-              <td><span className={`badge badge-${rfi.status === 'closed' ? 'green' : rfi.status === 'responded' ? 'blue' : 'amber'}`}>{rfi.status}</span></td>
-              <td className="muted">{rfi.employer_response ?? '—'}</td>
-              <td>
-                {rfi.status === 'open' && <button className="small" onClick={() => updateRfi.mutate({ rfiId: rfi.id, patch: { status: 'responded' } })}>Mark responded</button>}
-                {rfi.status === 'responded' && <button className="small" onClick={() => updateRfi.mutate({ rfiId: rfi.id, patch: { status: 'closed' } })}>Close</button>}
-              </td>
-            </tr>)}</tbody>
-          </table>}
-    </div>
-  </div>;
-}
-
-// ── Step 3: SoA RAG ───────────────────────────────────────────────────────
-
-function Step3SoaRag({ workflowId }: { workflowId: string }) {
-  const queryClient = useQueryClient();
-  const [editingRows, setEditingRows] = useState<SoaRagRow[]>([]);
-  const [newClause, setNewClause] = useState('');
-  const rag = useQuery({ queryKey: ['soa-rag', workflowId], queryFn: () => api.getSoaRag(workflowId) });
-
-  const save = useMutation({
-    mutationFn: (rows: SoaRagRow[]) => api.upsertSoaRag(workflowId, rows.map((r) => ({
-      clauseRef: r.clause_ref, amendmentText: r.amendment_text, ragStatus: r.rag_status,
-      jctNec4Ref: r.jct_nec4_ref, commentary: r.commentary
-    }))),
-    onSuccess: () => { setEditingRows([]); void queryClient.invalidateQueries({ queryKey: ['soa-rag', workflowId] }); }
-  });
-
-  const rows = editingRows.length > 0 ? editingRows : (rag.data ?? []);
-  const hasRed = rows.some((r) => r.rag_status === 'red');
-
-  const addRow = () => {
-    if (!newClause.trim()) return;
-    setEditingRows([...(editingRows.length > 0 ? editingRows : (rag.data ?? [])),
-      { id: '', workflow_id: workflowId, clause_ref: newClause, rag_status: 'green' }]);
-    setNewClause('');
-  };
-
-  const updateRow = (i: number, field: keyof SoaRagRow, value: string) => {
-    const current = editingRows.length > 0 ? editingRows : [...(rag.data ?? [])];
-    const updated = current.map((r, idx) => idx === i ? { ...r, [field]: value } : r);
-    setEditingRows(updated);
-  };
-
-  return <div>
-    {hasRed && <div className="alert alert-red"><strong>Director review required:</strong> Clauses marked RED must have a commentary note from a Director before proceeding.</div>}
-    <div className="alert alert-grey"><strong>Legal disclaimer:</strong> SoA commentary is for internal planning purposes only and does not constitute legal advice.</div>
-    <div className="panel">
-      <div className="inline-form" style={{ marginBottom: 12 }}>
-        <input value={newClause} onChange={(e) => setNewClause(e.target.value)} placeholder="Clause reference (e.g. A1.1.2)" />
-        <button className="secondary small" onClick={addRow}>Add clause</button>
-      </div>
-      {rag.isLoading ? <Busy /> : <table className="data-table">
-        <thead><tr><th>Clause Ref</th><th>RAG</th><th>JCT/NEC4 Ref</th><th>Commentary</th></tr></thead>
-        <tbody>{rows.map((row, i) => <tr key={row.clause_ref}>
-          <td><code>{row.clause_ref}</code></td>
-          <td><select className="rag-select" value={row.rag_status} onChange={(e) => updateRow(i, 'rag_status', e.target.value as 'red' | 'amber' | 'green')} style={{ background: row.rag_status === 'red' ? '#fee2e2' : row.rag_status === 'amber' ? '#fef3c7' : '#dcfce7' }}>
-            <option value="green">Green</option>
-            <option value="amber">Amber</option>
-            <option value="red">Red</option>
-          </select></td>
-          <td><input value={row.jct_nec4_ref ?? ''} onChange={(e) => updateRow(i, 'jct_nec4_ref', e.target.value)} placeholder="e.g. cl. 3.14" style={{ maxWidth: 120 }} /></td>
-          <td><input value={row.commentary ?? ''} onChange={(e) => updateRow(i, 'commentary', e.target.value)} placeholder={row.rag_status === 'red' ? 'Director review note required' : 'Commentary…'} /></td>
-        </tr>)}
-        {rows.length === 0 && <tr><td colSpan={4} className="muted" style={{ textAlign: 'center', padding: '1.5rem' }}>No SoA clauses added yet.</td></tr>}
-        </tbody>
-      </table>}
-      {editingRows.length > 0 && <div className="button-row" style={{ marginTop: 12 }}>
-        <button className="secondary small" onClick={() => setEditingRows([])}>Discard changes</button>
-        <button className="small" onClick={() => save.mutate(editingRows)} disabled={save.isPending}>Save RAG status</button>
-      </div>}
-      <ErrorMessage error={save.error} />
-    </div>
-  </div>;
-}
-
-// ── Step 4: Tender Launch Pack ─────────────────────────────────────────────
 
 const MAX_SHORTLIST = 5;
 
@@ -265,7 +175,7 @@ function ComplianceBadges({ flags }: { flags: ShortlistCandidate['compliance_fla
   </span>;
 }
 
-function Step4TenderLaunchPack({ workflowId }: { workflowId: string }) {
+function Step1TenderLaunchPack({ workflowId }: { workflowId: string }) {
   const queryClient = useQueryClient();
   const [search, setSearch] = useState('');
   const [trade, setTrade] = useState<string | null>(null);
@@ -403,9 +313,9 @@ function Step4TenderLaunchPack({ workflowId }: { workflowId: string }) {
   </div>;
 }
 
-// ── Step 5: ITT Dispatch ──────────────────────────────────────────────────
+// ── Step 2: ITT Dispatch ──────────────────────────────────────────────────
 
-function Step5IttDispatch({ workflowId }: { workflowId: string }) {
+function Step2IttDispatch({ workflowId }: { workflowId: string }) {
   const queryClient = useQueryClient();
   const itts = useQuery({ queryKey: ['itt', workflowId], queryFn: () => api.listItt(workflowId) });
 
@@ -462,9 +372,9 @@ function Step5IttDispatch({ workflowId }: { workflowId: string }) {
   </div>;
 }
 
-// ── Step 6: Comparative Analysis ──────────────────────────────────────────
+// ── Step 3: Comparative Analysis ──────────────────────────────────────────
 
-function Step6Comparative({ workflowId }: { workflowId: string }) {
+function Step3Comparative({ workflowId }: { workflowId: string }) {
   const queryClient = useQueryClient();
   const [name, setName] = useState('');
   const [tendered, setTendered] = useState('');
@@ -512,9 +422,9 @@ function Step6Comparative({ workflowId }: { workflowId: string }) {
   </div>;
 }
 
-// ── Step 7: Tender Submission ─────────────────────────────────────────────
+// ── Step 4: Tender Submission ─────────────────────────────────────────────
 
-function Step7Submission({ workflowId }: { workflowId: string }) {
+function Step4Submission({ workflowId }: { workflowId: string }) {
   const queryClient = useQueryClient();
   const [packages, setPackages] = useState<Array<{ name: string; subCost: string; prelims: string; riskPct: string; marginPct: string }>>([
     { name: '', subCost: '', prelims: '', riskPct: '', marginPct: '' }
