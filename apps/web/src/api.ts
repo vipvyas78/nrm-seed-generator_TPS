@@ -2,44 +2,38 @@ import { accessToken } from './auth';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
+/**
+ * What BuildFlow sends when a take-off completes, stashed on the workflow by the queue
+ * consumer. Present only on a workflow launched from a take-off — a workflow started by
+ * hand in this app has none.
+ */
+export type TakeoffCompletion = {
+  takeoffId: string;
+  pipelineSessionId?: string | null;
+  packageId: string;
+  packageName?: string | null;
+  packageVersionId?: string | null;
+  versionNumber?: number | null;
+  revision?: number | null;
+  projectId?: string | null;
+  projectName?: string | null;
+  tenderId: string | null;
+  tenderName: string | null;
+  tenderReference: string | null;
+  itemCount?: number | null;
+  gifaM2?: number | string | null;
+  completedAt?: string | null;
+};
+
 export type TenderPrepWorkflow = {
   id: string;
   package_id: string;
   organization_id: string;
   current_step: number;
-  step_data: Record<string, unknown>;
+  step_data: { takeoff?: TakeoffCompletion; takeoffReceivedAt?: string } & Record<string, unknown>;
   locked_at?: string;
   created_at: string;
   updated_at: string;
-};
-
-export type TenderPrepRfi = {
-  id: string;
-  workflow_id: string;
-  description: string;
-  status: 'open' | 'responded' | 'closed';
-  employer_response?: string;
-  resolved_at?: string;
-  created_at: string;
-};
-
-export type SoaRagRow = {
-  id: string;
-  workflow_id: string;
-  clause_ref: string;
-  amendment_text?: string;
-  rag_status: 'red' | 'amber' | 'green';
-  jct_nec4_ref?: string;
-  commentary?: string;
-  reviewed_by?: string;
-};
-
-export type SoaRagUpsert = {
-  clauseRef: string;
-  amendmentText?: string;
-  ragStatus: 'red' | 'amber' | 'green';
-  jctNec4Ref?: string;
-  commentary?: string;
 };
 
 export type TenderPrepShortlist = {
@@ -151,25 +145,15 @@ export const api = {
   // Workflow
   createWorkflow: (packageId: string) =>
     request<TenderPrepWorkflow>(`/api/packages/${packageId}/tender-prep`, { method: 'POST' }),
+  // Null when nothing has launched tender prep for this package yet.
+  getWorkflowByPackage: (packageId: string) =>
+    request<TenderPrepWorkflow | null>(`/api/packages/${packageId}/tender-prep`),
   getWorkflow: (workflowId: string) =>
     request<TenderPrepWorkflow>(`/api/tender-prep/${workflowId}`),
   advanceStep: (workflowId: string) =>
     request<TenderPrepWorkflow>(`/api/tender-prep/${workflowId}/advance`, { method: 'POST' }),
 
-  // Step 2: RFIs
-  listRfis: (workflowId: string) => request<TenderPrepRfi[]>(`/api/tender-prep/${workflowId}/rfis`),
-  createRfi: (workflowId: string, description: string) =>
-    request<TenderPrepRfi>(`/api/tender-prep/${workflowId}/rfis`, { method: 'POST', body: JSON.stringify({ description }) }),
-  updateRfi: (rfiId: string, patch: { status?: string; employerResponse?: string }) =>
-    request<TenderPrepRfi>(`/api/tender-prep/rfis/${rfiId}`, { method: 'PATCH', body: JSON.stringify(patch) }),
-
-  // Step 3: SoA RAG
-  getSoaRag: (workflowId: string) => request<SoaRagRow[]>(`/api/tender-prep/${workflowId}/soa-rag`),
-  // camelCase, matching the BFF's request schema — the response comes back snake_case as SoaRagRow.
-  upsertSoaRag: (workflowId: string, rows: SoaRagUpsert[]) =>
-    request<SoaRagRow[]>(`/api/tender-prep/${workflowId}/soa-rag`, { method: 'POST', body: JSON.stringify({ rows }) }),
-
-  // Step 4: Shortlist
+  // Step 1: Shortlist (Tender Launch Pack)
   listTrades: (search?: string) =>
     request<TradeCategory[]>(`/api/tender-prep/trades${search ? `?search=${encodeURIComponent(search)}` : ''}`),
   getShortlistCandidates: (workflowId: string, trade: string, limit?: number) =>
@@ -178,19 +162,19 @@ export const api = {
   confirmShortlist: (workflowId: string, input: { tradeCategory: string; boardOverrideNotes?: string; entries: Array<{ subcontractorId: string; rank: number; performanceScore?: number; complianceFlags?: Record<string, unknown> }> }) =>
     request<TenderPrepShortlist>(`/api/tender-prep/${workflowId}/shortlist/confirm`, { method: 'POST', body: JSON.stringify(input) }),
 
-  // Step 5: ITT
+  // Step 2: ITT
   listItt: (workflowId: string) => request<IttDispatch[]>(`/api/tender-prep/${workflowId}/itt`),
   dispatchItt: (workflowId: string) =>
     request<IttDispatch[]>(`/api/tender-prep/${workflowId}/itt/dispatch`, { method: 'POST' }),
   recordIttResponse: (dispatchId: string, response: IttDispatch['response']) =>
     request<IttDispatch>(`/api/tender-prep/itt/${dispatchId}`, { method: 'PATCH', body: JSON.stringify({ response }) }),
 
-  // Step 6: Comparative
+  // Step 3: Comparative
   listComparative: (workflowId: string) => request<TenderComparative[]>(`/api/tender-prep/${workflowId}/comparative`),
   upsertComparative: (workflowId: string, input: Omit<TenderComparative, 'id' | 'workflow_id'>) =>
     request<TenderComparative>(`/api/tender-prep/${workflowId}/comparative`, { method: 'POST', body: JSON.stringify(input) }),
 
-  // Step 7: Submission
+  // Step 4: Submission
   getSubmission: (workflowId: string) => request<TenderSubmission | null>(`/api/tender-prep/${workflowId}/submission`),
   saveSubmission: (workflowId: string, input: { packages: unknown[]; aggregateTotal?: number }) =>
     request<TenderSubmission>(`/api/tender-prep/${workflowId}/submission`, { method: 'POST', body: JSON.stringify(input) }),

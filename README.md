@@ -1,6 +1,6 @@
 # BuildFlow TPS — Tender Preparation & Submission
 
-A self-contained module that adds a 7-step tender preparation workflow to the BuildFlow suite. It plugs into the parent `nrm-seed-generator` app, sharing its PostgreSQL instance and Docker network.
+A self-contained module that adds a 4-step tender preparation workflow to the BuildFlow suite. A completed take-off in the parent platform launches a workflow here automatically, over a queue. It plugs into the parent `nrm-seed-generator` app, sharing its PostgreSQL instance and Docker network.
 
 ## Services
 
@@ -8,7 +8,8 @@ A self-contained module that adds a 7-step tender preparation workflow to the Bu
 |---------|------|-------------|
 | `web-tps` | 5175 | React/Vite UI served by nginx |
 | `bff-tps` | 3200 | Node.js/Fastify backend-for-frontend |
-| `api-tps` | 8200 | Python/FastAPI engine |
+| `api-tps` | 8200 | Python/FastAPI engine (no routes yet) |
+| `worker-tps` | — | Consumes `buildflow_takeoff_completion_queue` and launches tender prep |
 | `migrate-tps` | — | One-shot DB migration job |
 
 The compose project is named `tps`, so containers come up as `tps-bff-tps-1` and so on. Pinning the project name matters: without it Compose derives the name from the `infra/docker/` directory — the same name the parent platform derives — and a `docker compose down -v` here would destroy the parent's database volume.
@@ -23,7 +24,7 @@ Links out of TPS (`package_id`, `organization_id`, `created_by`, and `subcontrac
 
 ### Reading the SCMS schema
 
-Step 4 sources its shortlist candidates by querying the SCMS module's `scms` schema **directly** in the shared database, rather than calling the SCMS BFF over HTTP — same database, no extra hop, and no CORS/network change needed.
+Step 1 (Tender Launch Pack) sources its shortlist candidates by querying the SCMS module's `scms` schema **directly** in the shared database, rather than calling the SCMS BFF over HTTP — same database, no extra hop, and no CORS/network change needed.
 
 Every one of those queries lives in `apps/bff/src/scmsReadDb.ts` and nowhere else. They are `SELECT` only: TPS never writes to `scms`, because `nominations`, `gap_fill_queue` and `pqq_submissions` are outbound-correspondence paths where a row can trigger real contact with a subcontractor, and `pqq_tokens` holds credential hashes.
 
@@ -78,7 +79,7 @@ WEB_ORIGIN=http://localhost:5175
 # Parent app URL — used by the TPS web app to link back to BuildFlow
 VITE_MAIN_APP_URL=http://localhost:5173
 
-# Schema owned by the SCMS module, read directly for Step 4 shortlist candidates
+# Schema owned by the SCMS module, read directly for Step 1 shortlist candidates
 SCMS_SCHEMA=scms
 ```
 
@@ -100,7 +101,7 @@ docker compose --env-file .env -f infra/docker/docker-compose.yml up -d --build
 
 The `web-tps` image bakes every `VITE_*` value into the static bundle at build time, so compose passes them through `build.args` rather than `environment`. Changing any of them requires a rebuild (`--build`), not just a restart.
 
-`migrate-tps` creates the `tps` schema, applies `database/migrations/001_tender_prep.sql`, and records it in `tps.schema_migrations` before `bff-tps` starts. It uses `restart: on-failure` instead of `depends_on: postgres`, because a `depends_on` cannot reach a service in the parent's compose project — it simply retries until Postgres accepts connections.
+`migrate-tps` creates the `tps` schema, applies `database/migrations/*.sql`, and records them in `tps.schema_migrations` before `bff-tps` starts. It uses `restart: on-failure` instead of `depends_on: postgres`, because a `depends_on` cannot reach a service in the parent's compose project — it simply retries until Postgres accepts connections.
 
 ### 4. Verify
 
@@ -116,6 +117,34 @@ docker exec -it $(docker ps -qf name=postgres) \
 # Open the web UI
 open http://localhost:5175
 ```
+
+---
+
+## Launching from a completed take-off
+
+A completed take-off in BuildFlow is what makes a package ready to tender, so it starts the workflow here — over a queue, so neither module has to know the other is running.
+
+```
+BuildFlow markAnalysis('completed')
+  └─ bf_queue_outbox row, same transaction as the status      (producer, parent repo)
+      └─ dispatchOutbox → buildflow_takeoff_completion_queue  (BullMQ, parent's Redis)
+          └─ worker-tps → tpDb.launchFromTakeoff              (this repo)
+              └─ tps.workflows, current_step = 1 — Tender Launch Pack
+```
+
+**Steps 1–3 of the old 7-step wizard are gone.** Parsed Outputs, Employer RFIs and SoA RAG belong to the take-off module, so Tender Launch Pack is now step 1 — which means the consumer creates the workflow with the column's own `DEFAULT 1` and never sets a step.
+
+The message carries the tender, package, project and pipeline detail (`packageId` and `organizationId` are the only two the workflow cannot be created without), and is stashed whole on `workflows.step_data.takeoff`. `tenderId` is genuinely nullable — a package need not belong to a tender.
+
+The message is delivered **at least once**, and three things make that safe:
+
+- `bf_queue_outbox` has a unique index on the take-off id, so a repeated completion callback writes one row;
+- the BullMQ job id is the outbox row id, so a redelivered dispatch is deduplicated;
+- `launchFromTakeoff` is `ON CONFLICT (package_id)` and merges into `step_data`.
+
+**A take-off re-run is not a duplicate** — it mints a new take-off id, so it is a new message, and it refreshes `step_data.takeoff` while leaving `current_step` alone. Someone who has reached ITT Dispatch is not dragged back to the start.
+
+Starting a workflow by hand still works and is unchanged; it simply carries no `step_data.takeoff`.
 
 ---
 
@@ -162,13 +191,17 @@ If the parent app needs TPS inline, embed it as an iframe:
 
 ### Back-link (Step 1 in TPS)
 
-The TPS web app already reads `VITE_MAIN_APP_URL` and renders a "View full analysis in BuildFlow →" link in Step 1 pointing to:
+A workflow launched from a take-off carries the take-off's detail in `workflows.step_data.takeoff`, which Step 1 renders as a "Launched from take-off" panel — tender name and reference, package and version, take-off id, item count, GIFA — above a "View the take-off in BuildFlow →" link built from `VITE_MAIN_APP_URL`:
 
 ```
 {VITE_MAIN_APP_URL}/packages/{packageId}
 ```
 
 Set this to the parent app's origin when building the `web` container (see step 3 above).
+
+### Dev identity must match the parent
+
+Both repos provision actors through the issuer `buildflow-dev` and upsert on `(oidc_issuer, external_id)`, so `VITE_DEV_ORGANIZATION` **must be the same string in both** or you get two `bf_organizations` rows with different UUIDs. A workflow launched by `worker-tps` carries the parent's `organization_id`, and every TPS read filters on it — a mismatch does not raise an error, it just makes the workflow invisible.
 
 ---
 
@@ -187,7 +220,8 @@ Set this to the parent app's origin when building the `web` container (see step 
 | `OIDC_ISSUER` | Prod | — | Required when `AUTH_DISABLED=false` |
 | `OIDC_AUDIENCE` | Prod | — | Required when `AUTH_DISABLED=false` |
 | `OIDC_JWKS_URI` | Prod | — | Required when `AUTH_DISABLED=false` |
-| `SCMS_SCHEMA` | No | `scms` | Schema owned by the SCMS module, read (never written) for Step 4 shortlist candidates. Must be a bare SQL identifier. |
+| `SCMS_SCHEMA` | No | `scms` | Schema owned by the SCMS module, read (never written) for Step 1 shortlist candidates. Must be a bare SQL identifier. |
+| `REDIS_URL` | Worker | — | The parent platform's Redis. Required by `worker-tps`; unused by the API and migrator. |
 | `ENGINE_INTERNAL_URL` | No | — | Internal URL of the Python API |
 | `ENGINE_INTERNAL_TOKEN` | No | — | Bearer token for BFF→API calls |
 | `LOG_LEVEL` | No | `info` | Fastify log level |
@@ -197,9 +231,9 @@ Set this to the parent app's origin when building the `web` container (see step 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `VITE_API_URL` | `http://localhost:3200` | TPS BFF URL (baked into static build) |
-| `VITE_MAIN_APP_URL` | `http://localhost:5173` | Parent app URL for the Step 1 back-link |
-| `VITE_DEV_SUBJECT` | `dev-user-001` | Dev auth header, used when `AUTH_DISABLED=true` |
-| `VITE_DEV_ORGANIZATION` | `dev-org-001` | Dev auth header, used when `AUTH_DISABLED=true` |
+| `VITE_MAIN_APP_URL` | `http://localhost:5173` | Parent app URL for the take-off back-link on Step 1 |
+| `VITE_DEV_SUBJECT` | `local-user` | Dev auth header. **Must match the parent's** — see below |
+| `VITE_DEV_ORGANIZATION` | `local-org` | Dev auth header. **Must match the parent's** — see below |
 | `VITE_DEV_EMAIL` | `dev@example.com` | Dev auth header, used when `AUTH_DISABLED=true` |
 
 ### API (`api`)

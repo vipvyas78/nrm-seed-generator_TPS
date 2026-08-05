@@ -61,6 +61,14 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       return reply.status(201).send(await tpDb.createWorkflow(requireActor(request), packageId));
     });
 
+    // A take-off completing launches a workflow with nobody in the app, so the UI needs
+    // to find one it never started. Returns null rather than 404 — "not launched yet" is
+    // an ordinary answer here, not an error.
+    protectedApi.get('/api/packages/:packageId/tender-prep', async (request) => {
+      const { packageId } = params(request, z.object({ packageId: uuid }));
+      return tpDb.findWorkflowByPackage(requireActor(request), packageId);
+    });
+
     protectedApi.get('/api/tender-prep/:workflowId', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));
       return tpDb.getWorkflow(requireActor(request), workflowId);
@@ -71,50 +79,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       return tpDb.advanceStep(requireActor(request), workflowId);
     });
 
-    // ── Step 2: RFIs ────────────────────────────────────────────────────────
-
-    protectedApi.get('/api/tender-prep/:workflowId/rfis', async (request) => {
-      const { workflowId } = params(request, z.object({ workflowId: uuid }));
-      return tpDb.listRfis(requireActor(request), workflowId);
-    });
-
-    protectedApi.post('/api/tender-prep/:workflowId/rfis', async (request, reply) => {
-      const { workflowId } = params(request, z.object({ workflowId: uuid }));
-      const input = body(request, z.object({ description: z.string().trim().min(1).max(2000) }));
-      return reply.status(201).send(await tpDb.createRfi(requireActor(request), workflowId, input));
-    });
-
-    protectedApi.patch('/api/tender-prep/rfis/:rfiId', async (request) => {
-      const { rfiId } = params(request, z.object({ rfiId: uuid }));
-      const patch = body(request, z.object({
-        status: z.enum(['open', 'responded', 'closed']).optional(),
-        employerResponse: z.string().trim().max(4000).optional()
-      }));
-      return tpDb.updateRfi(requireActor(request), rfiId, patch);
-    });
-
-    // ── Step 3: SoA RAG ─────────────────────────────────────────────────────
-
-    protectedApi.get('/api/tender-prep/:workflowId/soa-rag', async (request) => {
-      const { workflowId } = params(request, z.object({ workflowId: uuid }));
-      return tpDb.getSoaRag(requireActor(request), workflowId);
-    });
-
-    protectedApi.post('/api/tender-prep/:workflowId/soa-rag', async (request) => {
-      const { workflowId } = params(request, z.object({ workflowId: uuid }));
-      const { rows } = body(request, z.object({
-        rows: z.array(z.object({
-          clauseRef: z.string().trim().min(1).max(120),
-          amendmentText: z.string().trim().max(4000).optional(),
-          ragStatus: z.enum(['red', 'amber', 'green']),
-          jctNec4Ref: z.string().trim().max(120).optional(),
-          commentary: z.string().trim().max(4000).optional()
-        }))
-      }));
-      return tpDb.upsertSoaRag(requireActor(request), workflowId, rows);
-    });
-
-    // ── Step 4: Shortlist ───────────────────────────────────────────────────
+    // ── Step 1: Shortlist (Tender Launch Pack) ──────────────────────────────
 
     // Trades a shortlist can be built for, read from SCMS. Static segment, so it takes
     // precedence over GET /api/tender-prep/:workflowId — no route conflict.
@@ -154,7 +119,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       return tpDb.confirmShortlist(requireActor(request), workflowId, input);
     });
 
-    // ── Step 5: ITT Dispatch ────────────────────────────────────────────────
+    // ── Step 2: ITT Dispatch ────────────────────────────────────────────────
 
     protectedApi.get('/api/tender-prep/:workflowId/itt', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));
@@ -172,7 +137,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       return tpDb.recordIttResponse(requireActor(request), dispatchId, response);
     });
 
-    // ── Step 6: Comparative ─────────────────────────────────────────────────
+    // ── Step 3: Comparative ─────────────────────────────────────────────────
 
     protectedApi.get('/api/tender-prep/:workflowId/comparative', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));
@@ -192,7 +157,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       return reply.status(201).send(await tpDb.upsertComparative(requireActor(request), workflowId, input));
     });
 
-    // ── Step 7: Submission ──────────────────────────────────────────────────
+    // ── Step 4: Submission ──────────────────────────────────────────────────
 
     protectedApi.get('/api/tender-prep/:workflowId/submission', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));

@@ -1,38 +1,18 @@
-"""TPS backend routes — BOQ conflict resolution and SoA analysis stubs."""
+"""TPS backend routes.
+
+Empty by design, for now. The two stubs that lived here — BOQ conflict analysis and
+SoA RAG suggestions — served the Employer RFIs and SoA RAG steps, which have moved to
+the take-off module along with Parsed Outputs. Conflict detection in particular already
+exists there (the `find_conflicts` node writes `bf_ge_conflicts`, surfaced on its own
+tab), so reimplementing it here would have been a second answer to one question.
+
+TPS's four remaining steps — Tender Launch Pack, ITT Dispatch, Comparative Analysis,
+Tender Submission — are served entirely by the Fastify BFF. This router stays registered
+so the service keeps a stable shape for whatever needs Python next.
+"""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter
 
 router = APIRouter()
-
-
-class ConflictAnalysis(BaseModel):
-    package_id: str
-    conflicts: list[dict]
-    severity: str
-
-
-class SoaAnalysis(BaseModel):
-    workflow_id: str
-    clause_refs: list[str]
-    suggested_rag: list[dict]
-
-
-@router.post("/conflicts/{package_id}", response_model=ConflictAnalysis)
-async def analyse_conflicts(package_id: str) -> ConflictAnalysis:
-    """Analyse a package's BOQ items for specification conflicts.
-
-    TODO: Implement conflict detection by cross-referencing spec_chunks against boq_items.
-    """
-    raise HTTPException(status_code=501, detail="BOQ conflict analysis not yet implemented")
-
-
-@router.post("/soa-suggestions/{workflow_id}", response_model=SoaAnalysis)
-async def suggest_soa_rag(workflow_id: str) -> SoaAnalysis:
-    """AI-assisted RAG status suggestions for SoA clauses.
-
-    TODO: Implement using spec_mapper embeddings + NRM RAG retrieval.
-    """
-    raise HTTPException(status_code=501, detail="SoA RAG suggestions not yet implemented")
