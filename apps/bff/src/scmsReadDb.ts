@@ -1,6 +1,5 @@
 import type { Database, Row } from './db.js';
 import { AppError } from './errors.js';
-import type { Actor } from './types.js';
 
 /**
  * The eligibility gate, shared by both queries so the picker's counts cannot drift from the
@@ -26,6 +25,15 @@ const ELIGIBILITY = `s.do_not_invite = false
  * TPS connects with `search_path=tps,public`, so every table below is schema-qualified —
  * an unqualified `subcontractors` would resolve inside `tps` and fail (or worse, one day
  * succeed against something unrelated).
+ *
+ * **Not org-scoped, on purpose.** The subcontractor register is shared reference data: the
+ * same firms are available whichever tender is being priced, so a buyer's own organisation
+ * has no bearing on who is capable of the work. TPS's own tables are a different matter and
+ * stay scoped — every workflow, shortlist and submission is filtered by organization_id in
+ * tenderPrepDb, and the candidate route runs assertWorkflowAccess before reaching here.
+ *
+ * Note this is a deliberate divergence from SCMS, which scopes its own register by
+ * organization_id throughout. TPS will therefore offer firms that SCMS's UI hides.
  */
 export class ScmsReadDatabase {
   /** Interpolated into SQL; validated as a bare SQL identifier by the config schema. */
@@ -40,9 +48,9 @@ export class ScmsReadDatabase {
    * the same eligibility gate the candidate query applies — so the number on the picker is
    * the number of rows you get when you click it.
    */
-  async listTradeCategories(actor: Actor, search?: string): Promise<Row[]> {
+  async listTradeCategories(search?: string): Promise<Row[]> {
     const s = this.schema;
-    const values: unknown[] = [actor.organizationId];
+    const values: unknown[] = [];
     let searchClause = '';
     if (search) {
       values.push(`%${search}%`);
@@ -52,8 +60,7 @@ export class ScmsReadDatabase {
       `SELECT ta.trade_category, COUNT(DISTINCT s.id)::int AS candidate_count
          FROM ${s}.trade_assignments ta
          JOIN ${s}.subcontractors s ON s.id = ta.subcontractor_id
-        WHERE s.organization_id = $1
-          AND ${ELIGIBILITY}
+        WHERE ${ELIGIBILITY}
           ${searchClause}
         GROUP BY ta.trade_category
         ORDER BY ta.trade_category`,
@@ -77,8 +84,16 @@ export class ScmsReadDatabase {
    * - `performance_score` stays NULL when a firm has never been rated, and sorts last.
    *   SCMS's `COALESCE(AVG(...), 0)` would score every unrated firm a hard zero, which reads
    *   as "terrible" rather than "unknown". `ratings_count` lets the UI say which it is.
+   * - Trades are matched by token, not string equality (tps.trades_match). A firm tagged
+   *   "Carpentry & Joinery" is more capable than one tagged "Carpentry", not less, and
+   *   equality threw all 333 multi-trade rows away — "Painting" and "Fire Stopping"
+   *   matched literally nothing before this.
+   *
+   * `matched_trades` returns the SCMS strings that actually satisfied the package, so a
+   * loose match ("Electrical Wholesalers" against an Electrical package) is visible in the
+   * reasoning column rather than buried.
    */
-  async getCandidatesForTrade(actor: Actor, tradeCategory: string, limit: number): Promise<Row[]> {
+  async getCandidatesForPackage(packageTerms: string[], limit: number): Promise<Row[]> {
     const s = this.schema;
     // UNIQUE (subcontractor_id, insurance_type) guarantees at most one PL and one EL row
     // per firm, so these joins cannot multiply the result.
@@ -90,6 +105,21 @@ export class ScmsReadDatabase {
               s.profile_completeness_pct,
               ROUND(AVG(r.total_score), 2) AS performance_score,
               COUNT(r.id)::int AS ratings_count,
+              ARRAY(SELECT DISTINCT ta2.trade_category
+                      FROM ${s}.trade_assignments ta2
+                     WHERE ta2.subcontractor_id = s.id
+                       AND tps.trades_match(ta2.trade_category, $1)
+                     ORDER BY ta2.trade_category) AS matched_trades,
+              -- Everything the USP is built from. Facts off the register, not marketing.
+              s.regional_coverage,
+              s.value_bands,
+              s.website,
+              (SELECT count(*) FROM ${s}.trade_assignments ta3
+                WHERE ta3.subcontractor_id = s.id)::int AS trade_count,
+              ct.full_name AS contact_name,
+              ct.role      AS contact_role,
+              ct.email     AS contact_email,
+              ct.phone     AS contact_phone,
               jsonb_build_object(
                 'pqq_status',               s.pqq_status::text,
                 'cis_status',               s.cis_status::text,
@@ -104,19 +134,35 @@ export class ScmsReadDatabase {
                    WHERE a.subcontractor_id = s.id ORDER BY a.scheme))
               ) AS compliance_flags
          FROM ${s}.subcontractors s
-         JOIN ${s}.trade_assignments ta
-           ON ta.subcontractor_id = s.id AND ta.trade_category = $2
          LEFT JOIN ${s}.performance_ratings r ON r.subcontractor_id = s.id
          LEFT JOIN ${s}.insurance_policies pl
            ON pl.subcontractor_id = s.id AND pl.insurance_type = 'pl'
          LEFT JOIN ${s}.insurance_policies el
            ON el.subcontractor_id = s.id AND el.insurance_type = 'el'
-        WHERE s.organization_id = $1
-          AND ${ELIGIBILITY}
-        GROUP BY s.id, pl.expiry_date, el.expiry_date
+         -- One contact, chosen by who you would actually send an ITT to: the estimator
+         -- first, then pre-construction, then the MD, and the general office last.
+         -- Contactable beats senior, so a row with an email outranks one without.
+         LEFT JOIN LATERAL (
+           SELECT c.full_name, c.role, c.email, c.phone
+             FROM ${s}.contacts c
+            WHERE c.subcontractor_id = s.id
+            ORDER BY CASE c.role WHEN 'estimator' THEN 1 WHEN 'pre_con' THEN 2
+                                 WHEN 'md' THEN 3 WHEN 'office' THEN 4 ELSE 5 END,
+                     (c.email IS NULL), (c.phone IS NULL), c.full_name
+            LIMIT 1
+         ) ct ON TRUE
+        WHERE ${ELIGIBILITY}
+          -- EXISTS, not a JOIN: a firm can carry several assignments that all satisfy the
+          -- package ("Carpentry" and "Carpentry & Joinery"), and joining would multiply
+          -- the ratings rows and inflate ratings_count.
+          AND EXISTS (SELECT 1 FROM ${s}.trade_assignments ta
+                       WHERE ta.subcontractor_id = s.id
+                         AND tps.trades_match(ta.trade_category, $1))
+        GROUP BY s.id, pl.expiry_date, el.expiry_date,
+                 ct.full_name, ct.role, ct.email, ct.phone
         ORDER BY AVG(r.total_score) DESC NULLS LAST, s.profile_completeness_pct DESC, s.name
-        LIMIT $3`,
-      [actor.organizationId, tradeCategory, limit]
+        LIMIT $2`,
+      [packageTerms, limit]
     ));
   }
 

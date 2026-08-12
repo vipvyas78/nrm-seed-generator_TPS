@@ -30,6 +30,10 @@ Every one of those queries lives in `apps/bff/src/scmsReadDb.ts` and nowhere els
 
 The trade-off is real — reading another module's physical tables means no contract and no compile-time signal, so a column renamed in SCMS breaks TPS at runtime. Confining it to one file, with the schema name configurable via `SCMS_SCHEMA`, is the mitigation.
 
+**The register is not organisation-scoped.** The same firms are capable of the same work whichever tender is being priced, so a buyer's own organisation has no bearing on who belongs on a shortlist — the subcontractor register is treated as shared reference data. This is a deliberate divergence from SCMS, which scopes its own register by `organization_id` throughout, so TPS will offer firms that SCMS's UI hides.
+
+TPS's own tables are scoped as strictly as before. Every workflow, shortlist, ITT and submission is filtered by `organization_id`, and `GET /shortlist/candidates` runs `assertWorkflowAccess` before it reads a single row from `scms` — so one tenant still cannot see another's tenders, and the register is only reachable by an authenticated caller.
+
 ---
 
 ## Prerequisites

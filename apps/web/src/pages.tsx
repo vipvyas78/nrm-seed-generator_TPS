@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { FormEvent, useState } from 'react';
 import { Outlet, useNavigate, useParams } from 'react-router-dom';
-import { api, type IttDispatch, type ShortlistCandidate, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
+import { api, type IttDispatch, type IttPack, type LaunchTableRow, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
 import { oidc, signIn } from './auth';
 
 function ErrorMessage({ error }: { error: unknown }) {
@@ -65,6 +65,14 @@ export function TenderPrepPage() {
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['workflow-by-package', packageId] })
   });
 
+  // Steps are freely navigable in both directions. Each step's data is kept
+  // independently, so revisiting the Tender Launch Pack to revise a shortlist loses
+  // nothing downstream.
+  const goToStep = useMutation({
+    mutationFn: (step: number) => api.setStep(workflowId!, step),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['workflow-by-package', packageId] })
+  });
+
   if (existing.isLoading) return <Busy />;
 
   if (!workflowId) {
@@ -96,8 +104,14 @@ export function TenderPrepPage() {
           const done = stepNum < currentStep;
           const active = stepNum === currentStep;
           return <li key={stepNum} className={`step-item ${active ? 'active' : ''} ${done ? 'done' : ''}`}>
-            <span className="step-num">{done ? '✓' : stepNum}</span>
-            <span className="step-title">{title}</span>
+            <button
+              className="step-jump"
+              disabled={active || goToStep.isPending}
+              onClick={() => goToStep.mutate(stepNum)}
+              title={active ? 'Current step' : `Go to ${title}`}>
+              <span className="step-num">{done ? '✓' : stepNum}</span>
+              <span className="step-title">{title}</span>
+            </button>
           </li>;
         })}
       </ul>
@@ -106,11 +120,17 @@ export function TenderPrepPage() {
     <section className="wizard-content">
       <div className="step-header">
         <h2>Step {currentStep}: {STEP_TITLES[currentStep - 1]}</h2>
-        {currentStep < FINAL_STEP && <button className="secondary small" onClick={() => advance.mutate()} disabled={advance.isPending}>
-          Next: {STEP_TITLES[currentStep]} →
-        </button>}
+        <div className="button-row">
+          {currentStep > 1 && <button className="secondary small" onClick={() => goToStep.mutate(currentStep - 1)} disabled={goToStep.isPending}>
+            ← Back: {STEP_TITLES[currentStep - 2]}
+          </button>}
+          {currentStep < FINAL_STEP && <button className="secondary small" onClick={() => advance.mutate()} disabled={advance.isPending}>
+            Next: {STEP_TITLES[currentStep]} →
+          </button>}
+        </div>
       </div>
       <ErrorMessage error={advance.error} />
+      <ErrorMessage error={goToStep.error} />
 
       {currentStep === 1 && takeoff && <TakeoffSummary takeoff={takeoff} packageId={packageId} />}
       {currentStep === 1 && <Step1TenderLaunchPack workflowId={workflowId} />}
@@ -156,221 +176,497 @@ function TakeoffSummary({ takeoff, packageId }: { takeoff: TakeoffCompletion; pa
   </div>;
 }
 
-const MAX_SHORTLIST = 5;
 
-/** PQQ state and insurance cover are shown, not enforced — the buyer weighs them. */
-function ComplianceBadges({ flags }: { flags: ShortlistCandidate['compliance_flags'] }) {
-  const pqqTone = flags.pqq_status === 'approved' ? 'green' : flags.pqq_status === 'submitted' ? 'amber' : 'grey';
-  return <span className="badge-row">
-    <span className={`badge badge-${pqqTone}`}>PQQ {flags.pqq_status.replace('_', ' ')}</span>
-    <span className={`badge badge-${flags.cis_status === 'UNKNOWN' ? 'grey' : 'green'}`}>CIS {flags.cis_status}</span>
-    <span className={`badge badge-${flags.pl_active ? 'green' : 'red'}`} title={flags.pl_expiry ? `Expires ${flags.pl_expiry}` : 'No expiry recorded'}>
-      PL {flags.pl_active ? 'active' : 'lapsed'}
-    </span>
-    <span className={`badge badge-${flags.el_active ? 'green' : 'red'}`} title={flags.el_expiry ? `Expires ${flags.el_expiry}` : 'No expiry recorded'}>
-      EL {flags.el_active ? 'active' : 'lapsed'}
-    </span>
-    {flags.at_risk && <span className="badge badge-red">At risk</span>}
-    {flags.accreditations.map((a) => <span key={a} className="badge badge-blue">{a}</span>)}
-  </span>;
+// ── Step 1: Tender Launch Pack ────────────────────────────────────────────
+//
+// The client's agreed package breakdown, in their own order, one row per package. The
+// suggested firms sit inside the row rather than exploding it, so the numbering stays 1..N
+// and reads as the project breakdown it is.
+
+/**
+ * One package. Selection is held locally until saved, so management can work down the
+ * table during the meeting and commit a package once, rather than firing a write per tick.
+ */
+function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowId: string }) {
+  const queryClient = useQueryClient();
+  const [picked, setPicked] = useState<Set<string>>(
+    () => new Set(row.subcontractors.filter((s) => s.selected).map((s) => s.subcontractor_id))
+  );
+  const [notes, setNotes] = useState(row.board_override_notes ?? '');
+  const [open, setOpen] = useState(true);
+  // The route is chosen the same way the subcontractors are: offered, then picked.
+  const [route, setRoute] = useState(row.route_of_procurement);
+  const [splitting, setSplitting] = useState(false);
+  const [splitNames, setSplitNames] = useState('');
+
+  const split = useMutation({
+    mutationFn: () => api.splitPackage(row.package_config_id,
+      splitNames.split(/[,\n]/).map((n) => n.trim()).filter(Boolean).map((n) => ({ name: n }))),
+    onSuccess: () => { setSplitting(false); setSplitNames(''); void queryClient.invalidateQueries({ queryKey: ['launch-table', workflowId] }); }
+  });
+  const unsplit = useMutation({
+    mutationFn: () => api.unsplitPackage(row.package_config_id),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['launch-table', workflowId] })
+  });
+
+  const save = useMutation({
+    mutationFn: () => api.savePackageSelection(workflowId, {
+      packageName: row.package_name,
+      packageSeq: row.seq,
+      routeOfProcurement: route,
+      boardOverrideNotes: notes.trim() || undefined,
+      // Everything shown, not just the ticks — the record has to answer "who was
+      // considered", not only "who was chosen".
+      entries: row.subcontractors
+        .filter((s) => !s.off_register)
+        .map((s, i) => ({
+          subcontractorId: s.subcontractor_id,
+          rank: i + 1,
+          selected: picked.has(s.subcontractor_id),
+          suggestionReason: s.suggestion_reason,
+          performanceScore: s.performance_score != null ? Number(s.performance_score) : undefined,
+          complianceFlags: s.compliance_flags
+        }))
+    }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['launch-table', workflowId] })
+  });
+
+  const toggle = (id: string) => setPicked((p) => {
+    const next = new Set(p);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+
+  const dirty = (() => {
+    const saved = new Set(row.subcontractors.filter((s) => s.selected).map((s) => s.subcontractor_id));
+    if (saved.size !== picked.size) return true;
+    for (const id of picked) if (!saved.has(id)) return true;
+    if (route !== row.route_of_procurement) return true;
+    return notes.trim() !== (row.board_override_notes ?? '').trim();
+  })();
+
+  return <tr className={`pkg-row ${row.is_heading ? 'pkg-heading' : ''} ${row.is_sub_package ? 'pkg-child' : ''}`}>
+    <td className="pkg-seq">{row.display_ref}</td>
+    <td className="pkg-name">
+      <strong>{row.package_name}</strong>
+      {row.is_heading && <span className="badge badge-grey">broken down</span>}
+      {row.stranded_bill_lines > 0 && <div className="alert alert-red tiny" style={{ marginTop: 6 }}>
+        {row.stranded_bill_lines} priced items sit on this heading and will not be tendered. Move them onto the sub-packages.
+      </div>}
+      {row.notes && <div className="muted pkg-note">{row.notes}</div>}
+      {!row.is_heading && <button className="link-toggle" onClick={() => setOpen(!open)}>
+        {open ? 'Hide' : `Show ${row.subcontractors.length}`} subcontractors
+      </button>}
+      {/* Splitting is only offered on a top-level package: a breakdown is one level deep. */}
+      {!row.is_sub_package && (row.is_heading
+        ? <button className="link-toggle" onClick={() => unsplit.mutate()} disabled={unsplit.isPending}>
+            Undo breakdown
+          </button>
+        : <button className="link-toggle" onClick={() => setSplitting(!splitting)}>
+            {splitting ? 'Cancel' : 'Break down…'}
+          </button>)}
+      {splitting && <div className="split-box">
+        <input
+          value={splitNames}
+          onChange={(e) => setSplitNames(e.target.value)}
+          placeholder="Mechanical, Electrical, Plumbing"
+        />
+        <div className="muted tiny">Comma-separated. Each becomes its own tendered package.</div>
+        <button className="small" onClick={() => split.mutate()}
+                disabled={split.isPending || splitNames.split(/[,\n]/).filter((n) => n.trim()).length < 2}>
+          {split.isPending ? 'Splitting…' : 'Create sub-packages'}
+        </button>
+        <ErrorMessage error={split.error} />
+      </div>}
+    </td>
+    <td>
+      {row.is_heading
+        ? <span className="muted tiny">—</span>
+        : <>
+            <select className="route-select" value={route} onChange={(e) => setRoute(e.target.value)}>
+              {(row.route_options.includes(route) ? row.route_options : [route, ...row.route_options])
+                .map((o) => <option key={o} value={o}>{o}</option>)}
+            </select>
+            {route !== row.configured_route &&
+              <div className="muted tiny">was “{row.configured_route}”</div>}
+          </>}
+    </td>
+    <td className="pkg-subs">
+      {row.is_heading
+        ? <p className="muted tiny">Tendered as its sub-packages below.</p>
+        : null}
+      {row.is_heading ? null : row.subcontractors.length === 0
+        ? <p className="muted">No firms in the register match {row.trade_terms.map((t) => `“${t}”`).join(', ')}.</p>
+        : open && <>
+          <table className="sub-table">
+            <thead>
+              <tr>
+                <th style={{ width: '2rem' }}>Invite</th>
+                <th>Subcontractor</th>
+                <th>USP</th>
+                <th>Contact</th>
+                <th>Why suggested</th>
+              </tr>
+            </thead>
+            <tbody>
+              {row.subcontractors.map((s) => <tr key={s.subcontractor_id} className={s.off_register ? 'off-register' : s.is_placeholder ? 'placeholder-row' : ''}>
+                <td>
+                  <input
+                    type="checkbox"
+                    checked={picked.has(s.subcontractor_id)}
+                    disabled={s.off_register || Boolean(s.is_placeholder)}
+                    onChange={() => toggle(s.subcontractor_id)}
+                  />
+                </td>
+                <td>
+                  <span className="sub-name">{s.name}</span>
+                  {s.trading_as && <div className="muted tiny">t/a {s.trading_as}</div>}
+                  {s.website && <div className="tiny"><a href={s.website} target="_blank" rel="noreferrer">website</a></div>}
+                </td>
+                <td className="tiny">{s.usp}</td>
+                <td className="tiny">
+                  {s.contact_name
+                    ? <>
+                        <div>{s.contact_name}{s.contact_role && <span className="muted"> · {s.contact_role.replace('_', '-')}</span>}</div>
+                        {s.contact_email && <div><a href={`mailto:${s.contact_email}`}>{s.contact_email}</a></div>}
+                        {s.contact_phone && <div className="muted">{s.contact_phone}</div>}
+                      </>
+                    : <span className="muted">No contact on file</span>}
+                </td>
+                <td className="tiny muted">{s.suggestion_reason}</td>
+              </tr>)}
+            </tbody>
+          </table>
+          <div className="pkg-actions">
+            <input
+              className="pkg-notes"
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="Meeting notes / override reason (optional)…"
+            />
+            <span className="muted">{picked.size} selected</span>
+            <button className="small" onClick={() => save.mutate()} disabled={!dirty || save.isPending}>
+              {save.isPending ? 'Saving…' : row.confirmed_at ? 'Update' : 'Confirm'}
+            </button>
+            {row.confirmed_at && !dirty && <span className="badge badge-green">Confirmed</span>}
+          </div>
+          <ErrorMessage error={save.error} />
+        </>}
+    </td>
+  </tr>;
 }
 
 function Step1TenderLaunchPack({ workflowId }: { workflowId: string }) {
-  const queryClient = useQueryClient();
-  const [search, setSearch] = useState('');
-  const [trade, setTrade] = useState<string | null>(null);
-  // Selection order is the ranking: first picked is rank 1.
-  const [picked, setPicked] = useState<string[]>([]);
-  const [notes, setNotes] = useState('');
-
-  const trades = useQuery({ queryKey: ['trades', search], queryFn: () => api.listTrades(search || undefined) });
-  const shortlists = useQuery({ queryKey: ['shortlists', workflowId], queryFn: () => api.getShortlists(workflowId) });
-  const candidates = useQuery({
-    queryKey: ['candidates', workflowId, trade],
-    queryFn: () => api.getShortlistCandidates(workflowId, trade!),
-    enabled: Boolean(trade)
+  const table = useQuery({
+    queryKey: ['launch-table', workflowId],
+    queryFn: () => api.getLaunchTable(workflowId)
   });
 
-  const lock = useMutation({
-    mutationFn: () => api.confirmShortlist(workflowId, {
-      tradeCategory: trade!,
-      boardOverrideNotes: notes.trim() || undefined,
-      entries: picked.map((id, i) => {
-        const c = candidates.data?.find((x) => x.subcontractor_id === id);
-        return {
-          subcontractorId: id,
-          rank: i + 1,
-          // NUMERIC arrives as a string, and stays absent when the firm is unrated.
-          performanceScore: c?.performance_score != null ? Number(c.performance_score) : undefined,
-          complianceFlags: c?.compliance_flags
-        };
-      })
-    }),
-    onSuccess: () => {
-      setPicked([]); setTrade(null); setNotes(''); setSearch('');
-      void queryClient.invalidateQueries({ queryKey: ['shortlists', workflowId] });
-    }
-  });
+  if (table.isLoading) return <Busy />;
+  if (table.error) return <ErrorMessage error={table.error} />;
 
-  const toggle = (id: string) => setPicked((p) =>
-    p.includes(id) ? p.filter((x) => x !== id) : p.length >= MAX_SHORTLIST ? p : [...p, id]);
+  const rows = table.data ?? [];
+  if (rows.length === 0) {
+    return <div className="panel">
+      <h3>No package breakdown configured</h3>
+      <p className="muted">
+        The Tender Launch Pack works through the package list agreed with the client when the
+        project is set up. Nothing is configured for this project or as an organisation
+        default, so there is nothing to tender yet.
+      </p>
+      <p className="muted" style={{ fontSize: '0.8rem', marginTop: 8 }}>
+        Configure it via <code>PUT /api/tender-prep/config/packages</code>.
+      </p>
+    </div>;
+  }
 
-  const selectTrade = (t: string) => { setTrade(t); setPicked([]); };
-  const alreadyLocked = new Set(shortlists.data?.map((s) => s.trade_category));
+  const totalSelected = rows.reduce((n, r) => n + r.subcontractors.filter((s) => s.selected).length, 0);
+  const confirmed = rows.filter((r) => r.confirmed_at).length;
 
-  return <div>
-    <div className="panel">
-      <h3>Programme (Placeholder)</h3>
-      <p className="muted">Tender programme Gantt — phase milestones will be displayed here.</p>
-      <div className="gantt-placeholder">Programme chart will be rendered here in a future release.</div>
+  return <div className="panel">
+    <div className="shortlist-header">
+      <h3>Tender Launch</h3>
+      <span className="muted">{confirmed} of {rows.length} packages confirmed · {totalSelected} subcontractors selected</span>
     </div>
-
-    <div className="panel">
-      <h3>Select a Trade</h3>
-      <p className="muted">Trades are read from SCMS. The count is the number of firms eligible to be invited.</p>
-      <div className="inline-form" style={{ marginBottom: 12 }}>
-        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search trades, e.g. Groundworks…" />
-      </div>
-      {trades.isLoading ? <Busy />
-        : trades.error ? <ErrorMessage error={trades.error} />
-        : trades.data?.length === 0 ? <p className="muted">No trades match “{search}”.</p>
-        : <div className="trade-chips">
-            {trades.data?.map((t) => <button
-              key={t.trade_category}
-              className={`trade-chip ${trade === t.trade_category ? 'active' : ''}`}
-              onClick={() => selectTrade(t.trade_category)}>
-              {t.trade_category}
-              <span className="trade-count">{t.candidate_count}</span>
-              {alreadyLocked.has(t.trade_category) && <span className="badge badge-green">locked</span>}
-            </button>)}
-          </div>}
-    </div>
-
-    {trade && <div className="panel">
-      <div className="shortlist-header">
-        <h3>{trade} — Candidates</h3>
-        <span className="muted">{picked.length} of {MAX_SHORTLIST} selected</span>
-      </div>
-      {candidates.isLoading ? <Busy />
-        : candidates.error ? <ErrorMessage error={candidates.error} />
-        : candidates.data?.length === 0 ? <p className="muted">No eligible firms carry this trade in SCMS.</p>
-        : <>
-          <table className="data-table">
-            <thead><tr><th>Rank</th><th>Subcontractor</th><th>Performance</th><th>Profile</th><th>Compliance</th></tr></thead>
-            <tbody>{candidates.data?.map((c) => {
-              const at = picked.indexOf(c.subcontractor_id);
-              return <tr key={c.subcontractor_id} className={at >= 0 ? 'row-done' : ''}>
-                <td>
-                  <button
-                    className={`rank-toggle ${at >= 0 ? 'active' : ''}`}
-                    disabled={at < 0 && picked.length >= MAX_SHORTLIST}
-                    onClick={() => toggle(c.subcontractor_id)}>
-                    {at >= 0 ? `#${at + 1}` : 'Add'}
-                  </button>
-                </td>
-                <td>
-                  <strong>{c.name}</strong>
-                  {c.trading_as && <span className="muted"> t/a {c.trading_as}</span>}
-                </td>
-                <td>{c.performance_score != null
-                  ? <>{Number(c.performance_score).toFixed(1)} <span className="muted">({c.ratings_count})</span></>
-                  : <span className="muted">Unrated</span>}</td>
-                <td>{c.profile_completeness_pct}%</td>
-                <td><ComplianceBadges flags={c.compliance_flags} /></td>
-              </tr>;
-            })}</tbody>
-          </table>
-          <div className="inline-form" style={{ marginTop: 12 }}>
-            <input value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Board override notes (optional)…" />
-            <button onClick={() => lock.mutate()} disabled={picked.length === 0 || lock.isPending}>
-              {lock.isPending ? 'Locking…' : `Lock Shortlist (${picked.length})`}
-            </button>
-          </div>
-          <ErrorMessage error={lock.error} />
-        </>}
-    </div>}
-
-    <div className="panel">
-      <h3>Locked Shortlists</h3>
-      {shortlists.isLoading ? <Busy />
-        : shortlists.data?.length === 0 ? <p className="muted">Nothing locked yet. Pick a trade above to build a shortlist.</p>
-        : shortlists.data?.map((sl) => <div key={sl.trade_category} className="shortlist-card">
-          <div className="shortlist-header">
-            <h4>{sl.trade_category}</h4>
-            {sl.confirmed_at && <span className="badge badge-green">Locked {new Date(sl.confirmed_at).toLocaleDateString()}</span>}
-          </div>
-          {sl.board_override_notes && <p className="muted" style={{ fontSize: '0.8rem' }}>{sl.board_override_notes}</p>}
-          <table className="data-table"><thead><tr><th>Rank</th><th>Subcontractor ID</th><th>Performance Score</th><th>Board Approved</th></tr></thead>
-            <tbody>{sl.entries.map((e) => <tr key={e.id}>
-              <td>#{e.rank}</td>
-              <td><code>{e.subcontractor_id}</code></td>
-              <td>{e.performance_score ?? <span className="muted">Unrated</span>}</td>
-              <td>{e.board_approved ? <span className="badge badge-green">Yes</span> : <span className="badge badge-grey">Pending</span>}</td>
-            </tr>)}</tbody>
-          </table>
-        </div>)}
+    <p className="muted" style={{ marginBottom: 12 }}>
+      Suggestions are read live from the supply chain register. Tick the firms to invite —
+      only those receive an ITT at Step 2.
+    </p>
+    <div className="table-scroll">
+      <table className="data-table launch-table">
+        <thead>
+          <tr>
+            <th style={{ width: '3rem' }}>#</th>
+            <th style={{ width: '16rem' }}>Package</th>
+            <th style={{ width: '11rem' }}>Route of Procurement</th>
+            <th>Subcontractors · invite and why suggested</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => <PackageRow key={row.display_ref} row={row} workflowId={workflowId} />)}
+        </tbody>
+      </table>
     </div>
   </div>;
 }
 
 // ── Step 2: ITT Dispatch ──────────────────────────────────────────────────
 
-function Step2IttDispatch({ workflowId }: { workflowId: string }) {
-  const queryClient = useQueryClient();
-  const itts = useQuery({ queryKey: ['itt', workflowId], queryFn: () => api.listItt(workflowId) });
+// ── Step 2: ITT Dispatch ──────────────────────────────────────────────────
+//
+// One ITT per trade package, assembled server-side from the live project data. Nothing is
+// sent from here: these are the packs as they would go out, for review first.
 
-  const dispatch = useMutation({
-    mutationFn: () => api.dispatchItt(workflowId),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['itt', workflowId] })
-  });
+function DocSchedule({ docs }: { docs: IttPack['documents'] }) {
+  const groups = docs.reduce<Record<string, IttPack['documents']>>((acc, d) => {
+    (acc[d.doc_type] ??= []).push(d);
+    return acc;
+  }, {});
+  const label = (t: string) => t.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  return <>{Object.entries(groups).map(([type, items]) => <details key={type} className="doc-group">
+    <summary><strong>{label(type)}</strong> <span className="muted">({items.length})</span></summary>
+    <ul className="doc-list">
+      {items.map((d) => <li key={d.filename}>
+        {d.filename}{d.page_count > 0 && <span className="muted"> · {d.page_count} pp</span>}
+      </li>)}
+    </ul>
+  </details>)}</>;
+}
 
-  const respond = useMutation({
-    mutationFn: ({ dispatchId, response }: { dispatchId: string; response: IttDispatch['response'] }) =>
-      api.recordIttResponse(dispatchId, response),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['itt', workflowId] })
-  });
+function IttPackView({ pack }: { pack: IttPack }) {
+  const t = pack.takeoff as Record<string, string | number | null>;
+  return <div className="itt-pack">
+    {pack.review_notes.length > 0 && <div className="alert alert-red">
+      <strong>Not ready to issue:</strong>
+      <ul style={{ margin: '4px 0 0 18px' }}>{pack.review_notes.map((n) => <li key={n}>{n}</li>)}</ul>
+    </div>}
 
-  const stats = {
-    sent: itts.data?.filter((d) => d.dispatched_at).length ?? 0,
-    willTender: itts.data?.filter((d) => d.response === 'will_tender').length ?? 0,
-    declined: itts.data?.filter((d) => d.response === 'decline').length ?? 0,
-    noResponse: itts.data?.filter((d) => !d.response).length ?? 0
-  };
-
-  return <div className="panel">
-    <div className="stats-bar">
-      <div className="stat"><span className="stat-value">{stats.sent}</span><span className="stat-label">Sent</span></div>
-      <div className="stat"><span className="stat-value" style={{ color: '#22c55e' }}>{stats.willTender}</span><span className="stat-label">Will Tender</span></div>
-      <div className="stat"><span className="stat-value" style={{ color: '#ef4444' }}>{stats.declined}</span><span className="stat-label">Declined</span></div>
-      <div className="stat"><span className="stat-value" style={{ color: '#6b7280' }}>{stats.noResponse}</span><span className="stat-label">No Response</span></div>
+    <div className="info-row">
+      <div className="info-item"><span className="info-label">ITT reference</span>
+        <code>ITT-{String(t.projectName ?? 'PROJECT').toUpperCase()}-{pack.display_ref}</code></div>
+      <div className="info-item"><span className="info-label">Route of procurement</span>{pack.route_of_procurement}</div>
+      <div className="info-item"><span className="info-label">Take-off</span><code>{String(t.takeoffId ?? '—')}</code></div>
+      <div className="info-item"><span className="info-label">BoQ</span><code>{pack.boq_id ?? '—'}</code></div>
     </div>
-    <div className="button-row" style={{ marginBottom: 12 }}>
-      <button onClick={() => dispatch.mutate()} disabled={dispatch.isPending}>Dispatch ITTs</button>
+
+    <h4>1. Tender return — what a compliant submission must contain</h4>
+    <p className="muted tiny">Evaluation is based on these. A return missing a required item is not compliant.</p>
+    <table className="data-table">
+      <thead><tr><th style={{ width: '2rem' }}>#</th><th>Form</th><th>Detail</th><th>Required</th></tr></thead>
+      <tbody>{pack.return_forms.map((f) => <tr key={f.seq}>
+        <td className="tiny">{f.seq}</td>
+        <td className="tiny"><strong>{f.name}</strong></td>
+        <td className="tiny muted">{f.description ?? '—'}</td>
+        <td>{f.is_required
+          ? <span className="badge badge-red">Required</span>
+          : <span className="badge badge-grey">Optional</span>}</td>
+      </tr>)}</tbody>
+    </table>
+
+    <h4>1b. Recipients</h4>
+    <p className="muted tiny">The firms selected at the tender launch meeting. Nothing has been sent.</p>
+    <table className="data-table">
+      <thead><tr><th>Rank</th><th>Subcontractor</th><th>Why selected</th></tr></thead>
+      <tbody>{pack.recipients.map((r) => <tr key={r.subcontractor_id}>
+        <td>#{r.rank}</td>
+        <td><code className="tiny">{r.subcontractor_id}</code></td>
+        <td className="tiny muted">{r.suggestion_reason ?? '—'}</td>
+      </tr>)}</tbody>
+    </table>
+
+    <h4>2. Scope and Bill of Quantities</h4>
+    <p className="muted tiny">
+      {pack.boq_summary.total} lines attributed by NRM classification — {pack.boq_summary.priceable} with
+      measured quantities, {pack.boq_summary.scope_only} carrying scope without a quantity.
+      Rates are omitted deliberately: each tenderer prices independently.
+    </p>
+    <div className="table-scroll">
+      <table className="data-table itt-boq">
+        <thead><tr><th>GE</th><th>Element</th><th>Description</th><th>Qty</th><th>Unit</th><th>Rate £</th></tr></thead>
+        <tbody>{pack.boq_lines.map((l, i) => <tr key={i} className={l.is_priceable ? '' : 'scope-only'}>
+          <td className="tiny">{l.ge_code}</td>
+          <td className="tiny">{l.element_code ?? '—'}</td>
+          <td className="tiny">{l.description}</td>
+          <td className="tiny" style={{ textAlign: 'right' }}>
+            {l.is_priceable ? Number(l.quantity).toLocaleString() : <span className="muted">scope</span>}
+          </td>
+          <td className="tiny">{l.unit ?? ''}</td>
+          <td className="tiny muted" style={{ textAlign: 'right' }}>to be priced</td>
+        </tr>)}
+        {pack.boq_lines.length === 0 && <tr><td colSpan={6} className="muted" style={{ textAlign: 'center', padding: '1rem' }}>
+          No measured lines attributed to this package.
+        </td></tr>}
+        </tbody>
+      </table>
     </div>
-    {itts.isLoading ? <Busy /> : itts.data?.length === 0 ? <p className="muted">No ITTs dispatched. Lock shortlists in Step 4 first.</p>
-      : <table className="data-table">
-          <thead><tr><th>Trade</th><th>Rank</th><th>Sub ID</th><th>Dispatched</th><th>Response</th><th>Action</th></tr></thead>
-          <tbody>{itts.data?.map((d) => <tr key={d.id}>
-            <td>{d.trade_category ?? '—'}</td>
-            <td>#{d.rank}</td>
-            <td><code style={{ fontSize: '0.75rem' }}>{d.subcontractor_id}</code></td>
-            <td>{d.dispatched_at ? new Date(d.dispatched_at).toLocaleDateString() : '—'}</td>
-            <td>{d.response
-              ? <span className={`badge badge-${d.response === 'will_tender' ? 'green' : d.response === 'decline' ? 'red' : 'amber'}`}>{d.response.replace('_', ' ')}</span>
-              : <span className="badge badge-grey">Awaiting</span>}</td>
-            <td>
-              {!d.response && d.dispatched_at && <select className="small-select" defaultValue="" onChange={(e) => { if (e.target.value) respond.mutate({ dispatchId: d.id, response: e.target.value as IttDispatch['response'] }); }}>
-                <option value="" disabled>Record response…</option>
-                <option value="will_tender">Will tender</option>
-                <option value="decline">Decline</option>
-                <option value="considering">Considering</option>
-                <option value="no_response">No response</option>
-              </select>}
-            </td>
-          </tr>)}</tbody>
-        </table>}
+
+    {pack.bill_lines.length > 0 && <>
+      <h4>2b. Schedule of items to be priced</h4>
+      <p className="muted tiny">
+        {pack.bill_lines.length} authored lines. These are not measured from the take-off —
+        surveys and staged fees have no quantity behind them — so each is priced as stated.
+      </p>
+      <div className="table-scroll">
+        <table className="data-table itt-boq">
+          <thead><tr><th>Ref</th><th>Item</th><th>Required for</th><th>Qty</th><th>Unit</th><th>Rate £</th></tr></thead>
+          <tbody>{pack.bill_lines.map((l, i, all) => <>
+            {(i === 0 || all[i - 1].section !== l.section) && l.section &&
+              <tr key={`s-${l.seq}`} className="bill-section"><td colSpan={6}><strong>{l.section}</strong></td></tr>}
+            <tr key={l.seq}>
+              <td className="tiny">{l.ref ?? l.seq}</td>
+              <td className="tiny">{l.description}{l.notes && <div className="muted">{l.notes}</div>}</td>
+              <td className="tiny">{l.required_for ?? '—'}</td>
+              <td className="tiny" style={{ textAlign: 'right' }}>{l.quantity ? Number(l.quantity).toLocaleString() : ''}</td>
+              <td className="tiny">{l.unit}</td>
+              <td className="tiny muted" style={{ textAlign: 'right' }}>to be priced</td>
+            </tr>
+          </>)}</tbody>
+        </table>
+      </div>
+    </>}
+
+    <h4>2c. Scope of works matrix</h4>
+    <p className="muted tiny">
+      What the subcontractor carries around the measured bill — {pack.scope_summary.total} items:
+      {' '}{pack.scope_summary.package_specific} specific to this package, {pack.scope_summary.general} general.
+      {' '}<strong>{pack.scope_summary.contract}</strong> are Contract items to be priced;
+      {' '}<strong>{pack.scope_summary.profit_plan}</strong> are Profit Plan and must <em>not</em> be priced by the tenderer.
+    </p>
+    {pack.scope_items.length === 0
+      ? <p className="muted tiny">No scope items for this package.</p>
+      : <details className="doc-group">
+          <summary><strong>Show {pack.scope_items.length} scope items</strong></summary>
+          <div className="table-scroll">
+            <table className="data-table itt-boq">
+              <thead><tr><th>Ref</th><th>Item</th><th>Designation</th><th>Cost basis</th></tr></thead>
+              <tbody>{pack.scope_items.map((s, i) => <tr key={i} className={s.procurement_stage === 'Profit Plan' ? 'scope-only' : ''}>
+                <td className="tiny">{s.ref}</td>
+                <td className="tiny">{s.description}</td>
+                <td className="tiny">{s.designation ?? '—'}</td>
+                <td className="tiny">{s.procurement_stage
+                  ? <span className={`badge badge-${s.procurement_stage === 'Contract' ? 'blue' : 'amber'}`}>{s.procurement_stage}</span>
+                  : '—'}</td>
+              </tr>)}</tbody>
+            </table>
+          </div>
+        </details>}
+
+    <h4>3. Documents issued</h4>
+    <p className="muted tiny">
+      All {pack.documents.length} tender documents are issued with every package — an Employer's
+      Requirement binds the subcontractor whether or not its filename mentions their trade.
+    </p>
+    <DocSchedule docs={pack.documents} />
+
+    <h4>4. Schedule of attendances</h4>
+    <p className="muted tiny">
+      Who provides what. <strong>SC</strong> subcontractor · <strong>H</strong> main contractor ·
+      <strong> J</strong> joint · <strong>N/A</strong> not available.
+      {' '}{pack.attendance_summary.subcontractor} carried by the subcontractor,
+      {' '}{pack.attendance_summary.main_contractor} by the main contractor.
+    </p>
+    {pack.attendances.length === 0
+      ? <p className="muted tiny">No schedule configured.</p>
+      : <div className="table-scroll">
+          <table className="data-table itt-boq">
+            <thead><tr><th>Group</th><th>Attendance / responsibility</th><th>Owner</th><th>Notes</th></tr></thead>
+            <tbody>{pack.attendances.map((a, i, all) => <tr key={a.seq}>
+              <td className="tiny">{i === 0 || all[i - 1].group_name !== a.group_name ? <strong>{a.group_name}</strong> : ''}</td>
+              <td className="tiny">{a.description}</td>
+              <td><span className={`badge badge-${a.owner === 'SC' ? 'amber' : a.owner === 'H' ? 'green' : a.owner === 'J' ? 'blue' : 'grey'}`}>{a.owner}</span></td>
+              <td className="tiny muted">{a.notes ?? ''}</td>
+            </tr>)}</tbody>
+          </table>
+        </div>}
+
+    <h4>5. Terms of employment — for information only</h4>
+    <p className="muted tiny">
+      The form of subcontract and draft pre-contract minutes are issued so a tenderer knows
+      what they would be signing up to if successful. They are <strong>not</strong> priced against
+      and are not a returnable.
+    </p>
+    {pack.precontract_minutes
+      ? <div className="info-row">
+          <div className="info-item"><span className="info-label">Form of subcontract</span>{pack.precontract_minutes.form_of_subcontract ?? '—'}</div>
+          <div className="info-item"><span className="info-label">Type</span>{pack.precontract_minutes.subcontract_type ?? '—'}</div>
+          <div className="info-item"><span className="info-label">Executed</span>{pack.precontract_minutes.executed_as ?? '—'}</div>
+          <div className="info-item"><span className="info-label">Status</span>
+            <span className="badge badge-grey">{pack.precontract_minutes.status.replace(/_/g, ' ')}</span></div>
+        </div>
+      : <p className="muted tiny">No draft minutes — the tenderer would be pricing without the terms of employment.</p>}
+
+    <h4>6. Value Engineering</h4>
+    <div className="alert alert-grey">
+      <strong>Mandatory.</strong> Every tenderer must submit at least one Value Engineering
+      proposal stating the saving, the programme effect, any departure from the specification
+      and the Employer's Requirements clause affected. A return without one is not compliant.
+    </div>
   </div>;
 }
+
+function Step2IttDispatch({ workflowId }: { workflowId: string }) {
+  const [open, setOpen] = useState<string | null>(null);
+  const itts = useQuery({ queryKey: ['itts', workflowId], queryFn: () => api.listItts(workflowId) });
+  const pack = useQuery({
+    queryKey: ['itt-pack', workflowId, open],
+    queryFn: () => api.getIttPack(workflowId, open!),
+    enabled: Boolean(open)
+  });
+
+  if (itts.isLoading) return <Busy />;
+  if (itts.error) return <ErrorMessage error={itts.error} />;
+  const rows = itts.data ?? [];
+
+  if (rows.length === 0) {
+    return <div className="panel">
+      <h3>No ITTs yet</h3>
+      <p className="muted">
+        An ITT is built for each package once the tender launch meeting has selected the firms
+        to invite. Go back to the Tender Launch Pack, tick the subcontractors for a package and
+        confirm it.
+      </p>
+    </div>;
+  }
+
+  return <div className="panel">
+    <div className="shortlist-header">
+      <h3>Invitations to Tender</h3>
+      <span className="muted">{rows.length} package{rows.length === 1 ? '' : 's'} · {rows.reduce((n, r) => n + Number(r.recipients), 0)} recipients</span>
+    </div>
+    <p className="muted" style={{ marginBottom: 12 }}>
+      Built from the live take-off, package configuration and document set. <strong>Nothing is
+      sent</strong> — these are drafts for review.
+    </p>
+    <div className="table-scroll">
+      <table className="data-table">
+        <thead><tr><th>#</th><th>Package</th><th>Route of Procurement</th><th>Recipients</th><th>Status</th><th></th></tr></thead>
+        <tbody>{rows.map((r) => <>
+          <tr key={r.package_name}>
+            <td>{r.package_seq ?? '—'}</td>
+            <td><strong>{r.package_name}</strong></td>
+            <td className="tiny">{r.route_of_procurement ?? '—'}</td>
+            <td>{r.recipients}</td>
+            <td>{Number(r.dispatched) > 0
+              ? <span className="badge badge-blue">logged {r.dispatched}</span>
+              : <span className="badge badge-grey">not issued</span>}</td>
+            <td>
+              <button className="small secondary" onClick={() => setOpen(open === r.package_name ? null : r.package_name)}>
+                {open === r.package_name ? 'Close' : 'View ITT'}
+              </button>
+            </td>
+          </tr>
+          {open === r.package_name && <tr key={`${r.package_name}-pack`}>
+            <td colSpan={6} className="itt-cell">
+              {pack.isLoading ? <Busy /> : pack.error ? <ErrorMessage error={pack.error} />
+                : pack.data ? <IttPackView pack={pack.data} /> : null}
+            </td>
+          </tr>}
+        </>)}</tbody>
+      </table>
+    </div>
+  </div>;
+}
+
 
 // ── Step 3: Comparative Analysis ──────────────────────────────────────────
 

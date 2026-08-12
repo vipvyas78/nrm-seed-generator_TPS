@@ -96,7 +96,63 @@ code { font-family: monospace; font-size: 0.85em; background: #f3f4f6; padding: 
 .text-red { color: #dc2626; }
 .text-green { color: #16a34a; }
 
-/* Step 4 — trade picker and candidate selection */
+/* Step 1 — Tender Launch table: one row per configured package */
+.table-scroll { overflow-x: auto; }
+.launch-table td { vertical-align: top; padding: 10px 12px; }
+.pkg-row { border-top: 1px solid #e5e7eb; }
+.pkg-seq { font-weight: 700; color: #6b7280; text-align: right; }
+.pkg-name strong { display: block; }
+.pkg-note { font-size: 0.75rem; margin-top: 2px; }
+.link-toggle { background: none; border: none; color: #2563eb; padding: 2px 0; font-size: 0.75rem; cursor: pointer; }
+.link-toggle:hover { background: none; text-decoration: underline; }
+.pkg-subs { min-width: 22rem; }
+/* Step 2 — ITT packs */
+.itt-cell { background: #f9fafb; padding: 16px !important; }
+.itt-pack h4 { font-size: 0.85rem; margin: 16px 0 6px; padding-bottom: 4px; border-bottom: 1px solid #e5e7eb; }
+.itt-pack h4:first-of-type { margin-top: 8px; }
+.itt-boq .scope-only td { background: #fffbeb; }
+.doc-group { margin-bottom: 4px; }
+.doc-group summary { cursor: pointer; font-size: 0.8rem; padding: 3px 0; }
+.doc-list { margin: 4px 0 8px 20px; font-size: 0.72rem; color: #4b5563; }
+.doc-list li { padding: 1px 0; }
+
+/* Route picker and package breakdown */
+.route-select { width: 100%; padding: 4px 6px; font-size: 0.78rem; }
+.pkg-heading { background: #f9fafb; }
+.pkg-heading .pkg-name strong { color: #374151; }
+.pkg-child .pkg-seq { color: #9ca3af; font-weight: 600; }
+.pkg-child .pkg-name { padding-left: 16px; border-left: 2px solid #e5e7eb; }
+.split-box { margin-top: 6px; padding: 8px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px; }
+.split-box input { margin-bottom: 4px; }
+.split-box button { margin-top: 6px; }
+
+/* Nested subcontractor table inside a package row */
+.sub-table { width: 100%; border-collapse: collapse; }
+.sub-table th { text-align: left; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; color: #6b7280; font-weight: 600; padding: 4px 8px; border-bottom: 1px solid #e5e7eb; }
+.sub-table td { padding: 6px 8px; vertical-align: top; border-bottom: 1px dashed #f3f4f6; }
+.sub-table tbody tr:last-child td { border-bottom: none; }
+.sub-table input[type="checkbox"] { width: auto; margin: 0; cursor: pointer; }
+.sub-table .sub-name { font-size: 0.85rem; font-weight: 500; }
+.tiny { font-size: 0.72rem; line-height: 1.35; }
+.off-register .sub-name { color: #b91c1c; font-style: italic; }
+
+/* Sidebar steps are navigable in both directions */
+.step-jump { display: flex; align-items: center; gap: 10px; width: 100%; background: none; border: none; padding: 0; color: inherit; font: inherit; cursor: pointer; text-align: left; }
+.step-jump:hover:not(:disabled) { background: none; opacity: 0.75; }
+.step-jump:disabled { opacity: 1; cursor: default; }
+
+.sub-list { list-style: none; margin: 0; padding: 0; }
+.sub { padding: 5px 0; border-bottom: 1px dashed #f3f4f6; }
+.sub:last-child { border-bottom: none; }
+.sub label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.sub input[type="checkbox"] { width: auto; margin: 0; cursor: pointer; }
+.sub-name { font-size: 0.875rem; }
+.sub-reason { font-size: 0.72rem; color: #6b7280; margin-left: 24px; }
+.sub.off-register .sub-name { color: #b91c1c; font-style: italic; }
+.pkg-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.pkg-notes { flex: 1; min-width: 12rem; }
+
+/* Trade picker (project configuration helper) */
 .trade-chips { display: flex; flex-wrap: wrap; gap: 8px; max-height: 220px; overflow-y: auto; }
 .trade-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; background: #fff; color: #374151; border: 1px solid #d1d5db; border-radius: 9999px; font-size: 0.8rem; font-weight: 500; }
 .trade-chip:hover:not(:disabled) { background: #f9fafb; }
@@ -109,3 +165,6 @@ code { font-family: monospace; font-size: 0.85em; background: #f3f4f6; padding: 
 .rank-toggle { padding: 3px 10px; min-width: 48px; background: #fff; color: #374151; border: 1px solid #d1d5db; font-size: 0.75rem; }
 .rank-toggle:hover:not(:disabled) { background: #f9fafb; }
 .rank-toggle.active { background: #2563eb; color: #fff; border-color: #2563eb; }
+.bill-section td { background: #f3f4f6; font-size: 0.75rem; padding: 5px 8px; }
+.placeholder-row td { background: #fef3c7; }
+.placeholder-row .sub-name { font-style: italic; color: #92400e; }

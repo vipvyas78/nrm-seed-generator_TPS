@@ -11,6 +11,7 @@
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { loadWorkerConfig } from './config.js';
+import { BoqReadDatabase } from './boqReadDb.js';
 import { Database } from './db.js';
 import { handleTakeoffCompleted } from './queues.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
@@ -75,7 +76,7 @@ describe('launching from a take-off', () => {
   const connect = () => {
     const config = loadWorkerConfig({ ...process.env, REDIS_URL: 'redis://unused:6379' });
     const db = new Database(config);
-    return { db, tpDb: new TenderPrepDatabase(db, new ScmsReadDatabase(db, config.SCMS_SCHEMA)) };
+    return { db, tpDb: new TenderPrepDatabase(db, new ScmsReadDatabase(db, config.SCMS_SCHEMA), new BoqReadDatabase(db)) };
   };
 
   it('creates the workflow on Tender Launch Pack and keeps the take-off detail', async () => {

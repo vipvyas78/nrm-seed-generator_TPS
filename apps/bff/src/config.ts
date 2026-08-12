@@ -14,7 +14,15 @@ const schema = z.object({
   // candidates) rather than calling the SCMS BFF, so the name is interpolated into SQL
   // and carries the same bare-identifier constraint as DATABASE_SCHEMA above.
   SCMS_SCHEMA: z.string().regex(/^[a-z_][a-z0-9_]*$/, 'SCMS_SCHEMA must be a bare SQL identifier').default('scms'),
-  WEB_ORIGIN: z.string().url().default('http://localhost:5175'),
+  // One or more comma-separated origins. A list rather than a single value because the
+  // same deployment is reached by more than one name: http://localhost:5175 from the
+  // machine running it, and http://<lan-ip>:5175 from a phone or tablet on the same
+  // network. An origin missing from here fails CORS, which in a browser looks like the
+  // API being down rather than a configuration problem.
+  WEB_ORIGIN: z.string().default('http://localhost:5175').transform((v) =>
+    v.split(',').map((o) => o.trim()).filter(Boolean)
+  ).refine((origins) => origins.length > 0 && origins.every((o) => URL.canParse(o)),
+    { message: 'WEB_ORIGIN must be a comma-separated list of absolute URLs' }),
   OIDC_ISSUER: optionalUrl,
   OIDC_AUDIENCE: z.string().optional(),
   OIDC_JWKS_URI: optionalUrl,

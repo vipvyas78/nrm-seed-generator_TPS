@@ -1,4 +1,5 @@
 import { loadWorkerConfig } from './config.js';
+import { BoqReadDatabase } from './boqReadDb.js';
 import { Database } from './db.js';
 import { startTakeoffCompletionWorker } from './queues.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
@@ -6,7 +7,7 @@ import { TenderPrepDatabase } from './tenderPrepDb.js';
 
 const config = loadWorkerConfig();
 const db = new Database(config);
-const tpDb = new TenderPrepDatabase(db, new ScmsReadDatabase(db, config.SCMS_SCHEMA));
+const tpDb = new TenderPrepDatabase(db, new ScmsReadDatabase(db, config.SCMS_SCHEMA), new BoqReadDatabase(db));
 const worker = startTakeoffCompletionWorker(config, tpDb);
 
 worker.on('failed', (job, error) => {
