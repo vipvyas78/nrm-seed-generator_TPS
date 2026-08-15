@@ -86,17 +86,24 @@ export type IttSummary = {
   confirmed_at: string | null;
   recipients: number;
   dispatched: number;
+  sent: number;
+  failed: number;
+  skipped_no_email: number;
   responded: number;
 };
 
 export type IttBoqLine = {
+  id: string;
   ge_code: string | null;
   element_code: string | null;
   description: string;
   quantity: string | null;
   unit: string | null;
   is_priceable: boolean;
+  ignored: boolean;
 };
+
+export type IttLineSection = 'return_form' | 'boq_line' | 'bill_line' | 'scope_item' | 'document';
 
 /** The assembled Invitation to Tender for one package. Rates are deliberately absent. */
 export type IttPack = {
@@ -106,21 +113,22 @@ export type IttPack = {
   takeoff: Record<string, unknown>;
   boq_id: string | null;
   confirmed_at: string | null;
-  recipients: Array<{ subcontractor_id: string; rank: number; suggestion_reason: string | null }>;
+  recipients: Array<{ shortlist_entry_id: string; subcontractor_id: string; rank: number; suggestion_reason: string | null }>;
   boq_lines: IttBoqLine[];
   /** Lines written in TPS for work a take-off cannot measure — surveys, staged fees. */
   bill_lines: Array<{
-    seq: number; section: string | null; ref: string | null; description: string;
+    id: string; seq: number; section: string | null; ref: string | null; description: string;
     unit: string; quantity: string | null; required_for: string | null; notes: string | null;
+    ignored: boolean;
   }>;
   boq_summary: { total: number; priceable: number; scope_only: number; authored: number };
-  documents: Array<{ doc_type: string; filename: string; page_count: number }>;
+  documents: Array<{ id: string; doc_type: string; filename: string; page_count: number; ignored: boolean }>;
   /** Section 1 — what a compliant tender return must contain. */
-  return_forms: Array<{ seq: number; name: string; description: string | null; is_required: boolean }>;
+  return_forms: Array<{ id: string; seq: number; name: string; description: string | null; is_required: boolean; ignored: boolean }>;
   /** Section 2 — what the subcontractor carries around the measured bill. */
   scope_items: Array<{
-    ref: number; description: string;
-    procurement_stage: string | null; designation: string | null;
+    id: string; ref: number; description: string;
+    procurement_stage: string | null; designation: string | null; ignored: boolean;
   }>;
   scope_summary: {
     total: number; package_specific: number; general: number;
@@ -188,6 +196,15 @@ export type LaunchCandidate = {
     el_active: boolean;
     accreditations: string[];
   };
+};
+
+/** The outcome of clicking "Confirm ITT" for one package. */
+export type ConfirmIttResult = {
+  package_name: string;
+  sent: number;
+  failed: number;
+  skipped_no_email: number;
+  recipients: Array<{ subcontractorId: string; status: 'sent' | 'failed' | 'skipped_no_email'; error?: string }>;
 };
 
 export type IttDispatch = {
@@ -294,8 +311,12 @@ export const api = {
   getIttPack: (workflowId: string, packageName: string) =>
     request<IttPack>(`/api/tender-prep/${workflowId}/itt-pack?packageName=${encodeURIComponent(packageName)}`),
   listItt: (workflowId: string) => request<IttDispatch[]>(`/api/tender-prep/${workflowId}/itt`),
-  dispatchItt: (workflowId: string) =>
-    request<IttDispatch[]>(`/api/tender-prep/${workflowId}/itt/dispatch`, { method: 'POST' }),
+  setIttLineOverride: (workflowId: string, packageName: string, input: { section: IttLineSection; itemId: string; ignored: boolean }) =>
+    request<{ ignored: boolean }>(`/api/tender-prep/${workflowId}/itts/${encodeURIComponent(packageName)}/line-overrides`, {
+      method: 'PUT', body: JSON.stringify(input)
+    }),
+  confirmItt: (workflowId: string, packageName: string) =>
+    request<ConfirmIttResult>(`/api/tender-prep/${workflowId}/itts/${encodeURIComponent(packageName)}/confirm`, { method: 'POST' }),
   recordIttResponse: (dispatchId: string, response: IttDispatch['response']) =>
     request<IttDispatch>(`/api/tender-prep/itt/${dispatchId}`, { method: 'PATCH', body: JSON.stringify({ response }) }),
 

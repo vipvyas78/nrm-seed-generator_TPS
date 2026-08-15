@@ -63,7 +63,7 @@ export class BoqReadDatabase {
    */
   async linesForPackage(boqId: string, pkg: Attribution): Promise<Row[]> {
     return this.run(() => this.db.query(
-      `SELECT element_code, ge_code, description, quantity, unit, sort_order,
+      `SELECT id, element_code, ge_code, description, quantity, unit, sort_order,
               (quantity IS NOT NULL AND quantity > 0) AS is_priceable
          FROM public.boq_items
         WHERE boq_id = $1
@@ -85,7 +85,7 @@ export class BoqReadDatabase {
    */
   async documentsForSession(sessionId: string): Promise<Row[]> {
     return this.run(() => this.db.query(
-      `SELECT doc_type, filename, COALESCE(page_count, 0) AS page_count
+      `SELECT id, doc_type, filename, COALESCE(page_count, 0) AS page_count
          FROM public.tender_documents
         WHERE session_id = $1
           AND doc_type NOT IN ('ignore', 'unknown')

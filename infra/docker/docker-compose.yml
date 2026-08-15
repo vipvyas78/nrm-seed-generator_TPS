@@ -31,6 +31,11 @@ services:
     working_dir: /app/apps/bff
     ports:
       - "3200:3200"
+    # Picks up CLOUDFLARE_*/BUILDFLOW_*/DROPBOX_*/TEST_* optional integration vars from the
+    # repo-root .env. `environment:` below still wins on any key collision, so the
+    # container-network overrides (DATABASE_URL, etc.) are unaffected.
+    env_file:
+      - ../../.env
     environment:
       NODE_ENV: ${NODE_ENV:-development}
       PORT: "3200"

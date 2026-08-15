@@ -167,6 +167,39 @@ export class ScmsReadDatabase {
   }
 
   /**
+   * The one contact to email for each of a fixed set of firms — the recipient lookup an ITT
+   * send needs. Same ranked contact as `getCandidatesForPackage` (estimator > pre_con > md >
+   * office, contactable beats senior); the only difference is the WHERE clause, which is
+   * `s.id = ANY(...)` here instead of a trade match, because by this point the meeting has
+   * already picked the firms and there is nothing left to search for.
+   *
+   * No eligibility filter: a firm selected at the tender launch meeting is being emailed
+   * because it was chosen, not re-screened against do-not-invite/status at send time.
+   */
+  async getContactsForSubcontractors(subcontractorIds: string[]): Promise<Row[]> {
+    if (subcontractorIds.length === 0) return [];
+    const s = this.schema;
+    return this.run(() => this.db.query(
+      `SELECT s.id AS subcontractor_id,
+              s.name,
+              ct.full_name AS contact_name,
+              ct.email     AS contact_email
+         FROM ${s}.subcontractors s
+         LEFT JOIN LATERAL (
+           SELECT c.full_name, c.email
+             FROM ${s}.contacts c
+            WHERE c.subcontractor_id = s.id
+            ORDER BY CASE c.role WHEN 'estimator' THEN 1 WHEN 'pre_con' THEN 2
+                                 WHEN 'md' THEN 3 WHEN 'office' THEN 4 ELSE 5 END,
+                     (c.email IS NULL), (c.phone IS NULL), c.full_name
+            LIMIT 1
+         ) ct ON TRUE
+        WHERE s.id = ANY($1)`,
+      [subcontractorIds]
+    ));
+  }
+
+  /**
    * TPS can be deployed without SCMS. Postgres reports that as `undefined_table` /
    * `undefined_schema`, which would otherwise surface as an opaque 500 — say what is
    * actually wrong instead.

@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { FormEvent, useState } from 'react';
 import { Outlet, useNavigate, useParams } from 'react-router-dom';
-import { api, type IttDispatch, type IttPack, type LaunchTableRow, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
+import { api, type ConfirmIttResult, type IttDispatch, type IttLineSection, type IttPack, type LaunchTableRow, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
 import { oidc, signIn } from './auth';
 
 function ErrorMessage({ error }: { error: unknown }) {
@@ -447,7 +447,27 @@ function Step1TenderLaunchPack({ workflowId }: { workflowId: string }) {
 // One ITT per trade package, assembled server-side from the live project data. Nothing is
 // sent from here: these are the packs as they would go out, for review first.
 
-function DocSchedule({ docs }: { docs: IttPack['documents'] }) {
+/**
+ * Checkbox for excluding one ITT line from what gets emailed, without touching the
+ * underlying source data. Fires immediately on click — there is no separate save step, so
+ * the pack is refetched on success rather than staged locally.
+ */
+function IgnoreToggle({ workflowId, packageName, section, itemId, ignored, label = 'Ignore for ITT' }: {
+  workflowId: string; packageName: string; section: IttLineSection; itemId: string; ignored: boolean; label?: string;
+}) {
+  const queryClient = useQueryClient();
+  const toggle = useMutation({
+    mutationFn: (next: boolean) => api.setIttLineOverride(workflowId, packageName, { section, itemId, ignored: next }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['itt-pack', workflowId, packageName] })
+  });
+  return <label className="tiny muted" style={{ whiteSpace: 'nowrap' }}>
+    <input type="checkbox" checked={ignored} disabled={toggle.isPending}
+      onChange={(e) => toggle.mutate(e.target.checked)} />
+    {' '}{label}
+  </label>;
+}
+
+function DocSchedule({ docs, workflowId, packageName }: { docs: IttPack['documents']; workflowId: string; packageName: string }) {
   const groups = docs.reduce<Record<string, IttPack['documents']>>((acc, d) => {
     (acc[d.doc_type] ??= []).push(d);
     return acc;
@@ -456,14 +476,17 @@ function DocSchedule({ docs }: { docs: IttPack['documents'] }) {
   return <>{Object.entries(groups).map(([type, items]) => <details key={type} className="doc-group">
     <summary><strong>{label(type)}</strong> <span className="muted">({items.length})</span></summary>
     <ul className="doc-list">
-      {items.map((d) => <li key={d.filename}>
-        {d.filename}{d.page_count > 0 && <span className="muted"> · {d.page_count} pp</span>}
+      {items.map((d) => <li key={d.filename} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'baseline' }}>
+        <span style={d.ignored ? { textDecoration: 'line-through', color: 'var(--muted, #888)' } : undefined}>
+          {d.filename}{d.page_count > 0 && <span className="muted"> · {d.page_count} pp</span>}
+        </span>
+        <IgnoreToggle workflowId={workflowId} packageName={packageName} section="document" itemId={d.id} ignored={d.ignored} />
       </li>)}
     </ul>
   </details>)}</>;
 }
 
-function IttPackView({ pack }: { pack: IttPack }) {
+function IttPackView({ pack, workflowId, packageName }: { pack: IttPack; workflowId: string; packageName: string }) {
   const t = pack.takeoff as Record<string, string | number | null>;
   return <div className="itt-pack">
     {pack.review_notes.length > 0 && <div className="alert alert-red">
@@ -482,19 +505,20 @@ function IttPackView({ pack }: { pack: IttPack }) {
     <h4>1. Tender return — what a compliant submission must contain</h4>
     <p className="muted tiny">Evaluation is based on these. A return missing a required item is not compliant.</p>
     <table className="data-table">
-      <thead><tr><th style={{ width: '2rem' }}>#</th><th>Form</th><th>Detail</th><th>Required</th></tr></thead>
-      <tbody>{pack.return_forms.map((f) => <tr key={f.seq}>
+      <thead><tr><th style={{ width: '2rem' }}>#</th><th>Form</th><th>Detail</th><th>Required</th><th>Ignore for ITT</th></tr></thead>
+      <tbody>{pack.return_forms.map((f) => <tr key={f.id} className={f.ignored ? 'scope-only' : ''}>
         <td className="tiny">{f.seq}</td>
         <td className="tiny"><strong>{f.name}</strong></td>
         <td className="tiny muted">{f.description ?? '—'}</td>
         <td>{f.is_required
           ? <span className="badge badge-red">Required</span>
           : <span className="badge badge-grey">Optional</span>}</td>
+        <td><IgnoreToggle workflowId={workflowId} packageName={packageName} section="return_form" itemId={f.id} ignored={f.ignored} label="" /></td>
       </tr>)}</tbody>
     </table>
 
     <h4>1b. Recipients</h4>
-    <p className="muted tiny">The firms selected at the tender launch meeting. Nothing has been sent.</p>
+    <p className="muted tiny">The firms selected at the tender launch meeting. Use "Confirm ITT" below to email them.</p>
     <table className="data-table">
       <thead><tr><th>Rank</th><th>Subcontractor</th><th>Why selected</th></tr></thead>
       <tbody>{pack.recipients.map((r) => <tr key={r.subcontractor_id}>
@@ -512,8 +536,8 @@ function IttPackView({ pack }: { pack: IttPack }) {
     </p>
     <div className="table-scroll">
       <table className="data-table itt-boq">
-        <thead><tr><th>GE</th><th>Element</th><th>Description</th><th>Qty</th><th>Unit</th><th>Rate £</th></tr></thead>
-        <tbody>{pack.boq_lines.map((l, i) => <tr key={i} className={l.is_priceable ? '' : 'scope-only'}>
+        <thead><tr><th>GE</th><th>Element</th><th>Description</th><th>Qty</th><th>Unit</th><th>Rate £</th><th>Ignore for ITT</th></tr></thead>
+        <tbody>{pack.boq_lines.map((l) => <tr key={l.id} className={l.is_priceable ? '' : 'scope-only'}>
           <td className="tiny">{l.ge_code}</td>
           <td className="tiny">{l.element_code ?? '—'}</td>
           <td className="tiny">{l.description}</td>
@@ -522,8 +546,9 @@ function IttPackView({ pack }: { pack: IttPack }) {
           </td>
           <td className="tiny">{l.unit ?? ''}</td>
           <td className="tiny muted" style={{ textAlign: 'right' }}>to be priced</td>
+          <td><IgnoreToggle workflowId={workflowId} packageName={packageName} section="boq_line" itemId={l.id} ignored={l.ignored} label="" /></td>
         </tr>)}
-        {pack.boq_lines.length === 0 && <tr><td colSpan={6} className="muted" style={{ textAlign: 'center', padding: '1rem' }}>
+        {pack.boq_lines.length === 0 && <tr><td colSpan={7} className="muted" style={{ textAlign: 'center', padding: '1rem' }}>
           No measured lines attributed to this package.
         </td></tr>}
         </tbody>
@@ -538,17 +563,18 @@ function IttPackView({ pack }: { pack: IttPack }) {
       </p>
       <div className="table-scroll">
         <table className="data-table itt-boq">
-          <thead><tr><th>Ref</th><th>Item</th><th>Required for</th><th>Qty</th><th>Unit</th><th>Rate £</th></tr></thead>
+          <thead><tr><th>Ref</th><th>Item</th><th>Required for</th><th>Qty</th><th>Unit</th><th>Rate £</th><th>Ignore for ITT</th></tr></thead>
           <tbody>{pack.bill_lines.map((l, i, all) => <>
             {(i === 0 || all[i - 1].section !== l.section) && l.section &&
-              <tr key={`s-${l.seq}`} className="bill-section"><td colSpan={6}><strong>{l.section}</strong></td></tr>}
-            <tr key={l.seq}>
+              <tr key={`s-${l.seq}`} className="bill-section"><td colSpan={7}><strong>{l.section}</strong></td></tr>}
+            <tr key={l.id}>
               <td className="tiny">{l.ref ?? l.seq}</td>
               <td className="tiny">{l.description}{l.notes && <div className="muted">{l.notes}</div>}</td>
               <td className="tiny">{l.required_for ?? '—'}</td>
               <td className="tiny" style={{ textAlign: 'right' }}>{l.quantity ? Number(l.quantity).toLocaleString() : ''}</td>
               <td className="tiny">{l.unit}</td>
               <td className="tiny muted" style={{ textAlign: 'right' }}>to be priced</td>
+              <td><IgnoreToggle workflowId={workflowId} packageName={packageName} section="bill_line" itemId={l.id} ignored={l.ignored} label="" /></td>
             </tr>
           </>)}</tbody>
         </table>
@@ -568,14 +594,15 @@ function IttPackView({ pack }: { pack: IttPack }) {
           <summary><strong>Show {pack.scope_items.length} scope items</strong></summary>
           <div className="table-scroll">
             <table className="data-table itt-boq">
-              <thead><tr><th>Ref</th><th>Item</th><th>Designation</th><th>Cost basis</th></tr></thead>
-              <tbody>{pack.scope_items.map((s, i) => <tr key={i} className={s.procurement_stage === 'Profit Plan' ? 'scope-only' : ''}>
+              <thead><tr><th>Ref</th><th>Item</th><th>Designation</th><th>Cost basis</th><th>Ignore for ITT</th></tr></thead>
+              <tbody>{pack.scope_items.map((s) => <tr key={s.id} className={s.procurement_stage === 'Profit Plan' ? 'scope-only' : ''}>
                 <td className="tiny">{s.ref}</td>
                 <td className="tiny">{s.description}</td>
                 <td className="tiny">{s.designation ?? '—'}</td>
                 <td className="tiny">{s.procurement_stage
                   ? <span className={`badge badge-${s.procurement_stage === 'Contract' ? 'blue' : 'amber'}`}>{s.procurement_stage}</span>
                   : '—'}</td>
+                <td><IgnoreToggle workflowId={workflowId} packageName={packageName} section="scope_item" itemId={s.id} ignored={s.ignored} label="" /></td>
               </tr>)}</tbody>
             </table>
           </div>
@@ -586,7 +613,7 @@ function IttPackView({ pack }: { pack: IttPack }) {
       All {pack.documents.length} tender documents are issued with every package — an Employer's
       Requirement binds the subcontractor whether or not its filename mentions their trade.
     </p>
-    <DocSchedule docs={pack.documents} />
+    <DocSchedule docs={pack.documents} workflowId={workflowId} packageName={packageName} />
 
     <h4>4. Schedule of attendances</h4>
     <p className="muted tiny">
@@ -636,11 +663,20 @@ function IttPackView({ pack }: { pack: IttPack }) {
 
 function Step2IttDispatch({ workflowId }: { workflowId: string }) {
   const [open, setOpen] = useState<string | null>(null);
+  const [lastResult, setLastResult] = useState<ConfirmIttResult | null>(null);
+  const queryClient = useQueryClient();
   const itts = useQuery({ queryKey: ['itts', workflowId], queryFn: () => api.listItts(workflowId) });
   const pack = useQuery({
     queryKey: ['itt-pack', workflowId, open],
     queryFn: () => api.getIttPack(workflowId, open!),
     enabled: Boolean(open)
+  });
+  const confirm = useMutation({
+    mutationFn: (packageName: string) => api.confirmItt(workflowId, packageName),
+    onSuccess: (result) => {
+      setLastResult(result);
+      void queryClient.invalidateQueries({ queryKey: ['itts', workflowId] });
+    }
   });
 
   if (itts.isLoading) return <Busy />;
@@ -664,31 +700,54 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
       <span className="muted">{rows.length} package{rows.length === 1 ? '' : 's'} · {rows.reduce((n, r) => n + Number(r.recipients), 0)} recipients</span>
     </div>
     <p className="muted" style={{ marginBottom: 12 }}>
-      Built from the live take-off, package configuration and document set. <strong>Nothing is
-      sent</strong> — these are drafts for review.
+      Built from the live take-off, package configuration and document set. Review below —
+      untick anything that should not go out under "Ignore for ITT" — then confirm to email
+      the selected subcontractors.
     </p>
     <div className="table-scroll">
       <table className="data-table">
-        <thead><tr><th>#</th><th>Package</th><th>Route of Procurement</th><th>Recipients</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>#</th><th>Package</th><th>Route of Procurement</th><th>Recipients</th><th>Status</th><th></th><th></th></tr></thead>
         <tbody>{rows.map((r) => <>
           <tr key={r.package_name}>
             <td>{r.package_seq ?? '—'}</td>
             <td><strong>{r.package_name}</strong></td>
             <td className="tiny">{r.route_of_procurement ?? '—'}</td>
             <td>{r.recipients}</td>
-            <td>{Number(r.dispatched) > 0
-              ? <span className="badge badge-blue">logged {r.dispatched}</span>
-              : <span className="badge badge-grey">not issued</span>}</td>
+            <td>
+              {Number(r.sent) > 0 && <span className="badge badge-green">sent {r.sent}</span>}
+              {' '}{Number(r.failed) > 0 && <span className="badge badge-red">failed {r.failed}</span>}
+              {' '}{Number(r.skipped_no_email) > 0 && <span className="badge badge-amber">no email {r.skipped_no_email}</span>}
+              {Number(r.sent) === 0 && Number(r.failed) === 0 && Number(r.skipped_no_email) === 0 &&
+                <span className="badge badge-grey">not sent</span>}
+            </td>
             <td>
               <button className="small secondary" onClick={() => setOpen(open === r.package_name ? null : r.package_name)}>
                 {open === r.package_name ? 'Close' : 'View ITT'}
               </button>
             </td>
+            <td>
+              <button
+                className="small"
+                disabled={!r.confirmed_at || Number(r.recipients) === 0 || (confirm.isPending && confirm.variables === r.package_name)}
+                title={!r.confirmed_at ? 'Confirm the package at Step 1 first' : undefined}
+                onClick={() => confirm.mutate(r.package_name)}
+              >
+                {confirm.isPending && confirm.variables === r.package_name ? 'Sending…' : Number(r.dispatched) > 0 ? 'Resend ITT' : 'Confirm ITT'}
+              </button>
+            </td>
           </tr>
+          {lastResult && lastResult.package_name === r.package_name && <tr key={`${r.package_name}-result`}>
+            <td colSpan={7}>
+              <div className={`alert ${lastResult.failed > 0 ? 'alert-red' : 'alert-green'}`} style={{ marginTop: 0 }}>
+                Sent {lastResult.sent}, failed {lastResult.failed}, no email on file {lastResult.skipped_no_email}.
+                {lastResult.failed > 0 && ' Check the recipients below and try again.'}
+              </div>
+            </td>
+          </tr>}
           {open === r.package_name && <tr key={`${r.package_name}-pack`}>
-            <td colSpan={6} className="itt-cell">
+            <td colSpan={7} className="itt-cell">
               {pack.isLoading ? <Busy /> : pack.error ? <ErrorMessage error={pack.error} />
-                : pack.data ? <IttPackView pack={pack.data} /> : null}
+                : pack.data ? <IttPackView pack={pack.data} workflowId={workflowId} packageName={r.package_name} /> : null}
             </td>
           </tr>}
         </>)}</tbody>

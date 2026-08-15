@@ -1,10 +1,16 @@
 import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
+import type { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
 import type { Database, Row } from './db.js';
 import type { DocumentLinkProvider } from './documentLinkProvider.js';
+import type { EmailService } from './emailService.js';
 import { conflict, notFound } from './errors.js';
+import { renderIttEmail } from './ittEmail.js';
 import type { ScmsReadDatabase } from './scmsReadDb.js';
 import type { TakeoffCompletion } from './takeoffCompletion.js';
 import type { Actor } from './types.js';
+
+/** Every ITT email is sent from this address, regardless of who confirms it in the UI. */
+const ITT_FROM_ADDRESS = 'tenders@novamerx.ai';
 
 /**
  * The one-line "why was this firm suggested" shown beside each name at the tender launch
@@ -112,7 +118,16 @@ export class TenderPrepDatabase {
     private readonly scms: ScmsReadDatabase,
     private readonly boq: BoqReadDatabase,
     // Optional: without one configured, documents are still listed, just with url: null.
-    private readonly documentLinks?: DocumentLinkProvider
+    private readonly documentLinks?: DocumentLinkProvider,
+    // Optional: without one configured, ITT emails send without document links.
+    private readonly buildflowLinks?: BuildflowDocumentLinksClient,
+    // Optional: without one configured, confirmAndSendItt records what it would have sent
+    // instead of actually sending — see confirmAndSendItt.
+    private readonly emailService?: EmailService,
+    // When set, every ITT email is redirected to `to` (from `from`) instead of the
+    // recipient's real SCMS contact address — lets "Confirm ITT" be exercised against real
+    // packages without emailing real subcontractors.
+    private readonly testEmailOverride?: { from: string; to: string } | null
   ) {}
 
   /**
@@ -162,7 +177,7 @@ export class TenderPrepDatabase {
     // Recipients are the firms the tender launch meeting actually selected — not everyone
     // considered. An ITT to a declined firm is the failure this whole step exists to avoid.
     const recipients = await this.db.query(
-      `SELECT se.subcontractor_id, se.rank, se.suggestion_reason
+      `SELECT se.id AS shortlist_entry_id, se.subcontractor_id, se.rank, se.suggestion_reason
          FROM shortlist_entries se
          JOIN shortlists sl ON sl.id = se.shortlist_id
         WHERE sl.workflow_id = $1 AND sl.package_name = $2 AND se.selected = TRUE
@@ -194,7 +209,7 @@ export class TenderPrepDatabase {
     // may carry both, so they are appended rather than substituted, and each line says which
     // source it came from so a measured quantity is never confused with an authored item.
     const billLines = await this.db.query<Row>(
-      `SELECT seq, section, ref, description, unit, quantity, required_for, notes
+      `SELECT id, seq, section, ref, description, unit, quantity, required_for, notes
          FROM package_bill_lines WHERE package_config_id = $1 ORDER BY seq`,
       [pkg.id]
     );
@@ -210,6 +225,14 @@ export class TenderPrepDatabase {
       [workflowId, packageName]
     );
 
+    // "Ignore for ITT": sections 1, 2 and 3 only (return forms, BoQ/bill/scope, documents).
+    // Recipients, attendances, minutes and Value Engineering are not overridable — a
+    // recipient is a selection made at Step 1, and the rest is boilerplate every tenderer
+    // needs regardless of what else is trimmed from a given package's pack.
+    const overrides = await this.listIttLineOverrides(workflowId, packageName);
+    const withIgnored = <T extends Row>(items: T[], section: string): T[] =>
+      items.map((item) => ({ ...item, ignored: overrides.get(section)?.has(String(item.id)) ?? false }));
+
     const priceable = boqLines.filter((l) => l.is_priceable).length;
     return {
       package_name: pkg.name,
@@ -220,15 +243,15 @@ export class TenderPrepDatabase {
       boq_id: boqSession?.boq_id ?? null,
       confirmed_at: shortlist?.confirmed_at ?? null,
       recipients,
-      boq_lines: boqLines,
-      bill_lines: billLines,
+      boq_lines: withIgnored(boqLines, 'boq_line'),
+      bill_lines: withIgnored(billLines, 'bill_line'),
       boq_summary: {
         total: boqLines.length, priceable, scope_only: boqLines.length - priceable,
         authored: billLines.length
       },
-      documents,
-      return_forms: returnForms,
-      scope_items: scopeItems,
+      documents: withIgnored(documents, 'document'),
+      return_forms: withIgnored(returnForms, 'return_form'),
+      scope_items: withIgnored(scopeItems, 'scope_item'),
       scope_summary: {
         total: scopeItems.length,
         package_specific: scopeItems.filter((s) => s.designation === 'Package').length,
@@ -274,6 +297,49 @@ export class TenderPrepDatabase {
   }
 
   /**
+   * Which lines under sections 1, 2 and 3 of this package's ITT are marked "Ignore for
+   * ITT" — excluded from what gets emailed, without touching the underlying source data.
+   * Keyed by section so `getPackageItt` can annotate each list independently.
+   */
+  private async listIttLineOverrides(workflowId: string, packageName: string): Promise<Map<string, Set<string>>> {
+    const rows = await this.db.query<{ section: string; item_id: string }>(
+      `SELECT section, item_id FROM itt_line_overrides WHERE workflow_id = $1 AND package_name = $2`,
+      [workflowId, packageName]
+    );
+    const bySection = new Map<string, Set<string>>();
+    for (const row of rows) {
+      const set = bySection.get(row.section) ?? new Set<string>();
+      set.add(row.item_id);
+      bySection.set(row.section, set);
+    }
+    return bySection;
+  }
+
+  /** Marks (or unmarks) one ITT line as excluded from this package's ITT emails. */
+  async setIttLineIgnored(actor: Actor, workflowId: string, input: {
+    packageName: string;
+    section: 'return_form' | 'boq_line' | 'bill_line' | 'scope_item' | 'document';
+    itemId: string;
+    ignored: boolean;
+  }): Promise<{ ignored: boolean }> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (input.ignored) {
+      await this.db.query(
+        `INSERT INTO itt_line_overrides (workflow_id, package_name, section, item_id, created_by)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (workflow_id, package_name, section, item_id) DO NOTHING`,
+        [workflowId, input.packageName, input.section, input.itemId, actor.userId]
+      );
+    } else {
+      await this.db.query(
+        `DELETE FROM itt_line_overrides WHERE workflow_id = $1 AND package_name = $2 AND section = $3 AND item_id = $4`,
+        [workflowId, input.packageName, input.section, input.itemId]
+      );
+    }
+    return { ignored: input.ignored };
+  }
+
+  /**
    * Scope items falling to one package.
    *
    * Matched on the package name as the client's matrix writes it. Their vocabulary and the
@@ -283,7 +349,7 @@ export class TenderPrepDatabase {
    */
   async listScopeItems(actor: Actor, packageName: string): Promise<Row[]> {
     return this.db.query(
-      `SELECT ref, description, procurement_stage, designation
+      `SELECT id, ref, description, procurement_stage, designation
          FROM scope_items
         WHERE organization_id = $1 AND $2 = ANY (packages)
         ORDER BY seq`,
@@ -345,7 +411,7 @@ export class TenderPrepDatabase {
   /** What a compliant tender return must contain. The house standard, per organisation. */
   async listReturnForms(actor: Actor): Promise<Row[]> {
     return this.db.query(
-      `SELECT seq, name, description, is_required FROM itt_return_forms
+      `SELECT id, seq, name, description, is_required FROM itt_return_forms
         WHERE organization_id = $1 ORDER BY seq`, [actor.organizationId]
     );
   }
@@ -944,6 +1010,9 @@ export class TenderPrepDatabase {
               sl.confirmed_at,
               count(*) FILTER (WHERE se.selected) AS recipients,
               count(d.id) FILTER (WHERE d.dispatched_at IS NOT NULL) AS dispatched,
+              count(d.id) FILTER (WHERE d.email_status = 'sent') AS sent,
+              count(d.id) FILTER (WHERE d.email_status = 'failed') AS failed,
+              count(d.id) FILTER (WHERE d.email_status = 'skipped_no_email') AS skipped_no_email,
               count(*) FILTER (WHERE se.selected AND d.response IS NOT NULL) AS responded
          FROM shortlists sl
          LEFT JOIN shortlist_entries se ON se.shortlist_id = sl.id
@@ -958,21 +1027,161 @@ export class TenderPrepDatabase {
 
   // ── Step 2: ITT Dispatch ──────────────────────────────────────────────────
 
-  async dispatchItt(actor: Actor, workflowId: string): Promise<Row[]> {
+  /**
+   * Sends the Invitation to Tender for one package to every subcontractor selected at the
+   * tender launch meeting, once the package itself is confirmed there. Replaces the old
+   * dispatchItt, which only stamped a timestamp — this builds the same content the "View
+   * ITT" preview shows (via getPackageItt), drops anything marked "Ignore for ITT", resolves
+   * document links and recipient emails, and actually sends.
+   *
+   * A per-recipient failure — no email on file, BuildFlow unreachable for one firm, a
+   * Cloudflare error — never stops the others: every outcome is recorded on itt_dispatch and
+   * rolled up into the summary this returns. Re-running this (the button is re-clickable)
+   * resends to everyone currently selected; it does not skip firms already marked sent.
+   */
+  async confirmAndSendItt(actor: Actor, workflowId: string, packageName: string): Promise<Row> {
     await this.assertWorkflowAccess(actor, workflowId);
-    // `selected` only. Every firm considered at the tender launch meeting is stored, so
-    // without this filter an ITT would go to the ones management deliberately declined.
-    const entries = await this.db.query<{ id: string }>(
-      `SELECT se.id FROM shortlist_entries se
-       JOIN shortlists sl ON sl.id = se.shortlist_id
-       WHERE sl.workflow_id = $1 AND sl.confirmed_at IS NOT NULL AND se.selected = TRUE`,
-      [workflowId]
+
+    const [shortlist] = await this.db.query<{ confirmed_at: string | null }>(
+      `SELECT confirmed_at FROM shortlists WHERE workflow_id = $1 AND package_name = $2`,
+      [workflowId, packageName]
     );
-    return Promise.all(entries.map((e) => this.db.one(
-      `INSERT INTO itt_dispatch (shortlist_entry_id, dispatched_at)
-       VALUES ($1, NOW()) ON CONFLICT (shortlist_entry_id) DO UPDATE SET dispatched_at = NOW() RETURNING *`,
-      [e.id]
-    )));
+    if (!shortlist?.confirmed_at) {
+      throw conflict('This package has not been confirmed at the Tender Launch Pack step yet.');
+    }
+
+    const pack = await this.getPackageItt(actor, workflowId, packageName);
+    const notIgnored = (items: Row[]) => items.filter((i) => i.ignored !== true);
+
+    const returnForms = notIgnored(pack.return_forms as Row[]);
+    const boqLines = notIgnored(pack.boq_lines as Row[]);
+    const billLines = notIgnored(pack.bill_lines as Row[]);
+    const scopeItems = notIgnored(pack.scope_items as Row[]);
+    const documents = pack.documents as Row[];
+    const ignoredDocuments = documents.filter((d) => d.ignored === true);
+    const ignoredDocIds = new Set(ignoredDocuments.map((d) => String(d.id)));
+    const ignoredFilenames = new Set(ignoredDocuments.map((d) => String(d.filename)));
+
+    // BuildFlow's document-links contract is keyed by packageVersionId, carried verbatim on
+    // the workflow since the take-off completed. A workflow started by hand, or one where
+    // BuildFlow can't be reached, sends without links rather than blocking the ITT.
+    const takeoff = pack.takeoff as Record<string, unknown>;
+    const packageVersionId = typeof takeoff?.packageVersionId === 'string' ? takeoff.packageVersionId : null;
+    const buildflowLinks = packageVersionId && this.buildflowLinks
+      ? await this.buildflowLinks.linksFor(packageVersionId)
+      : [];
+    const documentLinks = buildflowLinks
+      .filter((l) => !ignoredDocIds.has(l.fileId) && !ignoredFilenames.has(l.displayName))
+      .map((l) => ({ displayName: l.displayName, url: l.url }));
+
+    const priceable = boqLines.filter((l) => l.is_priceable).length;
+    const emailPack = {
+      packageName: pack.package_name as string,
+      displayRef: pack.display_ref as string,
+      projectName: (takeoff?.projectName as string | undefined) ?? 'the project',
+      routeOfProcurement: (pack.route_of_procurement as string | null) ?? null,
+      returnForms: returnForms.map((f) => ({
+        name: String(f.name), description: (f.description as string | null) ?? null, isRequired: Boolean(f.is_required)
+      })),
+      boqSummary: { total: boqLines.length, priceable, authored: billLines.length },
+      scopeItems: scopeItems.map((s) => ({ description: String(s.description) })),
+      attendanceSummary: {
+        subcontractor: Number((pack.attendance_summary as Row).subcontractor ?? 0),
+        mainContractor: Number((pack.attendance_summary as Row).main_contractor ?? 0),
+        joint: Number((pack.attendance_summary as Row).joint ?? 0)
+      },
+      valueEngineeringRequired: Boolean(pack.value_engineering_required)
+    };
+
+    const recipients = pack.recipients as Row[];
+    const subcontractorIds = recipients.map((r) => String(r.subcontractor_id));
+    const contacts = new Map(
+      (await this.scms.getContactsForSubcontractors(subcontractorIds))
+        .map((c) => [String(c.subcontractor_id), c])
+    );
+
+    let sent = 0, failed = 0, skippedNoEmail = 0;
+    const detail: Array<{ subcontractorId: string; status: string; error?: string }> = [];
+
+    const from = this.testEmailOverride?.from ?? ITT_FROM_ADDRESS;
+
+    for (const recipient of recipients) {
+      const subcontractorId = String(recipient.subcontractor_id);
+      const shortlistEntryId = String(recipient.shortlist_entry_id);
+      const contact = contacts.get(subcontractorId);
+      const realEmail = contact?.contact_email ? String(contact.contact_email) : null;
+      // Test mode redirects every send to a fixed inbox, including recipients with no real
+      // SCMS contact email on file, so the whole recipient list is exercised end-to-end.
+      const email = this.testEmailOverride?.to ?? realEmail;
+
+      if (!email) {
+        skippedNoEmail += 1;
+        detail.push({ subcontractorId, status: 'skipped_no_email' });
+        await this.db.query(
+          `INSERT INTO itt_dispatch (shortlist_entry_id, dispatched_at, email_status)
+           VALUES ($1, NOW(), 'skipped_no_email')
+           ON CONFLICT (shortlist_entry_id) DO UPDATE
+             SET dispatched_at = NOW(), email_status = 'skipped_no_email', email_error = NULL`,
+          [shortlistEntryId]
+        );
+        continue;
+      }
+
+      const rendered = renderIttEmail(
+        emailPack,
+        { name: contact?.contact_name ? String(contact.contact_name) : null, email },
+        documentLinks
+      );
+      // Keeps test-inbox messages distinguishable across packages/recipients when every
+      // send lands in the same TEST_TO_EMAIL_ACCOUNT.
+      const subject = this.testEmailOverride
+        ? `[TEST → ${contact?.contact_name ? String(contact.contact_name) : 'unknown'} <${realEmail ?? 'no email on file'}>] ${rendered.subject}`
+        : rendered.subject;
+      const { html, text } = rendered;
+
+      try {
+        if (this.emailService) {
+          const result = await this.emailService.send({ from, to: email, subject, html, text });
+          const messageId = (result as { message_id?: string } | null)?.message_id ?? null;
+          await this.db.query(
+            `INSERT INTO itt_dispatch (shortlist_entry_id, dispatched_at, email_status, email_sent_at, email_message_id, email_error)
+             VALUES ($1, NOW(), 'sent', NOW(), $2, NULL)
+             ON CONFLICT (shortlist_entry_id) DO UPDATE
+               SET dispatched_at = NOW(), email_status = 'sent', email_sent_at = NOW(),
+                   email_message_id = $2, email_error = NULL`,
+            [shortlistEntryId, messageId]
+          );
+          sent += 1;
+          detail.push({ subcontractorId, status: 'sent' });
+        } else {
+          // No Cloudflare config in this environment: record what would have been sent so
+          // the flow is exercisable end-to-end without a real email provider.
+          await this.db.query(
+            `INSERT INTO itt_dispatch (shortlist_entry_id, dispatched_at, email_status, email_error)
+             VALUES ($1, NOW(), 'failed', 'EmailService not configured in this environment')
+             ON CONFLICT (shortlist_entry_id) DO UPDATE
+               SET dispatched_at = NOW(), email_status = 'failed',
+                   email_error = 'EmailService not configured in this environment'`,
+            [shortlistEntryId]
+          );
+          failed += 1;
+          detail.push({ subcontractorId, status: 'failed', error: 'EmailService not configured in this environment' });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error sending email';
+        await this.db.query(
+          `INSERT INTO itt_dispatch (shortlist_entry_id, dispatched_at, email_status, email_error)
+           VALUES ($1, NOW(), 'failed', $2)
+           ON CONFLICT (shortlist_entry_id) DO UPDATE
+             SET dispatched_at = NOW(), email_status = 'failed', email_error = $2`,
+          [shortlistEntryId, message]
+        );
+        failed += 1;
+        detail.push({ subcontractorId, status: 'failed', error: message });
+      }
+    }
+
+    return { package_name: packageName, sent, failed, skipped_no_email: skippedNoEmail, recipients: detail };
   }
 
   async recordIttResponse(actor: Actor, dispatchId: string, response: string): Promise<Row> {

@@ -38,6 +38,17 @@ const schema = z.object({
   // Resolves ITT document filenames to shareable links. Optional: without it, ITT
   // documents still list, just with no link.
   DROPBOX_ACCESS_TOKEN: z.string().optional(),
+  // BuildFlow's own document-links contract: resolves a take-off package version to
+  // long-lived, email-safe document links. Optional: without both set, "Confirm ITT"
+  // emails still send, just without document links.
+  BUILDFLOW_BASE_URL: optionalUrl,
+  BUILDFLOW_DOCUMENT_LINKS_TOKEN: z.string().optional(),
+  // Redirects every outbound ITT email to TEST_TO_EMAIL_ACCOUNT instead of the recipient's
+  // real SCMS contact address, so "Confirm ITT" can be exercised against real packages
+  // without emailing real subcontractors. Off by default.
+  TEST_EMAIL_FLAG: z.enum(['Y', 'N']).default('N').transform((v) => v === 'Y'),
+  TEST_FROM_EMAIL_ACCOUNT: z.string().email().optional(),
+  TEST_TO_EMAIL_ACCOUNT: z.string().email().optional(),
   // Optional here on purpose: migrate.ts calls loadConfig() and migrate-tps has no Redis.
   // The worker requires it through loadWorkerConfig below.
   REDIS_URL: z.string().min(1).optional(),
@@ -73,6 +84,9 @@ export function loadConfig(input: NodeJS.ProcessEnv = process.env): Config {
   const config = schema.parse(input);
   if (!config.AUTH_DISABLED && (!config.OIDC_ISSUER || !config.OIDC_AUDIENCE || !config.OIDC_JWKS_URI)) {
     throw new Error('OIDC_ISSUER, OIDC_AUDIENCE, and OIDC_JWKS_URI are required when authentication is enabled');
+  }
+  if (config.TEST_EMAIL_FLAG && (!config.TEST_FROM_EMAIL_ACCOUNT || !config.TEST_TO_EMAIL_ACCOUNT)) {
+    throw new Error('TEST_FROM_EMAIL_ACCOUNT and TEST_TO_EMAIL_ACCOUNT are required when TEST_EMAIL_FLAG=Y');
   }
   if (config.NODE_ENV === 'production' && config.AUTH_DISABLED) {
     throw new Error('AUTH_DISABLED must not be enabled in production');

@@ -6,7 +6,9 @@ import type { Config } from './config.js';
 import { Database } from './db.js';
 import { AppError } from './errors.js';
 import { BoqReadDatabase } from './boqReadDb.js';
+import { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
 import { DropboxDocumentLinkProvider } from './documentLinkProvider.js';
+import { EmailService } from './emailService.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
 import { TenderPrepDatabase } from './tenderPrepDb.js';
 
@@ -38,7 +40,16 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const documentLinks = config.DROPBOX_ACCESS_TOKEN
     ? new DropboxDocumentLinkProvider(config.DROPBOX_ACCESS_TOKEN)
     : undefined;
-  const tpDb = new TenderPrepDatabase(db, scmsDb, boqDb, documentLinks);
+  const buildflowLinks = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
+    ? new BuildflowDocumentLinksClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
+    : undefined;
+  const emailService = config.CLOUDFLARE_ACCOUNT_ID && config.CLOUDFLARE_EMAIL_TOKEN
+    ? new EmailService({ cloudflareAccountId: config.CLOUDFLARE_ACCOUNT_ID, cloudflareApiToken: config.CLOUDFLARE_EMAIL_TOKEN })
+    : undefined;
+  const testEmailOverride = config.TEST_EMAIL_FLAG
+    ? { from: config.TEST_FROM_EMAIL_ACCOUNT!, to: config.TEST_TO_EMAIL_ACCOUNT! }
+    : null;
+  const tpDb = new TenderPrepDatabase(db, scmsDb, boqDb, documentLinks, buildflowLinks, emailService, testEmailOverride);
 
   app.decorate('tps', { config, db, tpDb, scmsDb });
   await app.register(cors, { origin: config.WEB_ORIGIN, credentials: false });
@@ -308,9 +319,24 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       return tpDb.listIttDispatch(requireActor(request), workflowId);
     });
 
-    protectedApi.post('/api/tender-prep/:workflowId/itt/dispatch', async (request) => {
-      const { workflowId } = params(request, z.object({ workflowId: uuid }));
-      return tpDb.dispatchItt(requireActor(request), workflowId);
+    // "Ignore for ITT": excludes one line (a return form, BoQ line, authored bill line,
+    // scope item or document) from what this package's ITT emails carry, without touching
+    // the underlying source data.
+    protectedApi.put('/api/tender-prep/:workflowId/itts/:packageName/line-overrides', async (request) => {
+      const { workflowId, packageName } = params(request, z.object({ workflowId: uuid, packageName: z.string().trim().min(1).max(200) }));
+      const { section, itemId, ignored } = body(request, z.object({
+        section: z.enum(['return_form', 'boq_line', 'bill_line', 'scope_item', 'document']),
+        itemId: uuid,
+        ignored: z.boolean()
+      }));
+      return tpDb.setIttLineIgnored(requireActor(request), workflowId, { packageName, section, itemId, ignored });
+    });
+
+    // Sends the ITT to every subcontractor selected for this package at the tender launch
+    // meeting. Re-clicking resends to everyone currently selected.
+    protectedApi.post('/api/tender-prep/:workflowId/itts/:packageName/confirm', async (request) => {
+      const { workflowId, packageName } = params(request, z.object({ workflowId: uuid, packageName: z.string().trim().min(1).max(200) }));
+      return tpDb.confirmAndSendItt(requireActor(request), workflowId, packageName);
     });
 
     protectedApi.patch('/api/tender-prep/itt/:dispatchId', async (request) => {
