@@ -6,6 +6,7 @@ import type { Config } from './config.js';
 import { Database } from './db.js';
 import { AppError } from './errors.js';
 import { BoqReadDatabase } from './boqReadDb.js';
+import { DropboxDocumentLinkProvider } from './documentLinkProvider.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
 import { TenderPrepDatabase } from './tenderPrepDb.js';
 
@@ -34,7 +35,10 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const db = new Database(config);
   const scmsDb = new ScmsReadDatabase(db, config.SCMS_SCHEMA);
   const boqDb = new BoqReadDatabase(db);
-  const tpDb = new TenderPrepDatabase(db, scmsDb, boqDb);
+  const documentLinks = config.DROPBOX_ACCESS_TOKEN
+    ? new DropboxDocumentLinkProvider(config.DROPBOX_ACCESS_TOKEN)
+    : undefined;
+  const tpDb = new TenderPrepDatabase(db, scmsDb, boqDb, documentLinks);
 
   app.decorate('tps', { config, db, tpDb, scmsDb });
   await app.register(cors, { origin: config.WEB_ORIGIN, credentials: false });
@@ -57,6 +61,12 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     protectedApi.addHook('preHandler', buildAuthenticator(config, db));
 
     // ── Workflow lifecycle ──────────────────────────────────────────────────
+
+    // Static segment, so it takes precedence over GET /api/tender-prep/:workflowId —
+    // no route conflict, same reasoning as /api/tender-prep/trades below.
+    protectedApi.get('/api/tender-prep/workflows', async (request) => {
+      return tpDb.listWorkflows(requireActor(request));
+    });
 
     protectedApi.post('/api/packages/:packageId/tender-prep', async (request, reply) => {
       const { packageId } = params(request, z.object({ packageId: uuid }));

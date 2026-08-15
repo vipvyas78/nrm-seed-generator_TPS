@@ -247,6 +247,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export const api = {
   // Workflow
+  listWorkflows: () => request<TenderPrepWorkflow[]>('/api/tender-prep/workflows'),
   createWorkflow: (packageId: string) =>
     request<TenderPrepWorkflow>(`/api/packages/${packageId}/tender-prep`, { method: 'POST' }),
   // Null when nothing has launched tender prep for this package yet.

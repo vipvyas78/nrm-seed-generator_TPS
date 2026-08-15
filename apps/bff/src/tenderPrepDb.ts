@@ -1,5 +1,6 @@
 import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
 import type { Database, Row } from './db.js';
+import type { DocumentLinkProvider } from './documentLinkProvider.js';
 import { conflict, notFound } from './errors.js';
 import type { ScmsReadDatabase } from './scmsReadDb.js';
 import type { TakeoffCompletion } from './takeoffCompletion.js';
@@ -109,7 +110,9 @@ export class TenderPrepDatabase {
   constructor(
     private readonly db: Database,
     private readonly scms: ScmsReadDatabase,
-    private readonly boq: BoqReadDatabase
+    private readonly boq: BoqReadDatabase,
+    // Optional: without one configured, documents are still listed, just with url: null.
+    private readonly documentLinks?: DocumentLinkProvider
   ) {}
 
   /**
@@ -176,9 +179,16 @@ export class TenderPrepDatabase {
     const boqLines = boqSession
       ? await this.boq.linesForPackage(String(boqSession.boq_id), attributionFor(pkg))
       : [];
-    const documents = boqSession
+    const rawDocuments = boqSession
       ? await this.boq.documentsForSession(String(boqSession.session_id))
       : [];
+    // Best-effort: a document TPS can't resolve a link for still appears, just with
+    // url: null — a broken lookup should never block issuing the ITT itself.
+    const documents = this.documentLinks
+      ? await Promise.all(rawDocuments.map(async (d) => ({
+          ...d, url: await this.documentLinks!.linkFor(String(d.filename))
+        })))
+      : rawDocuments.map((d) => ({ ...d, url: null }));
 
     // Authored lines: surveys, staged fees — anything the take-off cannot measure. A package
     // may carry both, so they are appended rather than substituted, and each line says which
@@ -477,6 +487,14 @@ export class TenderPrepDatabase {
   }
 
   // ── Workflows ─────────────────────────────────────────────────────────────
+
+  /** Every workflow the caller's organization can see, most recently updated first. */
+  async listWorkflows(actor: Actor): Promise<Row[]> {
+    return this.db.query(
+      `SELECT * FROM workflows WHERE organization_id = $1 AND archived_at IS NULL ORDER BY updated_at DESC`,
+      [actor.organizationId]
+    );
+  }
 
   async createWorkflow(actor: Actor, packageId: string): Promise<Row> {
     const existing = await this.db.query(

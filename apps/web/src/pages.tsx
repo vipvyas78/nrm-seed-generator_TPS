@@ -38,6 +38,36 @@ export function AuthCallback() {
   return <main className="shell"><p>{error ?? 'Completing sign-in…'}</p></main>;
 }
 
+// ── PackagesListPage ────────────────────────────────────────────────────────
+
+export function PackagesListPage() {
+  const workflows = useQuery({ queryKey: ['workflows'], queryFn: () => api.listWorkflows() });
+
+  if (workflows.isLoading) return <Busy />;
+
+  return <section style={{ padding: 24 }}>
+    <h1 style={{ marginBottom: 16 }}>Tender Preparation Packages</h1>
+    <ErrorMessage error={workflows.error} />
+    {workflows.data && workflows.data.length === 0 && <p className="muted">
+      No packages yet. A workflow appears here once a take-off completes for a package, or one is started by hand.
+    </p>}
+    {workflows.data && workflows.data.length > 0 && <table className="data-table">
+      <thead><tr><th>Package</th><th>Step</th><th>Updated</th><th /></tr></thead>
+      <tbody>
+        {workflows.data.map((wf) => {
+          const takeoff = wf.step_data?.takeoff;
+          return <tr key={wf.id}>
+            <td>{takeoff?.packageName ?? wf.package_id}</td>
+            <td>Step {wf.current_step}: {STEP_TITLES[wf.current_step - 1]}</td>
+            <td>{new Date(wf.updated_at).toLocaleString()}</td>
+            <td><a className="button-link" href={`/packages/${wf.package_id}/tender-prep`}>Open →</a></td>
+          </tr>;
+        })}
+      </tbody>
+    </table>}
+  </section>;
+}
+
 // ── TenderPrepPage ─────────────────────────────────────────────────────────
 
 export function TenderPrepPage() {

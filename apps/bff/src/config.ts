@@ -31,6 +31,13 @@ const schema = z.object({
   TOKEN_ENCRYPTION_KEY: z.string().min(1),
   ENGINE_INTERNAL_URL: optionalUrl,
   ENGINE_INTERNAL_TOKEN: z.string().optional(),
+  // Cloudflare Email Sending. Optional: nothing in the BFF sends email yet, so a
+  // deployment without these configured should not fail to boot.
+  CLOUDFLARE_ACCOUNT_ID: z.string().optional(),
+  CLOUDFLARE_EMAIL_TOKEN: z.string().optional(),
+  // Resolves ITT document filenames to shareable links. Optional: without it, ITT
+  // documents still list, just with no link.
+  DROPBOX_ACCESS_TOKEN: z.string().optional(),
   // Optional here on purpose: migrate.ts calls loadConfig() and migrate-tps has no Redis.
   // The worker requires it through loadWorkerConfig below.
   REDIS_URL: z.string().min(1).optional(),
