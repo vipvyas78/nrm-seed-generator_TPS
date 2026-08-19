@@ -1,5 +1,6 @@
 import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
 import type { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
+import type { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
 import type { Database, Row } from './db.js';
 import type { DocumentLinkProvider } from './documentLinkProvider.js';
 import type { EmailService } from './emailService.js';
@@ -121,6 +122,8 @@ export class TenderPrepDatabase {
     private readonly documentLinks?: DocumentLinkProvider,
     // Optional: without one configured, ITT emails send without document links.
     private readonly buildflowLinks?: BuildflowDocumentLinksClient,
+    // Optional: without one configured, ITT emails send without a specification clauses section.
+    private readonly specClauses?: BuildflowSpecClauseClient,
     // Optional: without one configured, confirmAndSendItt records what it would have sent
     // instead of actually sending — see confirmAndSendItt.
     private readonly emailService?: EmailService,
@@ -143,6 +146,91 @@ export class TenderPrepDatabase {
     if (!takeoffId) return null;
     const boq = await this.boq.findBoqForTakeoff(takeoffId);
     return boq ? String(boq.boq_id) : null;
+  }
+
+  /**
+   * Renders the ITT email for one package straight from a BoQ id, a take-off id and a
+   * package name — no workflow, shortlist or confirmation required.
+   *
+   * For previewing what an ITT would look like ahead of, or independent of, the Step 2
+   * dispatch flow that `getPackageItt`/`confirmAndSendItt` drive. It reuses the same
+   * attribution logic those two use (`attributionFor`, `linesForPackage` /
+   * `takeoffLinesForWorkPackage` / `takeoffLinesUnattributed`) so the BoQ lines it shows can
+   * never disagree with what a real dispatch would carry — only recipients, documents and
+   * spec clauses are omitted, since none of those depend on a workflow existing.
+   */
+  async previewIttEmail(actor: Actor, input: {
+    boqId: string; takeoffId: string; packageName: string;
+  }): Promise<{ subject: string; html: string; text: string }> {
+    const [pkg] = await this.db.query<Row>(
+      `SELECT pc.* FROM package_config pc WHERE pc.organization_id = $1 AND pc.name = $2
+        ORDER BY pc.project_id NULLS LAST LIMIT 1`,
+      [actor.organizationId, input.packageName]
+    );
+    if (!pkg) throw notFound('Package is not configured');
+
+    const boqLines = pkg.wp_code
+      ? [
+          ...await this.boq.takeoffLinesForWorkPackage(input.takeoffId, String(pkg.wp_code)),
+          ...await this.boq.takeoffLinesUnattributed(input.takeoffId, attributionFor(pkg))
+        ]
+      : await this.boq.linesForPackage(input.boqId, attributionFor(pkg));
+
+    const billLines = await this.db.query<Row>(
+      `SELECT id, seq, section, ref, description, unit, quantity, required_for, notes
+         FROM package_bill_lines WHERE package_config_id = $1 ORDER BY seq`,
+      [pkg.id]
+    );
+    const returnForms = await this.listReturnForms(actor);
+    const attendances = await this.listAttendances(actor, String(pkg.id));
+    const scopeItems = await this.listScopeItems(actor, input.packageName);
+
+    const previewSession = await this.boq.findBoqForTakeoff(input.takeoffId);
+    const previewSpecDocuments = previewSession
+      ? (await this.boq.specDocumentsForFilenames(
+          String(previewSession.session_id),
+          [...new Set(boqLines.flatMap((l) => (l.spec_source_files as string[] | null) ?? []))]
+        )).map((d) => String(d.filename))
+      : [];
+
+    const priceable = boqLines.filter((l) => l.is_priceable).length;
+    const emailPack = {
+      packageName: pkg.name as string,
+      displayRef: pkg.sub_seq == null ? String(pkg.seq) : `${pkg.seq}.${pkg.sub_seq}`,
+      projectName: 'the project',
+      routeOfProcurement: (pkg.route_of_procurement as string | null) ?? null,
+      returnForms: returnForms.map((f) => ({
+        name: String(f.name), description: (f.description as string | null) ?? null, isRequired: Boolean(f.is_required)
+      })),
+      boqSummary: { total: boqLines.length, priceable, authored: billLines.length },
+      boqLines: boqLines.map((l) => ({
+        geCode: (l.ge_code as string | null) ?? null, elementCode: (l.element_code as string | null) ?? null,
+        description: String(l.description), quantity: (l.quantity as number | null) ?? null,
+        unit: (l.unit as string | null) ?? null, isPriceable: Boolean(l.is_priceable)
+      })),
+      billLines: billLines.map((l) => ({
+        ref: (l.ref as string | null) ?? null, section: (l.section as string | null) ?? null,
+        description: String(l.description), quantity: (l.quantity as number | null) ?? null,
+        unit: (l.unit as string | null) ?? null, requiredFor: (l.required_for as string | null) ?? null
+      })),
+      scopeItems: scopeItems.map((s) => ({
+        ref: (s.ref as number | null) ?? null, description: String(s.description),
+        procurementStage: (s.procurement_stage as string | null) ?? null
+      })),
+      specClauses: [],
+      // Resolved the same way getPackageItt does, off the same lines — the preview has to
+      // show what would actually be sent, and this needs no workflow, only the session the
+      // take-off's BoQ belongs to.
+      specDocuments: previewSpecDocuments,
+      attendanceSummary: {
+        subcontractor: attendances.filter((a) => a.owner === 'SC').length,
+        mainContractor: attendances.filter((a) => a.owner === 'H').length,
+        joint: attendances.filter((a) => a.owner === 'J').length
+      },
+      valueEngineeringRequired: true
+    };
+
+    return renderIttEmail(emailPack, { name: null, email: '' }, []);
   }
 
   /**
@@ -207,9 +295,40 @@ export class TenderPrepDatabase {
       : boqSession
         ? await this.boq.linesForPackage(String(boqSession.boq_id), attributionFor(pkg))
         : [];
-    const rawDocuments = boqSession
-      ? await this.boq.documentsForSession(String(boqSession.session_id))
+    // The pipeline session, not the BoQ session. A derived package's lines come from
+    // takeoff_items and need no boq_sessions row at all, so gating the documents on one made
+    // a package show a full bill and no documents whenever the BoQ run had not been written.
+    const sessionId = boqSession?.session_id
+      ?? (typeof takeoff.pipelineSessionId === 'string' ? takeoff.pipelineSessionId : null);
+    const rawDocuments = sessionId
+      ? await this.boq.documentsForSession(String(sessionId))
       : [];
+
+    // The specification THIS package's own lines were read from.
+    //
+    // spec_source_files holds tender_documents.filename verbatim, so this is an exact join.
+    // It is deliberately not spec_chunk_ids: a chunk id cannot name a document at all —
+    // nrm_chunks keeps no path — and on Reading it is set on zero items of every work
+    // package, which is exactly why Flooring's specification section came back empty while
+    // its 17 clause-derived lines all named an Employer's Requirements PDF.
+    const citedSpecFiles = [...new Set(
+      boqLines.flatMap((l) => (l.spec_source_files as string[] | null) ?? [])
+    )];
+    const citingLines = boqLines.filter(
+      (l) => ((l.spec_source_files as string[] | null) ?? []).length > 0
+    ).length;
+    const specDocuments = sessionId
+      ? await this.boq.specDocumentsForFilenames(String(sessionId), citedSpecFiles)
+      : [];
+    // Counted over the names asked for, not the documents returned: a name matching no
+    // document means the take-off cited a document this tender pack does not contain, and
+    // that is a finding rather than something to round down to zero.
+    const resolvedNames = new Set(specDocuments.map((d) => String(d.filename).toLowerCase()));
+    const basename = (name: string) => name.split(/[\\/]/).pop() ?? name;
+    const unresolvedSpecFiles = citedSpecFiles.filter(
+      (name) => !resolvedNames.has(name.toLowerCase())
+             && !resolvedNames.has(basename(name).toLowerCase())
+    );
     // Best-effort: a document TPS can't resolve a link for still appears, just with
     // url: null — a broken lookup should never block issuing the ITT itself.
     const documents = this.documentLinks
@@ -270,6 +389,18 @@ export class TenderPrepDatabase {
       wp_code: pkg.wp_code ?? null,
       wp_scope_condition: pkg.wp_scope_condition ?? null,
       documents: withIgnored(documents, 'document'),
+      // Marked with the SAME 'document' override section, not a new one: a spec document IS
+      // a tender_documents row with the same id, so ignoring it in the schedule below has to
+      // ignore it here too. That falls out of reusing the section key, and needs no migration.
+      spec_documents: withIgnored(specDocuments, 'document'),
+      spec_summary: {
+        cited_lines: citingLines, total_lines: boqLines.length,
+        resolved: specDocuments.length,
+        unresolved: unresolvedSpecFiles.length, unresolved_names: unresolvedSpecFiles,
+        // A hand-loaded package reads boq_items, which has no spec_source_files column at
+        // all, so it cannot answer this question. Saying so beats reporting a bare zero.
+        available: Boolean(pkg.wp_code)
+      },
       return_forms: withIgnored(returnForms, 'return_form'),
       scope_items: withIgnored(scopeItems, 'scope_item'),
       scope_summary: {
@@ -301,6 +432,22 @@ export class TenderPrepDatabase {
         !takeoffId && 'No take-off is linked to this workflow.',
         !pkg.wp_code && !boqSession && 'No completed take-off BoQ is linked to this workflow.',
         documents.length === 0 && 'No tender documents are attached to this project.',
+        // The specification the take-off actually read, and the three ways it can be absent —
+        // kept apart, because they call for different things. Cited-but-unresolved means the
+        // pipeline named a document this pack does not contain; cited-nothing means the lines
+        // were measured off drawings rather than a clause, which is normal for some trades and
+        // worth knowing for others.
+        Boolean(pkg.wp_code) && citingLines > 0 && specDocuments.length === 0 &&
+          `${citingLines} line${citingLines === 1 ? '' : 's'} cite a specification (${unresolvedSpecFiles.join(', ')}), but no matching tender document was found for it.`,
+        Boolean(pkg.wp_code) && specDocuments.length > 0 && unresolvedSpecFiles.length > 0 &&
+          `Cited but not in the tender pack: ${unresolvedSpecFiles.join(', ')}.`,
+        Boolean(pkg.wp_code) && boqLines.length > 0 && citingLines === 0 &&
+          'No line in this package cites a specification, so the ITT names none. These lines were measured without a clause reference.',
+        // An unconfigured integration and an empty one are different facts, and both clients
+        // return [] either way. Without this the ITT emails with no document links at all and
+        // reads exactly as though the project had none.
+        !this.buildflowLinks &&
+          'Document links unavailable: BUILDFLOW_BASE_URL and BUILDFLOW_DOCUMENT_LINKS_TOKEN are not configured, so this ITT would be emailed with no document links.',
         // Scope and attendances are what make the pricing document coordinate: they define
         // everything the subcontractor carries around the measured bill. Missing either and
         // every tenderer guesses differently, so neither the price nor the comparison holds.
@@ -1237,6 +1384,12 @@ export class TenderPrepDatabase {
       .map((l) => ({ displayName: l.displayName, url: l.url }));
 
     const priceable = boqLines.filter((l) => l.is_priceable).length;
+
+    // Best-effort: an id BuildFlow can't resolve, or BuildFlow being unreachable, should
+    // never block the ITT — the email just sends with no spec clauses section.
+    const chunkIds = [...new Set(boqLines.flatMap((l) => (l.spec_chunk_ids as string[] | null) ?? []))];
+    const specClauses = this.specClauses ? await this.specClauses.clausesFor(chunkIds) : [];
+
     const emailPack = {
       packageName: pack.package_name as string,
       displayRef: pack.display_ref as string,
@@ -1246,7 +1399,30 @@ export class TenderPrepDatabase {
         name: String(f.name), description: (f.description as string | null) ?? null, isRequired: Boolean(f.is_required)
       })),
       boqSummary: { total: boqLines.length, priceable, authored: billLines.length },
-      scopeItems: scopeItems.map((s) => ({ description: String(s.description) })),
+      boqLines: boqLines.map((l) => ({
+        geCode: (l.ge_code as string | null) ?? null, elementCode: (l.element_code as string | null) ?? null,
+        description: String(l.description), quantity: (l.quantity as number | null) ?? null,
+        unit: (l.unit as string | null) ?? null, isPriceable: Boolean(l.is_priceable)
+      })),
+      billLines: billLines.map((l) => ({
+        ref: (l.ref as string | null) ?? null, section: (l.section as string | null) ?? null,
+        description: String(l.description), quantity: (l.quantity as number | null) ?? null,
+        unit: (l.unit as string | null) ?? null, requiredFor: (l.required_for as string | null) ?? null
+      })),
+      scopeItems: scopeItems.map((s) => ({
+        ref: (s.ref as number | null) ?? null, description: String(s.description),
+        procurementStage: (s.procurement_stage as string | null) ?? null
+      })),
+      specClauses: specClauses.map((c) => ({
+        chunkId: c.chunkId, geCode: c.geCode, elementCode: c.elementCode, subElementCode: c.subElementCode,
+        subsectionTitle: c.subsectionTitle, rawText: c.rawText, nbsCode: c.nbsCode
+      })),
+      // Ignored spec documents are dropped here, like every other section: getPackageItt
+      // stamps them from the SAME 'document' override key as the schedule, so unticking a
+      // document in the UI removes it from both lists at once.
+      specDocuments: ((pack.spec_documents as Row[]) ?? [])
+        .filter((d) => d.ignored !== true)
+        .map((d) => String(d.filename)),
       attendanceSummary: {
         subcontractor: Number((pack.attendance_summary as Row).subcontractor ?? 0),
         mainContractor: Number((pack.attendance_summary as Row).main_contractor ?? 0),

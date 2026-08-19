@@ -136,6 +136,14 @@ export type IttPack = {
   wp_code?: string | null;
   wp_scope_condition?: string | null;
   documents: Array<{ id: string; doc_type: string; filename: string; page_count: number; ignored: boolean }>;
+  /** The subset of `documents` this package's own take-off lines were read from. */
+  spec_documents?: Array<{ id: string; doc_type: string; filename: string; page_count: number; ignored: boolean }>;
+  spec_summary?: {
+    cited_lines: number; total_lines: number; resolved: number;
+    unresolved: number; unresolved_names: string[];
+    /** False for a legacy package: boq_items has no spec_source_files to answer from. */
+    available: boolean;
+  };
   /** Section 1 — what a compliant tender return must contain. */
   return_forms: Array<{ id: string; seq: number; name: string; description: string | null; is_required: boolean; ignored: boolean }>;
   /** Section 2 — what the subcontractor carries around the measured bill. */

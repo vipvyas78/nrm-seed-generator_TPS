@@ -630,6 +630,37 @@ function IttPackView({ pack, workflowId, packageName }: { pack: IttPack; workflo
     </p>
     <DocSchedule docs={pack.documents} workflowId={workflowId} packageName={packageName} />
 
+    {/* Which of those the take-off actually measured against. Section 3 still issues
+        everything — this narrows nothing, it just says where these quantities came from,
+        which is the first thing a tenderer pricing one trade wants to open. */}
+    <h4>3b. Specification referenced by this package</h4>
+    {pack.spec_summary?.available === false
+      ? <p className="muted tiny">
+          This package is not derived from a take-off, so which specification its lines came
+          from is not recorded.
+        </p>
+      : <>
+          <p className="muted tiny">
+            {pack.spec_summary?.cited_lines ?? 0} of {pack.spec_summary?.total_lines ?? 0} lines
+            cite a specification.
+            {(pack.spec_summary?.unresolved ?? 0) > 0 && <>
+              {' '}<strong>Cited but not in the tender pack:</strong>{' '}
+              {pack.spec_summary?.unresolved_names.join(', ')}.
+            </>}
+          </p>
+          {(pack.spec_documents?.length ?? 0) === 0
+            ? <p className="muted tiny">No line in this package cites a specification document.</p>
+            : <table className="data-table">
+                <thead><tr><th>Document</th><th>Type</th><th>Pages</th><th>Ignore for ITT</th></tr></thead>
+                <tbody>{pack.spec_documents!.map((d) => <tr key={d.id} className={d.ignored ? 'scope-only' : ''}>
+                  <td className="tiny">{d.filename}</td>
+                  <td className="tiny muted">{d.doc_type.replace(/_/g, ' ')}</td>
+                  <td className="tiny">{d.page_count > 0 ? d.page_count : '—'}</td>
+                  <td><IgnoreToggle workflowId={workflowId} packageName={packageName} section="document" itemId={d.id} ignored={d.ignored} label="" /></td>
+                </tr>)}</tbody>
+              </table>}
+        </>}
+
     <h4>4. Schedule of attendances</h4>
     <p className="muted tiny">
       Who provides what. <strong>SC</strong> subcontractor · <strong>H</strong> main contractor ·

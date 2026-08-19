@@ -64,7 +64,7 @@ export class BoqReadDatabase {
   async linesForPackage(boqId: string, pkg: Attribution): Promise<Row[]> {
     return this.run(() => this.db.query(
       `SELECT id, element_code, ge_code, description, quantity, unit, sort_order,
-              (quantity IS NOT NULL AND quantity > 0) AS is_priceable
+              (quantity IS NOT NULL AND quantity > 0) AS is_priceable, spec_chunk_ids
          FROM public.boq_items
         WHERE boq_id = $1
           AND tps.boq_line_in_package(ge_code, element_code, description, $2, $3, $4, $5, $6)
@@ -106,7 +106,8 @@ export class BoqReadDatabase {
       `SELECT ti.id, ti.ge_code, ti.element_code, ti.description, ti.unit,
               COALESCE(latest.effective_quantity, ti.quantity) AS quantity,
               (COALESCE(latest.effective_quantity, ti.quantity) > 0) AS is_priceable,
-              ti.sort_order, 'work_package' AS attributed_by
+              ti.sort_order, 'work_package' AS attributed_by,
+              ti.spec_chunk_ids, ti.spec_source_files
          FROM public.takeoff_items ti
          LEFT JOIN LATERAL (
            SELECT effective_quantity FROM public.takeoff_item_review_events e
@@ -147,7 +148,8 @@ export class BoqReadDatabase {
       `SELECT ti.id, ti.ge_code, ti.element_code, ti.description, ti.unit,
               COALESCE(latest.effective_quantity, ti.quantity) AS quantity,
               (COALESCE(latest.effective_quantity, ti.quantity) > 0) AS is_priceable,
-              ti.sort_order, 'nrm_code' AS attributed_by
+              ti.sort_order, 'nrm_code' AS attributed_by,
+              ti.spec_chunk_ids, ti.spec_source_files
          FROM public.takeoff_items ti
          LEFT JOIN LATERAL (
            SELECT effective_quantity FROM public.takeoff_item_review_events e
@@ -161,6 +163,54 @@ export class BoqReadDatabase {
         ORDER BY ti.ge_code, ti.element_code NULLS LAST, ti.sort_order NULLS LAST, ti.description`,
       [takeoffId, pkg.ge_codes, pkg.element_prefixes, pkg.trade_terms,
        pkg.include_terms ?? [], pkg.exclude_terms ?? []]
+    ));
+  }
+
+  /**
+   * The specification documents a package's own lines were read from.
+   *
+   * A take-off line derived from a spec clause records the document it came from in
+   * `takeoff_items.spec_source_files`, and that column holds `tender_documents.filename`
+   * VERBATIM — elemental_lines reads the filenames out of tender_documents itself before it
+   * parses a clause out of each one. So this is an exact join, not a guess.
+   *
+   * IT HAS TO BE THIS COLUMN, not spec_chunk_ids. A chunk id can never name a document:
+   * nrm_chunks has no source_path, no filename and no usable document_id for a tender_spec
+   * row — embed_chunks.py carries the path in memory and drops it from the INSERT. So
+   * BuildFlow's /internal/spec-clauses answers "which clause", correctly, and cannot answer
+   * "which document" however it is called. On Reading's take-off spec_chunk_ids is set on 25
+   * of 525 items and on ZERO items of every work package, while spec_source_files is set on
+   * 213 — including 17 of Flooring's 18. Keying the ITT on the chunk ids is why Flooring's
+   * specification section came back empty.
+   *
+   * The two tolerant arms are copied from BuildFlow's own resolveSpecSourceFiles, whose
+   * comment records that the pipeline writes "sometimes a full path and sometimes a bare
+   * name". Reading's values are all bare and match on the first arm; the others cost nothing
+   * and stop the next pack reading empty for a reason nobody would look for.
+   *
+   * Returns one row per document, not per citation — a caller wanting the citation count
+   * should count the filenames it passed in. A name matching nothing is simply absent, which
+   * is what lets getPackageItt report it as unresolved rather than lose it.
+   */
+  async specDocumentsForFilenames(sessionId: string, names: string[]): Promise<Row[]> {
+    if (names.length === 0) return [];
+    return this.run(() => this.db.query(
+      `SELECT DISTINCT td.id, td.doc_type, td.filename, COALESCE(td.page_count, 0) AS page_count
+         FROM unnest($2::text[]) AS wanted(name)
+         -- chr(92) rather than a backslash literal. One would have to survive a TS template
+         -- literal AND Postgres's bracket-expression rules, and a bracketed separator class
+         -- is rejected outright there as an unbalanced bracket (tested). Normalising the
+         -- separator with a plain replace() needs no escaping in either layer.
+         CROSS JOIN LATERAL (
+           SELECT regexp_replace(replace(wanted.name, chr(92), '/'), '^.*/', '') AS value
+         ) basename
+         JOIN public.tender_documents td
+           ON td.session_id = $1
+          AND (LOWER(td.filename)    = LOWER(wanted.name)
+            OR LOWER(td.source_path) = LOWER(wanted.name)
+            OR LOWER(td.filename)    = LOWER(basename.value))
+        ORDER BY td.doc_type, td.filename`,
+      [sessionId, names]
     ));
   }
 

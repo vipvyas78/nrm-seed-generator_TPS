@@ -193,6 +193,32 @@ seq after the new one shifts.
 what `scmsReadDb`'s word-level matcher wants, so the shortlist column keeps working without a
 second vocabulary to maintain.
 
+### Which specification a package was measured against
+
+The ITT names, per package, the specification documents that package's own take-off lines
+were read from — for Reading's Flooring package, `01 - Employers Requirements 144.pdf`.
+
+It comes from `takeoff_items.spec_source_files`, which holds `tender_documents.filename`
+verbatim (`elemental_lines` reads those filenames out of `tender_documents` before parsing a
+clause from each), so the join is exact.
+
+**It cannot come from `spec_chunk_ids`, and that was the bug.** `nrm_chunks` keeps no path,
+filename or usable document id for a `tender_spec` row — `embed_chunks.py` carries
+`source_path` in memory and drops it from the INSERT — so BuildFlow's `/internal/spec-clauses`
+answers *which clause* correctly and can never answer *which document*. On Reading,
+`spec_chunk_ids` is set on 25 of 525 items and on **zero** items of every work package, while
+`spec_source_files` is set on 213 — including 17 of Flooring's 18. Keying the ITT's
+specification section on the chunk ids is why it came back empty for every package.
+
+The list is a **subsection**, not a filter: section 3 still issues all documents to every
+tenderer, because an Employer's Requirement binds a subcontractor whether or not its filename
+mentions their trade. A cited filename matching no document is reported as `unresolved`
+rather than dropped — it means the take-off named a document this tender pack does not
+contain. Spec documents carry the same `'document'` ignore key as the schedule, so unticking
+one removes it from both.
+
+---
+
 ### Scope and Bill of Quantities come from the take-off
 
 The ITT's section 2 reads `public.takeoff_items` filtered on `work_package`, not `boq_items`
@@ -284,6 +310,8 @@ Both repos provision actors through the issuer `buildflow-dev` and upsert on `(o
 | `OIDC_JWKS_URI` | Prod | — | Required when `AUTH_DISABLED=false` |
 | `SCMS_SCHEMA` | No | `scms` | Schema owned by the SCMS module, read (never written) for Step 1 shortlist candidates. Must be a bare SQL identifier. |
 | `REDIS_URL` | Worker | — | The parent platform's Redis. Required by `worker-tps`; unused by the API and migrator. |
+| `BUILDFLOW_BASE_URL` | No | — | BuildFlow's BFF as reachable from this container — `http://bff:3000` on the shared network, **not** localhost. Enables emailed document links and spec-clause text. |
+| `BUILDFLOW_DOCUMENT_LINKS_TOKEN` | No | — | Shared secret for both BuildFlow internal routes. **Must equal `TPS_INTERNAL_TOKEN` on the BuildFlow side** (compose default `buildflow-tps-dev-token`) or every call 401s. Unset, the ITT still sends and says so in its review notes. |
 | `ENGINE_INTERNAL_URL` | No | — | Internal URL of the Python API |
 | `ENGINE_INTERNAL_TOKEN` | No | — | Bearer token for BFF→API calls |
 | `LOG_LEVEL` | No | `info` | Fastify log level |

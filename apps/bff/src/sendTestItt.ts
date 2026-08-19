@@ -1,5 +1,6 @@
 import { BoqReadDatabase } from './boqReadDb.js';
 import { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
+import { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
 import { loadConfig } from './config.js';
 import { Database } from './db.js';
 import { DropboxDocumentLinkProvider } from './documentLinkProvider.js';
@@ -28,11 +29,14 @@ const documentLinks = config.DROPBOX_ACCESS_TOKEN
 const buildflowLinks = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
   ? new BuildflowDocumentLinksClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
   : undefined;
+const specClauses = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
+  ? new BuildflowSpecClauseClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
+  : undefined;
 const emailService = config.CLOUDFLARE_ACCOUNT_ID && config.CLOUDFLARE_EMAIL_TOKEN
   ? new EmailService({ cloudflareAccountId: config.CLOUDFLARE_ACCOUNT_ID, cloudflareApiToken: config.CLOUDFLARE_EMAIL_TOKEN })
   : undefined;
 const testEmailOverride = { from: config.TEST_FROM_EMAIL_ACCOUNT!, to: config.TEST_TO_EMAIL_ACCOUNT! };
-const tpDb = new TenderPrepDatabase(db, scmsDb, boqDb, documentLinks, buildflowLinks, emailService, testEmailOverride);
+const tpDb = new TenderPrepDatabase(db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, emailService, testEmailOverride);
 
 const packages = await db.query<{ workflow_id: string; package_name: string }>(
   `SELECT workflow_id, package_name FROM shortlists WHERE package_seq = ANY($1) ORDER BY package_seq`,

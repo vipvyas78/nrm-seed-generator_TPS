@@ -7,6 +7,7 @@ import { Database } from './db.js';
 import { AppError } from './errors.js';
 import { BoqReadDatabase } from './boqReadDb.js';
 import { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
+import { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
 import { DropboxDocumentLinkProvider } from './documentLinkProvider.js';
 import { EmailService } from './emailService.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
@@ -43,13 +44,16 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const buildflowLinks = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
     ? new BuildflowDocumentLinksClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
     : undefined;
+  const specClauses = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
+    ? new BuildflowSpecClauseClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
+    : undefined;
   const emailService = config.CLOUDFLARE_ACCOUNT_ID && config.CLOUDFLARE_EMAIL_TOKEN
     ? new EmailService({ cloudflareAccountId: config.CLOUDFLARE_ACCOUNT_ID, cloudflareApiToken: config.CLOUDFLARE_EMAIL_TOKEN })
     : undefined;
   const testEmailOverride = config.TEST_EMAIL_FLAG
     ? { from: config.TEST_FROM_EMAIL_ACCOUNT!, to: config.TEST_TO_EMAIL_ACCOUNT! }
     : null;
-  const tpDb = new TenderPrepDatabase(db, scmsDb, boqDb, documentLinks, buildflowLinks, emailService, testEmailOverride);
+  const tpDb = new TenderPrepDatabase(db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, emailService, testEmailOverride);
 
   app.decorate('tps', { config, db, tpDb, scmsDb });
   await app.register(cors, { origin: config.WEB_ORIGIN, credentials: false });
