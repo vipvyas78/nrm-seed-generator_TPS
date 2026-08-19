@@ -46,3 +46,37 @@ export const takeoffCompletionMessage = z.object({
 });
 
 export type TakeoffCompletion = z.infer<typeof takeoffCompletionMessage>;
+
+/**
+ * The second half of the same contract, published when a reviewer releases a take-off to
+ * tender. Byte-identical to TAKEOFF_TENDER_QUEUE in nrm-seed-generator's queues.ts.
+ *
+ * Two topics rather than one because they answer different questions and can be arbitrarily
+ * far apart in time: `completed` says the pipeline finished measuring and creates the
+ * workflow shell; `tendered` says a human has approved or ignored every item, and is what
+ * builds the package list. A take-off can sit completed-but-unreviewed indefinitely.
+ */
+export const TAKEOFF_TENDER_QUEUE = 'buildflow_takeoff_tender_queue';
+
+/**
+ * Extends the completion shape — same identity fields, so nothing about reading a message
+ * changes — with the two facts the package rule needs.
+ *
+ * `projectScope` is `.nullable()`, not defaulted: a project that has never been given a
+ * scope selects the same packages as one explicitly scoped `works`, but they are different
+ * facts and only one of them is worth telling a user about.
+ *
+ * `workPackages` is what the take-off actually resolved, as at the moment it was released.
+ * It travels in the message rather than being re-queried here on purpose — re-reading
+ * takeoff_items later would silently answer for whatever has happened since.
+ */
+export const takeoffTenderedMessage = takeoffCompletionMessage.extend({
+  projectScope: z.string().nullable().optional(),
+  workPackages: z.array(z.object({
+    wpCode: z.string().min(1),
+    itemCount: z.number()
+  })).default([]),
+  tenderedAt: z.string().nullable().optional()
+});
+
+export type TakeoffTendered = z.infer<typeof takeoffTenderedMessage>;

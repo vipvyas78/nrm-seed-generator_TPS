@@ -280,6 +280,12 @@ function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowId: stri
     <td className="pkg-name">
       <strong>{row.package_name}</strong>
       {row.is_heading && <span className="badge badge-grey">broken down</span>}
+      {/* Why this package is in the list at all. A Manual one is prelims and the like —
+          nothing measures it, so it is offered rather than found, and a reviewer deciding
+          whether to tender it needs to know which of the two they are looking at. */}
+      {row.wp_scope_condition === 'Manual' && <span className="badge badge-amber" title="No take-off measures this work — added because every job carries it">manual</span>}
+      {row.wp_scope_condition === 'D&B' && <span className="badge badge-blue" title="Included because this is a design-and-build appointment">design &amp; build</span>}
+      {row.wp_code && <code className="tiny muted"> {row.wp_code}</code>}
       {row.stranded_bill_lines > 0 && <div className="alert alert-red tiny" style={{ marginTop: 6 }}>
         {row.stranded_bill_lines} priced items sit on this heading and will not be tendered. Move them onto the sub-packages.
       </div>}
@@ -398,14 +404,15 @@ function Step1TenderLaunchPack({ workflowId }: { workflowId: string }) {
   const rows = table.data ?? [];
   if (rows.length === 0) {
     return <div className="panel">
-      <h3>No package breakdown configured</h3>
+      <h3>Nothing to tender yet</h3>
       <p className="muted">
-        The Tender Launch Pack works through the package list agreed with the client when the
-        project is set up. Nothing is configured for this project or as an organisation
-        default, so there is nothing to tender yet.
+        The package list is built from the take-off. Review it in BuildFlow — approve or
+        ignore every item — then press <strong>Tender Take off</strong> on the TOQ tab. The
+        packages appear here within a few seconds of that.
       </p>
       <p className="muted" style={{ fontSize: '0.8rem', marginTop: 8 }}>
-        Configure it via <code>PUT /api/tender-prep/config/packages</code>.
+        Which packages are required is decided by the work packages the take-off resolved and
+        the project&rsquo;s scope, against the NRM1 work-package configuration.
       </p>
     </div>;
   }
@@ -530,9 +537,17 @@ function IttPackView({ pack, workflowId, packageName }: { pack: IttPack; workflo
 
     <h4>2. Scope and Bill of Quantities</h4>
     <p className="muted tiny">
-      {pack.boq_summary.total} lines attributed by NRM classification — {pack.boq_summary.priceable} with
-      measured quantities, {pack.boq_summary.scope_only} carrying scope without a quantity.
-      Rates are omitted deliberately: each tenderer prices independently.
+      {pack.boq_summary.total} lines — {pack.boq_summary.priceable} with measured quantities,
+      {' '}{pack.boq_summary.scope_only} carrying scope the take-off could not measure.
+      {pack.attributed_by_work_package
+        ? <> Taken straight from the take-off: {pack.boq_summary.by_work_package ?? 0} claimed by
+            work package{(pack.boq_summary.by_nrm_code ?? 0) > 0
+              ? <>, {pack.boq_summary.by_nrm_code} by NRM classification because the take-off
+                  resolved no package for them</>
+              : null}.</>
+        : ' Attributed by NRM classification.'}
+      {' '}Quantities are the reviewed ones. Rates are omitted deliberately: each tenderer
+      prices independently.
     </p>
     <div className="table-scroll">
       <table className="data-table itt-boq">
@@ -614,6 +629,37 @@ function IttPackView({ pack, workflowId, packageName }: { pack: IttPack; workflo
       Requirement binds the subcontractor whether or not its filename mentions their trade.
     </p>
     <DocSchedule docs={pack.documents} workflowId={workflowId} packageName={packageName} />
+
+    {/* Which of those the take-off actually measured against. Section 3 still issues
+        everything — this narrows nothing, it just says where these quantities came from,
+        which is the first thing a tenderer pricing one trade wants to open. */}
+    <h4>3b. Specification referenced by this package</h4>
+    {pack.spec_summary?.available === false
+      ? <p className="muted tiny">
+          This package is not derived from a take-off, so which specification its lines came
+          from is not recorded.
+        </p>
+      : <>
+          <p className="muted tiny">
+            {pack.spec_summary?.cited_lines ?? 0} of {pack.spec_summary?.total_lines ?? 0} lines
+            cite a specification.
+            {(pack.spec_summary?.unresolved ?? 0) > 0 && <>
+              {' '}<strong>Cited but not in the tender pack:</strong>{' '}
+              {pack.spec_summary?.unresolved_names.join(', ')}.
+            </>}
+          </p>
+          {(pack.spec_documents?.length ?? 0) === 0
+            ? <p className="muted tiny">No line in this package cites a specification document.</p>
+            : <table className="data-table">
+                <thead><tr><th>Document</th><th>Type</th><th>Pages</th><th>Ignore for ITT</th></tr></thead>
+                <tbody>{pack.spec_documents!.map((d) => <tr key={d.id} className={d.ignored ? 'scope-only' : ''}>
+                  <td className="tiny">{d.filename}</td>
+                  <td className="tiny muted">{d.doc_type.replace(/_/g, ' ')}</td>
+                  <td className="tiny">{d.page_count > 0 ? d.page_count : '—'}</td>
+                  <td><IgnoreToggle workflowId={workflowId} packageName={packageName} section="document" itemId={d.id} ignored={d.ignored} label="" /></td>
+                </tr>)}</tbody>
+              </table>}
+        </>}
 
     <h4>4. Schedule of attendances</h4>
     <p className="muted tiny">

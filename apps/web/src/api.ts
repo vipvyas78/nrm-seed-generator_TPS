@@ -72,6 +72,11 @@ export type LaunchTableRow = {
   trade_terms: string[];
   /** Authored bill lines stranded on a heading — nobody has been asked to price them. */
   stranded_bill_lines: number;
+  /** Set when the row was derived from a released take-off rather than hand-loaded. */
+  wp_code?: string | null;
+  /** Why this package is in the list: All | TOQ | D&B | Manual. */
+  wp_scope_condition?: string | null;
+  derived_from_takeoff?: string | null;
   notes?: string | null;
   confirmed_at: string | null;
   board_override_notes: string | null;
@@ -121,8 +126,24 @@ export type IttPack = {
     unit: string; quantity: string | null; required_for: string | null; notes: string | null;
     ignored: boolean;
   }>;
-  boq_summary: { total: number; priceable: number; scope_only: number; authored: number };
+  boq_summary: {
+    total: number; priceable: number; scope_only: number; authored: number;
+    /** Split by which mechanism claimed the line, so a thin bill and a take-off that
+        resolved no work package cannot be mistaken for one another. */
+    by_work_package?: number; by_nrm_code?: number;
+  };
+  attributed_by_work_package?: boolean;
+  wp_code?: string | null;
+  wp_scope_condition?: string | null;
   documents: Array<{ id: string; doc_type: string; filename: string; page_count: number; ignored: boolean }>;
+  /** The subset of `documents` this package's own take-off lines were read from. */
+  spec_documents?: Array<{ id: string; doc_type: string; filename: string; page_count: number; ignored: boolean }>;
+  spec_summary?: {
+    cited_lines: number; total_lines: number; resolved: number;
+    unresolved: number; unresolved_names: string[];
+    /** False for a legacy package: boq_items has no spec_source_files to answer from. */
+    available: boolean;
+  };
   /** Section 1 — what a compliant tender return must contain. */
   return_forms: Array<{ id: string; seq: number; name: string; description: string | null; is_required: boolean; ignored: boolean }>;
   /** Section 2 — what the subcontractor carries around the measured bill. */

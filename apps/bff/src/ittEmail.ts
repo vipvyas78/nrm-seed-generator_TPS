@@ -16,6 +16,40 @@ export interface IttEmailDocumentLink {
   url: string;
 }
 
+export interface IttEmailBoqLine {
+  geCode: string | null;
+  elementCode: string | null;
+  description: string;
+  quantity: number | null;
+  unit: string | null;
+  isPriceable: boolean;
+}
+
+export interface IttEmailBillLine {
+  ref: string | null;
+  section: string | null;
+  description: string;
+  quantity: number | null;
+  unit: string | null;
+  requiredFor: string | null;
+}
+
+export interface IttEmailScopeItem {
+  ref: number | null;
+  description: string;
+  procurementStage: string | null;
+}
+
+export interface IttEmailSpecClause {
+  chunkId: string;
+  geCode: string | null;
+  elementCode: string | null;
+  subElementCode: string | null;
+  subsectionTitle: string | null;
+  rawText: string;
+  nbsCode: string | null;
+}
+
 export interface IttEmailPack {
   packageName: string;
   displayRef: string;
@@ -23,12 +57,41 @@ export interface IttEmailPack {
   routeOfProcurement: string | null;
   returnForms: Array<{ name: string; description: string | null; isRequired: boolean }>;
   boqSummary: { total: number; priceable: number; authored: number };
-  scopeItems: Array<{ description: string }>;
+  boqLines: IttEmailBoqLine[];
+  billLines: IttEmailBillLine[];
+  scopeItems: IttEmailScopeItem[];
+  specClauses: IttEmailSpecClause[];
+  /**
+   * The specification documents this package's own lines were read from, by name.
+   *
+   * Distinct from `documentLinks`, which is every tender document issued with the project.
+   * This says which of them the take-off actually measured against, and it is the one a
+   * tenderer pricing this trade opens first.
+   */
+  specDocuments: string[];
   attendanceSummary: { subcontractor: number; mainContractor: number; joint: number };
   valueEngineeringRequired: boolean;
 }
 
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+const stageLabel = (stage: string | null): string => {
+  if (stage === 'Contract') return 'Contract — must be priced';
+  if (stage === 'Profit Plan') return 'Profit Plan — not priced';
+  return stage ?? '';
+};
+
+const qty = (n: number | null): string => (n === null ? '—' : String(n));
+
+/** Plain-text pipe table, header row plus one row per record. */
+const textTable = (headers: string[], rows: string[][]): string =>
+  [headers.join(' | '), ...rows.map((r) => r.join(' | '))].join('\n');
+
+const htmlTable = (headers: string[], rows: string[][]): string => `
+  <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+    <thead><tr>${headers.map((h) => `<th style="text-align:left; border-bottom: 2px solid #ccc; padding: 4px 6px;">${esc(h)}</th>`).join('')}</tr></thead>
+    <tbody>${rows.map((r) => `<tr>${r.map((c) => `<td style="border-bottom: 1px solid #eee; padding: 4px 6px;">${c}</td>`).join('')}</tr>`).join('')}</tbody>
+  </table>`;
 
 export function renderIttEmail(
   pack: IttEmailPack,
@@ -41,8 +104,21 @@ export function renderIttEmail(
   const requiredForms = pack.returnForms.filter((f) => f.isRequired);
   const optionalForms = pack.returnForms.filter((f) => !f.isRequired);
 
-  const scopeLines = pack.scopeItems.slice(0, 20).map((s) => s.description);
-  const scopeOverflow = pack.scopeItems.length - scopeLines.length;
+  const scopeLines = pack.scopeItems.map((s) =>
+    `${s.ref !== null ? `[${s.ref}] ` : ''}${s.description}${s.procurementStage ? ` (${stageLabel(s.procurementStage)})` : ''}`
+  );
+
+  const boqHeaders = ['GE Code', 'Element', 'Description', 'Qty', 'Unit'];
+  const boqRows = pack.boqLines.map((l) => [l.geCode ?? '—', l.elementCode ?? '—', l.description, qty(l.quantity), l.unit ?? '—']);
+  const boqHtmlRows = boqRows.map((r) => r.map(esc));
+
+  const billHeaders = ['Ref', 'Section', 'Description', 'Qty', 'Unit', 'Required for'];
+  const billRows = pack.billLines.map((l) => [l.ref ?? '—', l.section ?? '—', l.description, qty(l.quantity), l.unit ?? '—', l.requiredFor ?? '—']);
+  const billHtmlRows = billRows.map((r) => r.map(esc));
+
+  const specHeaders = ['GE Code', 'Element / Sub-element', 'Clause'];
+  const specRows = pack.specClauses.map((c) => [c.geCode ?? '—', [c.elementCode, c.subElementCode].filter(Boolean).join(' / ') || '—', c.rawText]);
+  const specHtmlRows = specRows.map((r) => r.map(esc));
 
   const text = `INVITATION TO TENDER
 
@@ -58,11 +134,17 @@ compliant return must contain.
 
 SCOPE OF WORKS (SUMMARY)
 ${scopeLines.length > 0 ? scopeLines.map((s) => ` - ${s}`).join('\n') : ' - See attached scope of works matrix.'}
-${scopeOverflow > 0 ? ` ...and ${scopeOverflow} more item${scopeOverflow === 1 ? '' : 's'}.\n` : ''}
+
 BILL OF QUANTITIES
 ${pack.boqSummary.total} measured lines attributed to this package (${pack.boqSummary.priceable} carrying a quantity), plus ${pack.boqSummary.authored} authored line${pack.boqSummary.authored === 1 ? '' : 's'}. Rates are not shown — please price independently.
 
-TENDER DOCUMENTS
+${boqRows.length > 0 ? textTable(boqHeaders, boqRows) : 'See attached bill of quantities.'}
+${billRows.length > 0 ? `\nBILL OF QUANTITIES — AUTHORED ITEMS\n${textTable(billHeaders, billRows)}\n` : ''}
+${specRows.length > 0 ? `\nSPECIFICATION CLAUSES\n${textTable(specHeaders, specRows)}\n` : ''}
+${pack.specDocuments.length > 0 ? `SPECIFICATION REFERENCED BY THIS PACKAGE
+${pack.specDocuments.map((d) => ` - ${d}`).join('\n')}
+
+` : ''}TENDER DOCUMENTS
 ${documentLinks.length > 0
   ? documentLinks.map((d) => ` - ${d.displayName}: ${d.url}`).join('\n')
   : ' - No documents are available to link at this time.'}
@@ -97,12 +179,26 @@ Please raise all technical and commercial queries in writing before the return d
 
   <h2 style="font-size: 15px;">Scope of works (summary)</h2>
   ${scopeLines.length > 0
-    ? `<ul>${scopeLines.map((s) => `<li>${esc(s)}</li>`).join('')}</ul>${scopeOverflow > 0 ? `<p style="color:#888;font-size:12px;">...and ${scopeOverflow} more item${scopeOverflow === 1 ? '' : 's'}.</p>` : ''}`
+    ? `<ul>${scopeLines.map((s) => `<li>${esc(s)}</li>`).join('')}</ul>`
     : '<p>See attached scope of works matrix.</p>'}
 
   <h2 style="font-size: 15px;">Bill of quantities</h2>
   <p>${pack.boqSummary.total} measured lines attributed to this package (${pack.boqSummary.priceable} carrying a quantity), plus
   ${pack.boqSummary.authored} authored line${pack.boqSummary.authored === 1 ? '' : 's'}. Rates are not shown — please price independently.</p>
+  ${boqHtmlRows.length > 0 ? htmlTable(boqHeaders, boqHtmlRows) : '<p>See attached bill of quantities.</p>'}
+
+  ${billHtmlRows.length > 0 ? `
+  <h2 style="font-size: 15px;">Bill of quantities — authored items</h2>
+  ${htmlTable(billHeaders, billHtmlRows)}` : ''}
+
+  ${specHtmlRows.length > 0 ? `
+  <h2 style="font-size: 15px;">Specification clauses</h2>
+  ${htmlTable(specHeaders, specHtmlRows)}` : ''}
+
+  ${pack.specDocuments.length > 0 ? `
+  <h2 style="font-size: 15px;">Specification referenced by this package</h2>
+  <p style="font-size: 13px;">The measured lines above were read from these documents. They are issued with the full document schedule below.</p>
+  <ul>${pack.specDocuments.map((d) => `<li>${esc(d)}</li>`).join('')}</ul>` : ''}
 
   <h2 style="font-size: 15px;">Tender documents</h2>
   ${documentLinks.length > 0

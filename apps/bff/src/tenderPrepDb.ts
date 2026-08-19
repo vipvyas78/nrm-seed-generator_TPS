@@ -1,12 +1,13 @@
 import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
 import type { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
+import type { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
 import type { Database, Row } from './db.js';
 import type { DocumentLinkProvider } from './documentLinkProvider.js';
 import type { EmailService } from './emailService.js';
 import { conflict, notFound } from './errors.js';
 import { renderIttEmail } from './ittEmail.js';
 import type { ScmsReadDatabase } from './scmsReadDb.js';
-import type { TakeoffCompletion } from './takeoffCompletion.js';
+import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js';
 import type { Actor } from './types.js';
 
 /** Every ITT email is sent from this address, regardless of who confirms it in the UI. */
@@ -121,6 +122,8 @@ export class TenderPrepDatabase {
     private readonly documentLinks?: DocumentLinkProvider,
     // Optional: without one configured, ITT emails send without document links.
     private readonly buildflowLinks?: BuildflowDocumentLinksClient,
+    // Optional: without one configured, ITT emails send without a specification clauses section.
+    private readonly specClauses?: BuildflowSpecClauseClient,
     // Optional: without one configured, confirmAndSendItt records what it would have sent
     // instead of actually sending — see confirmAndSendItt.
     private readonly emailService?: EmailService,
@@ -143,6 +146,91 @@ export class TenderPrepDatabase {
     if (!takeoffId) return null;
     const boq = await this.boq.findBoqForTakeoff(takeoffId);
     return boq ? String(boq.boq_id) : null;
+  }
+
+  /**
+   * Renders the ITT email for one package straight from a BoQ id, a take-off id and a
+   * package name — no workflow, shortlist or confirmation required.
+   *
+   * For previewing what an ITT would look like ahead of, or independent of, the Step 2
+   * dispatch flow that `getPackageItt`/`confirmAndSendItt` drive. It reuses the same
+   * attribution logic those two use (`attributionFor`, `linesForPackage` /
+   * `takeoffLinesForWorkPackage` / `takeoffLinesUnattributed`) so the BoQ lines it shows can
+   * never disagree with what a real dispatch would carry — only recipients, documents and
+   * spec clauses are omitted, since none of those depend on a workflow existing.
+   */
+  async previewIttEmail(actor: Actor, input: {
+    boqId: string; takeoffId: string; packageName: string;
+  }): Promise<{ subject: string; html: string; text: string }> {
+    const [pkg] = await this.db.query<Row>(
+      `SELECT pc.* FROM package_config pc WHERE pc.organization_id = $1 AND pc.name = $2
+        ORDER BY pc.project_id NULLS LAST LIMIT 1`,
+      [actor.organizationId, input.packageName]
+    );
+    if (!pkg) throw notFound('Package is not configured');
+
+    const boqLines = pkg.wp_code
+      ? [
+          ...await this.boq.takeoffLinesForWorkPackage(input.takeoffId, String(pkg.wp_code)),
+          ...await this.boq.takeoffLinesUnattributed(input.takeoffId, attributionFor(pkg))
+        ]
+      : await this.boq.linesForPackage(input.boqId, attributionFor(pkg));
+
+    const billLines = await this.db.query<Row>(
+      `SELECT id, seq, section, ref, description, unit, quantity, required_for, notes
+         FROM package_bill_lines WHERE package_config_id = $1 ORDER BY seq`,
+      [pkg.id]
+    );
+    const returnForms = await this.listReturnForms(actor);
+    const attendances = await this.listAttendances(actor, String(pkg.id));
+    const scopeItems = await this.listScopeItems(actor, input.packageName);
+
+    const previewSession = await this.boq.findBoqForTakeoff(input.takeoffId);
+    const previewSpecDocuments = previewSession
+      ? (await this.boq.specDocumentsForFilenames(
+          String(previewSession.session_id),
+          [...new Set(boqLines.flatMap((l) => (l.spec_source_files as string[] | null) ?? []))]
+        )).map((d) => String(d.filename))
+      : [];
+
+    const priceable = boqLines.filter((l) => l.is_priceable).length;
+    const emailPack = {
+      packageName: pkg.name as string,
+      displayRef: pkg.sub_seq == null ? String(pkg.seq) : `${pkg.seq}.${pkg.sub_seq}`,
+      projectName: 'the project',
+      routeOfProcurement: (pkg.route_of_procurement as string | null) ?? null,
+      returnForms: returnForms.map((f) => ({
+        name: String(f.name), description: (f.description as string | null) ?? null, isRequired: Boolean(f.is_required)
+      })),
+      boqSummary: { total: boqLines.length, priceable, authored: billLines.length },
+      boqLines: boqLines.map((l) => ({
+        geCode: (l.ge_code as string | null) ?? null, elementCode: (l.element_code as string | null) ?? null,
+        description: String(l.description), quantity: (l.quantity as number | null) ?? null,
+        unit: (l.unit as string | null) ?? null, isPriceable: Boolean(l.is_priceable)
+      })),
+      billLines: billLines.map((l) => ({
+        ref: (l.ref as string | null) ?? null, section: (l.section as string | null) ?? null,
+        description: String(l.description), quantity: (l.quantity as number | null) ?? null,
+        unit: (l.unit as string | null) ?? null, requiredFor: (l.required_for as string | null) ?? null
+      })),
+      scopeItems: scopeItems.map((s) => ({
+        ref: (s.ref as number | null) ?? null, description: String(s.description),
+        procurementStage: (s.procurement_stage as string | null) ?? null
+      })),
+      specClauses: [],
+      // Resolved the same way getPackageItt does, off the same lines — the preview has to
+      // show what would actually be sent, and this needs no workflow, only the session the
+      // take-off's BoQ belongs to.
+      specDocuments: previewSpecDocuments,
+      attendanceSummary: {
+        subcontractor: attendances.filter((a) => a.owner === 'SC').length,
+        mainContractor: attendances.filter((a) => a.owner === 'H').length,
+        joint: attendances.filter((a) => a.owner === 'J').length
+      },
+      valueEngineeringRequired: true
+    };
+
+    return renderIttEmail(emailPack, { name: null, email: '' }, []);
   }
 
   /**
@@ -191,12 +279,56 @@ export class TenderPrepDatabase {
     );
 
     const boqSession = takeoffId ? await this.boq.findBoqForTakeoff(takeoffId) : null;
-    const boqLines = boqSession
-      ? await this.boq.linesForPackage(String(boqSession.boq_id), attributionFor(pkg))
+    // A derived package claims its lines by the work package the take-off resolved; a legacy
+    // hand-loaded one still claims them by NRM code off the aggregated boq_items. Which
+    // applies is decided by the row, not by a flag anyone sets: pc.wp_code is present only
+    // on a row generated from a released take-off.
+    //
+    // The two are never OR-ed. The work-package pass sees only items that HAVE one and the
+    // NRM-code pass only items that do not, so a line cannot be claimed twice, and each
+    // carries `attributed_by` so a surveyor can see which mechanism put it there.
+    const boqLines = pkg.wp_code && takeoffId
+      ? [
+          ...await this.boq.takeoffLinesForWorkPackage(takeoffId, String(pkg.wp_code)),
+          ...await this.boq.takeoffLinesUnattributed(takeoffId, attributionFor(pkg))
+        ]
+      : boqSession
+        ? await this.boq.linesForPackage(String(boqSession.boq_id), attributionFor(pkg))
+        : [];
+    // The pipeline session, not the BoQ session. A derived package's lines come from
+    // takeoff_items and need no boq_sessions row at all, so gating the documents on one made
+    // a package show a full bill and no documents whenever the BoQ run had not been written.
+    const sessionId = boqSession?.session_id
+      ?? (typeof takeoff.pipelineSessionId === 'string' ? takeoff.pipelineSessionId : null);
+    const rawDocuments = sessionId
+      ? await this.boq.documentsForSession(String(sessionId))
       : [];
-    const rawDocuments = boqSession
-      ? await this.boq.documentsForSession(String(boqSession.session_id))
+
+    // The specification THIS package's own lines were read from.
+    //
+    // spec_source_files holds tender_documents.filename verbatim, so this is an exact join.
+    // It is deliberately not spec_chunk_ids: a chunk id cannot name a document at all —
+    // nrm_chunks keeps no path — and on Reading it is set on zero items of every work
+    // package, which is exactly why Flooring's specification section came back empty while
+    // its 17 clause-derived lines all named an Employer's Requirements PDF.
+    const citedSpecFiles = [...new Set(
+      boqLines.flatMap((l) => (l.spec_source_files as string[] | null) ?? [])
+    )];
+    const citingLines = boqLines.filter(
+      (l) => ((l.spec_source_files as string[] | null) ?? []).length > 0
+    ).length;
+    const specDocuments = sessionId
+      ? await this.boq.specDocumentsForFilenames(String(sessionId), citedSpecFiles)
       : [];
+    // Counted over the names asked for, not the documents returned: a name matching no
+    // document means the take-off cited a document this tender pack does not contain, and
+    // that is a finding rather than something to round down to zero.
+    const resolvedNames = new Set(specDocuments.map((d) => String(d.filename).toLowerCase()));
+    const basename = (name: string) => name.split(/[\\/]/).pop() ?? name;
+    const unresolvedSpecFiles = citedSpecFiles.filter(
+      (name) => !resolvedNames.has(name.toLowerCase())
+             && !resolvedNames.has(basename(name).toLowerCase())
+    );
     // Best-effort: a document TPS can't resolve a link for still appears, just with
     // url: null — a broken lookup should never block issuing the ITT itself.
     const documents = this.documentLinks
@@ -247,9 +379,28 @@ export class TenderPrepDatabase {
       bill_lines: withIgnored(billLines, 'bill_line'),
       boq_summary: {
         total: boqLines.length, priceable, scope_only: boqLines.length - priceable,
-        authored: billLines.length
+        authored: billLines.length,
+        // Reported separately so "this package's bill is thin" and "a third of the take-off
+        // resolved no work package" cannot be mistaken for each other.
+        by_work_package: boqLines.filter((l) => l.attributed_by === 'work_package').length,
+        by_nrm_code: boqLines.filter((l) => l.attributed_by !== 'work_package').length
       },
+      attributed_by_work_package: Boolean(pkg.wp_code),
+      wp_code: pkg.wp_code ?? null,
+      wp_scope_condition: pkg.wp_scope_condition ?? null,
       documents: withIgnored(documents, 'document'),
+      // Marked with the SAME 'document' override section, not a new one: a spec document IS
+      // a tender_documents row with the same id, so ignoring it in the schedule below has to
+      // ignore it here too. That falls out of reusing the section key, and needs no migration.
+      spec_documents: withIgnored(specDocuments, 'document'),
+      spec_summary: {
+        cited_lines: citingLines, total_lines: boqLines.length,
+        resolved: specDocuments.length,
+        unresolved: unresolvedSpecFiles.length, unresolved_names: unresolvedSpecFiles,
+        // A hand-loaded package reads boq_items, which has no spec_source_files column at
+        // all, so it cannot answer this question. Saying so beats reporting a bare zero.
+        available: Boolean(pkg.wp_code)
+      },
       return_forms: withIgnored(returnForms, 'return_form'),
       scope_items: withIgnored(scopeItems, 'scope_item'),
       scope_summary: {
@@ -278,13 +429,37 @@ export class TenderPrepDatabase {
         boqLines.length > 0 && priceable === 0 && billLines.length === 0 &&
           'Every attributed line has zero quantity; the tenderer has scope but no quantities.',
         recipients.length === 0 && 'No subcontractors have been selected for this package at the tender launch meeting.',
-        !boqSession && 'No completed take-off BoQ is linked to this workflow.',
+        !takeoffId && 'No take-off is linked to this workflow.',
+        !pkg.wp_code && !boqSession && 'No completed take-off BoQ is linked to this workflow.',
         documents.length === 0 && 'No tender documents are attached to this project.',
+        // The specification the take-off actually read, and the three ways it can be absent —
+        // kept apart, because they call for different things. Cited-but-unresolved means the
+        // pipeline named a document this pack does not contain; cited-nothing means the lines
+        // were measured off drawings rather than a clause, which is normal for some trades and
+        // worth knowing for others.
+        Boolean(pkg.wp_code) && citingLines > 0 && specDocuments.length === 0 &&
+          `${citingLines} line${citingLines === 1 ? '' : 's'} cite a specification (${unresolvedSpecFiles.join(', ')}), but no matching tender document was found for it.`,
+        Boolean(pkg.wp_code) && specDocuments.length > 0 && unresolvedSpecFiles.length > 0 &&
+          `Cited but not in the tender pack: ${unresolvedSpecFiles.join(', ')}.`,
+        Boolean(pkg.wp_code) && boqLines.length > 0 && citingLines === 0 &&
+          'No line in this package cites a specification, so the ITT names none. These lines were measured without a clause reference.',
+        // An unconfigured integration and an empty one are different facts, and both clients
+        // return [] either way. Without this the ITT emails with no document links at all and
+        // reads exactly as though the project had none.
+        !this.buildflowLinks &&
+          'Document links unavailable: BUILDFLOW_BASE_URL and BUILDFLOW_DOCUMENT_LINKS_TOKEN are not configured, so this ITT would be emailed with no document links.',
         // Scope and attendances are what make the pricing document coordinate: they define
         // everything the subcontractor carries around the measured bill. Missing either and
         // every tenderer guesses differently, so neither the price nor the comparison holds.
-        scopeItems.length === 0 &&
+        //
+        // A derived package carries its scope in section 2 — the take-off's unmeasured items
+        // ARE scope — so an empty legacy matrix is not a gap for it. Keeping the note would
+        // mark every derived package "not ready to issue" for the absence of a spreadsheet
+        // this project was never going to have.
+        !pkg.wp_code && scopeItems.length === 0 &&
           'No scope of works items for this package. The bill states what is measured but not what the subcontractor carries around it, so returns will not be comparable.',
+        Boolean(pkg.wp_code) && boqLines.length > 0 && boqLines.length === priceable &&
+          'Every attributed line carries a quantity, so this package states no unmeasured scope. Check nothing has been left out.',
         attendances.length === 0 &&
           'No schedule of attendances. Every return will be qualified — no tenderer prices attendances they have not been told they carry.',
         returnForms.length === 0 &&
@@ -667,6 +842,135 @@ export class TenderPrepDatabase {
     });
   }
 
+  /**
+   * Build this project's package list from a released take-off.
+   *
+   * The list used to be configuration — 144 rows loaded once from the client's spreadsheet,
+   * org-wide, identical for every project. It is now derived, from three facts the parent
+   * platform already holds:
+   *
+   *   what the take-off measured   message.workPackages, as at the moment of release
+   *   what the appointment covers  message.projectScope (bf_projects.project_scope)
+   *   when a package is required   public.nrm_sub_element_work_package.wp_scope_condition
+   *
+   * ONE ROW PER CODE, AT THE WIDEST CONDITION IT CARRIES. A work package maps to many NRM1
+   * sub-elements and they need not agree: WP-GRND is `TOQ` under one and `All` under
+   * another. `All` is the wider claim — a package that is unconditionally required under any
+   * sub-element is unconditionally required — so the conditions are ranked and the widest
+   * wins. Taking an arbitrary row instead would make the list depend on NRM1 code order,
+   * which is not a fact about anything.
+   *
+   * DEACTIVATE, NEVER DELETE. package_bill_lines and attendance_items cascade off
+   * package_config.id; replacePackageConfig's own comment records a delete-then-reinsert
+   * that "silently wiped 890 lines of survey schedule". A package falling out of scope is
+   * not a reason to destroy an authored bill, and a later re-run may well bring it back.
+   *
+   * Called by the queue consumer, so the actor is built from the message and this bypasses
+   * the HTTP authenticator by design — same as launchFromTakeoff.
+   */
+  async buildPackagesFromTakeoff(
+    actor: Actor, message: TakeoffTendered
+  ): Promise<{ selected: number; deactivated: number; byCondition: Record<string, number> }> {
+    const projectId = message.projectId ?? null;
+    const measured = message.workPackages.map((entry) => entry.wpCode);
+    const isDnB = message.projectScope === 'design_and_build';
+    // Registered per organization because route_options is org-scoped. A reviewer changes it
+    // in Step 1 either way; this only has to satisfy package_config_route_not_blank.
+    const defaultRoute = isDnB ? 'Design, Supply and install' : 'Supply and install';
+
+    return this.db.transaction(async (client) => {
+      await client.query(
+        `INSERT INTO route_options (organization_id, label, sort_order) VALUES ($1, $2, 10)
+         ON CONFLICT (organization_id, label) DO NOTHING`,
+        [actor.organizationId, defaultRoute]
+      );
+
+      // The rule, in SQL, over the parent's public schema. `strictness` ranks the conditions
+      // so DISTINCT ON keeps the widest; the WHERE then applies each one's meaning.
+      const selected = await this.db.query<{
+        wp_code: string; label: string; sort_order: number; wp_scope_condition: string;
+      }>(
+        `WITH ranked AS (
+           SELECT DISTINCT ON (m.wp_code)
+                  m.wp_code, w.label, w.sort_order, m.wp_scope_condition
+             FROM public.nrm_sub_element_work_package m
+             JOIN public.work_package_config w ON w.wp_code = m.wp_code AND w.is_active
+            WHERE m.wp_code IS NOT NULL
+            ORDER BY m.wp_code,
+                     CASE m.wp_scope_condition
+                       WHEN 'All' THEN 0 WHEN 'D&B' THEN 1
+                       WHEN 'TOQ' THEN 2 WHEN 'Manual' THEN 3 ELSE 4 END
+         )
+         SELECT * FROM ranked
+          WHERE wp_scope_condition = 'All'
+             OR (wp_scope_condition = 'D&B'    AND $2::boolean)
+             OR (wp_scope_condition = 'TOQ'    AND wp_code = ANY($1::text[]))
+             OR  wp_scope_condition = 'Manual'
+          ORDER BY sort_order, wp_code`,
+        [measured, isDnB], client
+      );
+
+      // Push the existing derived rows out of the numbering before renumbering them.
+      //
+      // package_config_seq_key is UNIQUE (organization_id, project_id, seq, sub_seq), and
+      // seq is assigned here by position in the selected list. So the moment the SET of
+      // packages changes -- a project switched to design and build gains its D&B package
+      // and everything after it shifts by one -- the upsert tries to give a code a seq that
+      // another code still holds, and the whole rebuild aborts on a duplicate key.
+      //
+      // Same +100000 idiom replacePackageConfig uses for the same constraint, and it works
+      // for the same reason: inside one transaction, so nothing ever observes the gap.
+      await client.query(
+        `UPDATE package_config SET seq = seq + 100000
+          WHERE organization_id = $1 AND project_id IS NOT DISTINCT FROM $2
+            AND wp_code IS NOT NULL`,
+        [actor.organizationId, projectId]
+      );
+
+      for (const [index, row] of selected.entries()) {
+        await client.query(
+          `INSERT INTO package_config
+             (organization_id, project_id, seq, name, route_of_procurement, trade_terms,
+              wp_code, wp_scope_condition, derived_from_takeoff, is_active, notes)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10)
+           ON CONFLICT (organization_id, project_id, wp_code) WHERE wp_code IS NOT NULL
+           DO UPDATE SET seq = EXCLUDED.seq, name = EXCLUDED.name,
+                         trade_terms = EXCLUDED.trade_terms,
+                         wp_scope_condition = EXCLUDED.wp_scope_condition,
+                         derived_from_takeoff = EXCLUDED.derived_from_takeoff,
+                         is_active = TRUE, notes = EXCLUDED.notes, updated_at = NOW()`,
+          [
+            actor.organizationId, projectId, index + 1, row.label, defaultRoute,
+            // The label IS a trade name ("Dry lining & partitions"), which is what
+            // scmsReadDb's word-level matcher wants, so Step 1's shortlist column keeps
+            // working without a second vocabulary to maintain. route_of_procurement is
+            // deliberately NOT in the DO UPDATE set: a reviewer's choice survives a rebuild.
+            [row.label],
+            row.wp_code, row.wp_scope_condition, message.takeoffId,
+            row.wp_scope_condition === 'Manual'
+              ? 'Added manually — no take-off measures this work.'
+              : null
+          ]
+        );
+      }
+
+      const keep = selected.map((row) => row.wp_code);
+      const deactivated = await this.db.query<{ id: string }>(
+        `UPDATE package_config SET is_active = FALSE, updated_at = NOW()
+          WHERE organization_id = $1 AND project_id IS NOT DISTINCT FROM $2
+            AND wp_code IS NOT NULL AND NOT (wp_code = ANY($3::text[])) AND is_active
+          RETURNING id`,
+        [actor.organizationId, projectId, keep], client
+      );
+
+      const byCondition: Record<string, number> = {};
+      for (const row of selected) {
+        byCondition[row.wp_scope_condition] = (byCondition[row.wp_scope_condition] ?? 0) + 1;
+      }
+      return { selected: selected.length, deactivated: deactivated.length, byCondition };
+    });
+  }
+
   // ── Project configuration: the client's package breakdown ─────────────────
 
   /**
@@ -684,7 +988,7 @@ export class TenderPrepDatabase {
              CASE WHEN p.sub_seq IS NULL THEN p.seq::text
                   ELSE p.seq || '.' || p.sub_seq END AS display_ref
         FROM package_config p
-       WHERE p.organization_id = $1`;
+       WHERE p.organization_id = $1 AND p.is_active`;
     if (projectId) {
       const scoped = await this.db.query(
         `${select} AND p.project_id = $2 ORDER BY p.seq, p.sub_seq NULLS FIRST`,
@@ -921,6 +1225,11 @@ export class TenderPrepDatabase {
         route_options: routeOptions,
         trade_terms: terms,
         stranded_bill_lines: strandedBill,
+        // Present only on a row derived from a released take-off. Step 1 uses the condition
+        // to mark a Manual package -- work no take-off measures, offered rather than found.
+        wp_code: pkg.wp_code ?? null,
+        wp_scope_condition: pkg.wp_scope_condition ?? null,
+        derived_from_takeoff: pkg.derived_from_takeoff ?? null,
         notes: pkg.notes,
         confirmed_at: shortlist?.confirmed_at ?? null,
         board_override_notes: shortlist?.board_override_notes ?? null,
@@ -1075,6 +1384,12 @@ export class TenderPrepDatabase {
       .map((l) => ({ displayName: l.displayName, url: l.url }));
 
     const priceable = boqLines.filter((l) => l.is_priceable).length;
+
+    // Best-effort: an id BuildFlow can't resolve, or BuildFlow being unreachable, should
+    // never block the ITT — the email just sends with no spec clauses section.
+    const chunkIds = [...new Set(boqLines.flatMap((l) => (l.spec_chunk_ids as string[] | null) ?? []))];
+    const specClauses = this.specClauses ? await this.specClauses.clausesFor(chunkIds) : [];
+
     const emailPack = {
       packageName: pack.package_name as string,
       displayRef: pack.display_ref as string,
@@ -1084,7 +1399,30 @@ export class TenderPrepDatabase {
         name: String(f.name), description: (f.description as string | null) ?? null, isRequired: Boolean(f.is_required)
       })),
       boqSummary: { total: boqLines.length, priceable, authored: billLines.length },
-      scopeItems: scopeItems.map((s) => ({ description: String(s.description) })),
+      boqLines: boqLines.map((l) => ({
+        geCode: (l.ge_code as string | null) ?? null, elementCode: (l.element_code as string | null) ?? null,
+        description: String(l.description), quantity: (l.quantity as number | null) ?? null,
+        unit: (l.unit as string | null) ?? null, isPriceable: Boolean(l.is_priceable)
+      })),
+      billLines: billLines.map((l) => ({
+        ref: (l.ref as string | null) ?? null, section: (l.section as string | null) ?? null,
+        description: String(l.description), quantity: (l.quantity as number | null) ?? null,
+        unit: (l.unit as string | null) ?? null, requiredFor: (l.required_for as string | null) ?? null
+      })),
+      scopeItems: scopeItems.map((s) => ({
+        ref: (s.ref as number | null) ?? null, description: String(s.description),
+        procurementStage: (s.procurement_stage as string | null) ?? null
+      })),
+      specClauses: specClauses.map((c) => ({
+        chunkId: c.chunkId, geCode: c.geCode, elementCode: c.elementCode, subElementCode: c.subElementCode,
+        subsectionTitle: c.subsectionTitle, rawText: c.rawText, nbsCode: c.nbsCode
+      })),
+      // Ignored spec documents are dropped here, like every other section: getPackageItt
+      // stamps them from the SAME 'document' override key as the schedule, so unticking a
+      // document in the UI removes it from both lists at once.
+      specDocuments: ((pack.spec_documents as Row[]) ?? [])
+        .filter((d) => d.ignored !== true)
+        .map((d) => String(d.filename)),
       attendanceSummary: {
         subcontractor: Number((pack.attendance_summary as Row).subcontractor ?? 0),
         mainContractor: Number((pack.attendance_summary as Row).main_contractor ?? 0),

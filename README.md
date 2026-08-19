@@ -152,6 +152,90 @@ Starting a workflow by hand still works and is unchanged; it simply carries no `
 
 ---
 
+## The package list is derived, not configured
+
+Step 1 used to work through `tps.package_config` — a list loaded once from the client's
+spreadsheet through `PUT /api/tender-prep/config/packages`, with no UI, organisation-wide,
+identical for every project. It is now built from the take-off.
+
+```
+BuildFlow: reviewer approves/ignores every TOQ item, presses "Tender Take off"
+  └─ bf_queue_outbox 'takeoff.tendered', same transaction as the release stamp
+      └─ buildflow_takeoff_tender_queue                        (BullMQ, parent's Redis)
+          └─ worker-tps → tpDb.buildPackagesFromTakeoff        (this repo)
+              └─ tps.package_config rows carrying wp_code, scoped to the project
+```
+
+Which packages are required comes from `public.nrm_sub_element_work_package.wp_scope_condition`:
+`All` always · `TOQ` only where the take-off measured work under that code · `D&B` only when
+`bf_projects.project_scope = 'design_and_build'` · `Manual` offered, badged, never
+auto-selected. A code maps to many NRM1 sub-elements and they need not agree, so the widest
+condition wins.
+
+**The table is not dropped, and that is deliberate.** Package identity in this schema is a
+bare string: `package_bill_lines` and `attendance_items` are FK'd to `package_config.id` and
+cascade, while `shortlists`, `itt_line_overrides`, `tender_returns` and `precontract_minutes`
+all join by `name`. Replacing the table would take Step 1's confirm flow, the ITT's sections
+2b and 4, and every per-line override with it. So the rows become derived and the table
+stays — rows with `wp_code` are generated and rebuilt on each release, rows without one are
+the legacy list, still served to any project that has never been tendered
+(`listPackageConfig` prefers project rows and falls back to the org default).
+
+A package that falls out of scope is **deactivated, never deleted** — `replacePackageConfig`
+already records a delete-then-reinsert that "silently wiped 890 lines of survey schedule".
+`route_of_procurement` is deliberately absent from the upsert's `DO UPDATE` set: the
+derivation proposes a route, it does not overrule the person who tendered the package. And
+`seq` is bumped by 100000 before renumbering, because `package_config_seq_key` is unique on
+`(organization_id, project_id, seq, sub_seq)` and the moment the package *set* changes every
+seq after the new one shifts.
+
+`trade_terms` is the work-package label — "Dry lining & partitions" is a trade name, which is
+what `scmsReadDb`'s word-level matcher wants, so the shortlist column keeps working without a
+second vocabulary to maintain.
+
+### Which specification a package was measured against
+
+The ITT names, per package, the specification documents that package's own take-off lines
+were read from — for Reading's Flooring package, `01 - Employers Requirements 144.pdf`.
+
+It comes from `takeoff_items.spec_source_files`, which holds `tender_documents.filename`
+verbatim (`elemental_lines` reads those filenames out of `tender_documents` before parsing a
+clause from each), so the join is exact.
+
+**It cannot come from `spec_chunk_ids`, and that was the bug.** `nrm_chunks` keeps no path,
+filename or usable document id for a `tender_spec` row — `embed_chunks.py` carries
+`source_path` in memory and drops it from the INSERT — so BuildFlow's `/internal/spec-clauses`
+answers *which clause* correctly and can never answer *which document*. On Reading,
+`spec_chunk_ids` is set on 25 of 525 items and on **zero** items of every work package, while
+`spec_source_files` is set on 213 — including 17 of Flooring's 18. Keying the ITT's
+specification section on the chunk ids is why it came back empty for every package.
+
+The list is a **subsection**, not a filter: section 3 still issues all documents to every
+tenderer, because an Employer's Requirement binds a subcontractor whether or not its filename
+mentions their trade. A cited filename matching no document is reported as `unresolved`
+rather than dropped — it means the take-off named a document this tender pack does not
+contain. Spec documents carry the same `'document'` ignore key as the schedule, so unticking
+one removes it from both.
+
+---
+
+### Scope and Bill of Quantities come from the take-off
+
+The ITT's section 2 reads `public.takeoff_items` filtered on `work_package`, not `boq_items`
+attributed by NRM group-element prefix. Items with a quantity are the priceable bill; items
+without are scope the take-off recorded but could not measure — which is what `is_priceable`
+already distinguished. Quantities are the **reviewed** ones
+(`COALESCE(latest.effective_quantity, ti.quantity)`, the same LATERAL the parent's own
+`reaggregateReviewedBoq` uses), ignored items are gone, and rates are still never selected.
+
+The NRM-code rule remains as a **second** mechanism for items the take-off resolved no
+package for — 196 of Reading's 525 — and for items naming a code
+`work_package_config` no longer holds (`WP-MEP`, `WP-FIN`, retired by the parent's migration
+075). The two never overlap and every line carries `attributed_by`, so a thin bill and a
+take-off that resolved nothing cannot be mistaken for each other.
+
+---
+
 ## Wiring the TPS frontend into the parent app
 
 The TPS web app is a standalone SPA. The parent app links into it by navigating to:
@@ -226,6 +310,8 @@ Both repos provision actors through the issuer `buildflow-dev` and upsert on `(o
 | `OIDC_JWKS_URI` | Prod | — | Required when `AUTH_DISABLED=false` |
 | `SCMS_SCHEMA` | No | `scms` | Schema owned by the SCMS module, read (never written) for Step 1 shortlist candidates. Must be a bare SQL identifier. |
 | `REDIS_URL` | Worker | — | The parent platform's Redis. Required by `worker-tps`; unused by the API and migrator. |
+| `BUILDFLOW_BASE_URL` | No | — | BuildFlow's BFF as reachable from this container — `http://bff:3000` on the shared network, **not** localhost. Enables emailed document links and spec-clause text. |
+| `BUILDFLOW_DOCUMENT_LINKS_TOKEN` | No | — | Shared secret for both BuildFlow internal routes. **Must equal `TPS_INTERNAL_TOKEN` on the BuildFlow side** (compose default `buildflow-tps-dev-token`) or every call 401s. Unset, the ITT still sends and says so in its review notes. |
 | `ENGINE_INTERNAL_URL` | No | — | Internal URL of the Python API |
 | `ENGINE_INTERNAL_TOKEN` | No | — | Bearer token for BFF→API calls |
 | `LOG_LEVEL` | No | `info` | Fastify log level |
