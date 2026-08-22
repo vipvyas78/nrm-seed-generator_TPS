@@ -1,0 +1,28 @@
+-- The ITT's scope of works now comes from the configurable scope library, so the
+-- per-line "Ignore for ITT" overrides that pointed at the old matrix no longer point
+-- at anything.
+--
+-- tps.itt_line_overrides stores (workflow, package, section, item_id), where item_id is
+-- the id of the row being suppressed. For section = 'scope_item' those ids are
+-- tps.scope_items UUIDs. listScopeItems now reads public.tender_scope_items instead
+-- (BuildFlow migration 077), which mints its own ids, so every one of those overrides
+-- matches nothing.
+--
+-- THE SYMPTOM IF THIS IS NOT RUN IS SILENT AND IT GOES OUTWARD. An override is a
+-- reviewer's decision that a clause does NOT apply to this package -- they read it, they
+-- struck it out. A stale override does not error and does not warn: the clause simply
+-- reappears in the next ITT, in a document a subcontractor prices against. Nothing on
+-- the screen says the decision was lost, because the toggle it was made with now shows
+-- an untouched row.
+--
+-- So the rows are deleted rather than left to rot. Every affected package returns to
+-- "nothing ignored", which is a state a reviewer can see and redo against the new,
+-- sectioned list. Recovering the decisions instead would mean matching old rows to new
+-- ones on description text, and a near-match there re-suppresses the WRONG clause --
+-- the one failure mode worse than asking someone to look again.
+--
+-- Only the scope_item section is touched. Overrides on return forms, BoQ lines, bill
+-- lines and documents key on rows this change does not move, and stay exactly as they
+-- are.
+
+DELETE FROM tps.itt_line_overrides WHERE section = 'scope_item';

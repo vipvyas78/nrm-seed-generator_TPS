@@ -183,7 +183,7 @@ export class TenderPrepDatabase {
     );
     const returnForms = await this.listReturnForms(actor);
     const attendances = await this.listAttendances(actor, String(pkg.id));
-    const scopeItems = await this.listScopeItems(actor, input.packageName);
+    const scopeItems = await this.listScopeItems({ name: input.packageName, wp_code: pkg.wp_code });
 
     const previewSession = await this.boq.findBoqForTakeoff(input.takeoffId);
     const previewSpecDocuments = previewSession
@@ -214,7 +214,7 @@ export class TenderPrepDatabase {
         unit: (l.unit as string | null) ?? null, requiredFor: (l.required_for as string | null) ?? null
       })),
       scopeItems: scopeItems.map((s) => ({
-        ref: (s.ref as number | null) ?? null, description: String(s.description),
+        section: String(s.section), description: String(s.description),
         procurementStage: (s.procurement_stage as string | null) ?? null
       })),
       specClauses: [],
@@ -350,7 +350,7 @@ export class TenderPrepDatabase {
     // what, and the terms of employment the tenderer is pricing against.
     const returnForms = await this.listReturnForms(actor);
     const attendances = await this.listAttendances(actor, String(pkg.id));
-    const scopeItems = await this.listScopeItems(actor, packageName);
+    const scopeItems = await this.listScopeItems({ name: packageName, wp_code: pkg.wp_code });
     const [minutes] = await this.db.query<Row>(
       `SELECT form_of_subcontract, subcontract_type, executed_as, works_summary, status
          FROM precontract_minutes WHERE workflow_id = $1 AND package_name = $2`,
@@ -405,11 +405,24 @@ export class TenderPrepDatabase {
       scope_items: withIgnored(scopeItems, 'scope_item'),
       scope_summary: {
         total: scopeItems.length,
-        package_specific: scopeItems.filter((s) => s.designation === 'Package').length,
-        general: scopeItems.filter((s) => s.designation === 'General').length,
-        // Priced into the subcontract vs carried by the main contractor's own budget.
+        // Derived, not stored: the library answers this directly. A clause carried by every
+        // trade is general; one naming trades is specific to them.
+        package_specific: scopeItems.filter((s) => !s.applies_to_all_trades).length,
+        general: scopeItems.filter((s) => s.applies_to_all_trades).length,
+        // Priced into the subcontract vs carried by the main contractor's own budget. Both
+        // read 0 until procurement_stage is set in Configuration → Tenders: the trade scope
+        // PDFs the library was seeded from state neither.
         contract: scopeItems.filter((s) => s.procurement_stage === 'Contract').length,
-        profit_plan: scopeItems.filter((s) => s.procurement_stage === 'Profit Plan').length
+        profit_plan: scopeItems.filter((s) => s.procurement_stage === 'Profit Plan').length,
+        // The subheadings this package's scope actually spans, in print order, so the
+        // reviewer sees the shape of the document before it is sent.
+        by_section: scopeItems.reduce<Array<{ section: string; total: number }>>((acc, item) => {
+          const section = String(item.section);
+          const last = acc[acc.length - 1];
+          if (last && last.section === section) last.total += 1;
+          else acc.push({ section, total: 1 });
+          return acc;
+        }, [])
       },
       attendances,
       attendance_summary: {
@@ -515,23 +528,75 @@ export class TenderPrepDatabase {
   }
 
   /**
-   * Scope items falling to one package.
+   * The scope of works falling to one package, in the order an ITT prints it.
    *
-   * Matched on the package name as the client's matrix writes it. Their vocabulary and the
-   * configured package list do not fully agree — the matrix has "Mechanical & Plumbing"
-   * where the configuration has "MEP" — so an unmatched package returns nothing rather than
-   * guessing, and the gap is reported by scopeMatrixCoverage below.
+   * Reads the ITT scope library — public.tender_scope_sections / _trades / _items,
+   * migration 077 — which is CONFIGURATION, owned by BuildFlow's Configuration → Tenders
+   * screen and reached here through this connection's `tps,public` search path, exactly
+   * as work_package_config already is. Nothing in TPS writes it.
+   *
+   * It replaces tps.scope_items as the ITT's scope source. That table held the client's
+   * Appendix 1 matrix: 890 rows keyed by package NAME, with no sections and no editing
+   * surface anywhere in the product. It is left in place (replaceScopeItems still writes
+   * it) but no longer feeds an ITT.
+   *
+   * A PACKAGE REACHES ITS SCOPE THROUGH A TRADE, and the trade is found two ways:
+   *
+   *   wp_code   a package derived from a released take-off carries one, and
+   *             tender_scope_trades.wp_code names the trade answering for it. A key, so
+   *             it is tried first.
+   *   label     the legacy hand-loaded packages carry no wp_code at all, so the package
+   *             name is matched against the trade's own label. A name is not a key and
+   *             routinely finds nothing, which is the whole reason the mapping exists.
+   *
+   * A PACKAGE THAT RESOLVES TO NO TRADE GETS NOTHING — not the general clauses, which is
+   * what dropping the guard below would silently produce. Issuing a partial scope of works
+   * reads as a complete one: a tenderer prices what they are sent and qualifies nothing,
+   * because nothing on the page says a section is missing. An empty scope section is
+   * visible; scopeTradeCoverage reports exactly which packages are in that state.
    */
-  async listScopeItems(actor: Actor, packageName: string): Promise<Row[]> {
+  async listScopeItems(pkg: { name: string; wp_code?: unknown }): Promise<Row[]> {
+    const wpCode = typeof pkg.wp_code === 'string' && pkg.wp_code ? pkg.wp_code : null;
     return this.db.query(
-      `SELECT id, ref, description, procurement_stage, designation
-         FROM scope_items
-        WHERE organization_id = $1 AND $2 = ANY (packages)
-        ORDER BY seq`,
-      [actor.organizationId, packageName]
+      `WITH by_wp AS (
+         SELECT trade_code FROM tender_scope_trades
+          WHERE is_active AND $1::TEXT IS NOT NULL AND wp_code = $1
+       ),
+       by_label AS (
+         SELECT trade_code FROM tender_scope_trades
+          WHERE is_active AND lower(btrim(label)) = lower(btrim($2))
+            AND NOT EXISTS (SELECT 1 FROM by_wp)
+       ),
+       trade AS (SELECT trade_code FROM by_wp UNION ALL SELECT trade_code FROM by_label)
+       SELECT i.id,
+              i.description,
+              i.procurement_stage,
+              i.applies_to_all_trades,
+              s.section_code,
+              s.label AS section,
+              s.sort_order AS section_sort
+         FROM tender_scope_items i
+         JOIN tender_scope_sections s ON s.section_code = i.section_code
+        WHERE i.is_active AND s.is_active
+          -- No trade, no scope. Without this an unmapped package would still collect every
+          -- applies_to_all_trades clause and look like a working ITT.
+          AND EXISTS (SELECT 1 FROM trade)
+          AND (i.applies_to_all_trades
+               OR EXISTS (SELECT 1 FROM trade t WHERE t.trade_code = ANY (i.trade_codes)))
+        ORDER BY s.sort_order, i.seq`,
+      [wpCode, pkg.name]
     );
   }
 
+  /**
+   * Replace the legacy Appendix 1 scope matrix.
+   *
+   * LEFT IN PLACE, BUT NO LONGER READ BY AN ITT. listScopeItems now reads the configurable
+   * scope library instead (see above). This still writes tps.scope_items so an existing
+   * import of the client's matrix is not destroyed, and so the rows remain available to
+   * carry procurement_stage across — the PDFs the library was seeded from state neither
+   * Contract nor Profit Plan.
+   */
   async replaceScopeItems(actor: Actor, items: Array<{
     ref: number; description: string; procurementStage?: string | null;
     designation?: string | null; packages: string[];
@@ -558,28 +623,47 @@ export class TenderPrepDatabase {
   }
 
   /**
-   * Which package names in the scope matrix correspond to a configured package.
+   * Which packages will actually receive a scope of works, and which will not.
    *
-   * A matrix name with no configured package means scope nobody will be asked to price; a
-   * configured package absent from the matrix means a tenderer receives no scope items.
-   * Both are worth seeing before an ITT goes out.
+   * The same question the old scope-matrix coverage answered, asked of the scope library:
+   * a package resolves to a trade or it does not, and one that does not issues an ITT with
+   * an empty scope section. Both halves are worth seeing BEFORE an ITT goes out, which is
+   * why this reports the two gaps separately rather than a single percentage:
+   *
+   *   unresolved_packages   a package nothing maps to a trade — a tenderer gets no scope
+   *   unclaimed_trades      a trade no package reaches — scope nobody will be asked to price
+   *
+   * `unmapped_trades` is the actionable one on a fresh install: 43 of the 59 seeded trades
+   * carry no wp_code, because only 16 correspond to a work package by name and the rest
+   * were left blank rather than guessed. They are filled in from Configuration → Tenders.
    */
-  async scopeMatrixCoverage(actor: Actor): Promise<Row> {
-    const rows = await this.db.query<{ pkg: string }>(
-      `SELECT DISTINCT unnest(packages) AS pkg FROM scope_items WHERE organization_id = $1`,
+  async scopeTradeCoverage(actor: Actor): Promise<Row> {
+    const trades = await this.db.query<{ trade_code: string; label: string; wp_code: string | null }>(
+      `SELECT trade_code, label, wp_code FROM tender_scope_trades WHERE is_active ORDER BY sort_order`
+    );
+    const packages = await this.db.query<{ name: string; wp_code: string | null }>(
+      `SELECT name, wp_code FROM package_config
+        WHERE organization_id = $1 AND is_active ORDER BY seq`,
       [actor.organizationId]
     );
-    const configured = await this.db.query<{ name: string }>(
-      `SELECT name FROM package_config WHERE organization_id = $1`, [actor.organizationId]
-    );
-    const matrixNames = new Set(rows.map((r) => String(r.pkg)));
-    const configuredNames = new Set(configured.map((c) => String(c.name)));
+
+    const byWpCode = new Map(trades.filter((t) => t.wp_code).map((t) => [t.wp_code as string, t]));
+    const byLabel = new Map(trades.map((t) => [t.label.trim().toLowerCase(), t]));
+    // The same two rungs listScopeItems resolves on, in the same order, so this report
+    // cannot claim coverage the ITT does not actually have.
+    const tradeFor = (pkg: { name: string; wp_code: string | null }) =>
+      (pkg.wp_code ? byWpCode.get(pkg.wp_code) : undefined) ?? byLabel.get(pkg.name.trim().toLowerCase());
+
+    const resolved = packages.map((pkg) => ({ pkg, trade: tradeFor(pkg) }));
+    const claimed = new Set(resolved.map((r) => r.trade?.trade_code).filter(Boolean));
+
     return {
-      matrix_packages: matrixNames.size,
-      configured_packages: configuredNames.size,
-      matched: [...matrixNames].filter((n) => configuredNames.has(n)).sort(),
-      in_matrix_only: [...matrixNames].filter((n) => !configuredNames.has(n)).sort(),
-      configured_only: [...configuredNames].filter((n) => !matrixNames.has(n)).sort()
+      packages: packages.length,
+      trades: trades.length,
+      unmapped_trades: trades.filter((t) => !t.wp_code).map((t) => t.label).sort(),
+      resolved_packages: resolved.filter((r) => r.trade).map((r) => r.pkg.name).sort(),
+      unresolved_packages: resolved.filter((r) => !r.trade).map((r) => r.pkg.name).sort(),
+      unclaimed_trades: trades.filter((t) => !claimed.has(t.trade_code)).map((t) => t.label).sort()
     };
   }
 
@@ -1410,7 +1494,7 @@ export class TenderPrepDatabase {
         unit: (l.unit as string | null) ?? null, requiredFor: (l.required_for as string | null) ?? null
       })),
       scopeItems: scopeItems.map((s) => ({
-        ref: (s.ref as number | null) ?? null, description: String(s.description),
+        section: String(s.section), description: String(s.description),
         procurementStage: (s.procurement_stage as string | null) ?? null
       })),
       specClauses: specClauses.map((c) => ({

@@ -35,7 +35,8 @@ export interface IttEmailBillLine {
 }
 
 export interface IttEmailScopeItem {
-  ref: number | null;
+  /** The subheading this clause prints under, e.g. "Health, Safety & Environmental". */
+  section: string;
   description: string;
   procurementStage: string | null;
 }
@@ -104,9 +105,40 @@ export function renderIttEmail(
   const requiredForms = pack.returnForms.filter((f) => f.isRequired);
   const optionalForms = pack.returnForms.filter((f) => !f.isRequired);
 
-  const scopeLines = pack.scopeItems.map((s) =>
-    `${s.ref !== null ? `[${s.ref}] ` : ''}${s.description}${s.procurementStage ? ` (${stageLabel(s.procurementStage)})` : ''}`
-  );
+  // The scope of works prints exactly as the client's own trade scope sheets do: grouped
+  // under subheadings, in the order the library gives them, numbered straight through.
+  //
+  // The caller supplies the items ALREADY ORDERED by section — this only has to detect
+  // where one section ends and the next begins. Re-sorting here would need this file to
+  // hold a second opinion about section order, and the two would drift the first time a
+  // client reordered their sections in the config editor.
+  //
+  // The number is assigned HERE, per package, not carried from the library. A clause's
+  // number is a position in one document: the same clause is item 29 in one trade's scope
+  // and item 43 in another's, and a bill referring to "item 29" has to mean the 29th line
+  // of the scope the tenderer was actually sent.
+  let scopeNumber = 0;
+  const scopeSections: Array<{ section: string; lines: Array<{ number: number; text: string }> }> = [];
+  for (const item of pack.scopeItems) {
+    scopeNumber += 1;
+    const text = `${item.description}${item.procurementStage ? ` (${stageLabel(item.procurementStage)})` : ''}`;
+    const current = scopeSections[scopeSections.length - 1];
+    if (current && current.section === item.section) current.lines.push({ number: scopeNumber, text });
+    else scopeSections.push({ section: item.section, lines: [{ number: scopeNumber, text }] });
+  }
+
+  const scopeText = scopeSections
+    .map((group) => `${group.section}\n${group.lines.map((l) => `  ${String(l.number).padStart(3)}  ${l.text}`).join('\n')}`)
+    .join('\n\n');
+
+  const scopeHtml = scopeSections.map((group) => `
+  <h3 style="font-size: 13px; margin: 14px 0 4px;">${esc(group.section)}</h3>
+  <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+    <tbody>${group.lines.map((l) => `<tr>
+      <td style="width: 34px; vertical-align: top; padding: 2px 6px 2px 0; color: #888;">${l.number}</td>
+      <td style="vertical-align: top; padding: 2px 0;">${esc(l.text)}</td>
+    </tr>`).join('')}</tbody>
+  </table>`).join('');
 
   const boqHeaders = ['GE Code', 'Element', 'Description', 'Qty', 'Unit'];
   const boqRows = pack.boqLines.map((l) => [l.geCode ?? '—', l.elementCode ?? '—', l.description, qty(l.quantity), l.unit ?? '—']);
@@ -128,12 +160,12 @@ Route:    ${pack.routeOfProcurement ?? 'Not stated'}
 
 ${greeting}
 
-You are invited to tender for the above package. Please find below the scope of works
-summary, the bill of quantities coverage, the documents this invitation carries and what a
+You are invited to tender for the above package. Please find below the scope of works,
+the bill of quantities coverage, the documents this invitation carries and what a
 compliant return must contain.
 
-SCOPE OF WORKS (SUMMARY)
-${scopeLines.length > 0 ? scopeLines.map((s) => ` - ${s}`).join('\n') : ' - See attached scope of works matrix.'}
+SCOPE OF WORKS
+${scopeSections.length > 0 ? scopeText : ' - See attached scope of works matrix.'}
 
 BILL OF QUANTITIES
 ${pack.boqSummary.total} measured lines attributed to this package (${pack.boqSummary.priceable} carrying a quantity), plus ${pack.boqSummary.authored} authored line${pack.boqSummary.authored === 1 ? '' : 's'}. Rates are not shown — please price independently.
@@ -173,14 +205,12 @@ Please raise all technical and commercial queries in writing before the return d
 
   <p>${esc(greeting)}</p>
 
-  <p>You are invited to tender for the above package. Please find below the scope of works
-  summary, the bill of quantities coverage, the documents this invitation carries and what a
+  <p>You are invited to tender for the above package. Please find below the scope of works,
+  the bill of quantities coverage, the documents this invitation carries and what a
   compliant return must contain.</p>
 
-  <h2 style="font-size: 15px;">Scope of works (summary)</h2>
-  ${scopeLines.length > 0
-    ? `<ul>${scopeLines.map((s) => `<li>${esc(s)}</li>`).join('')}</ul>`
-    : '<p>See attached scope of works matrix.</p>'}
+  <h2 style="font-size: 15px;">Scope of works</h2>
+  ${scopeSections.length > 0 ? scopeHtml : '<p>See attached scope of works matrix.</p>'}
 
   <h2 style="font-size: 15px;">Bill of quantities</h2>
   <p>${pack.boqSummary.total} measured lines attributed to this package (${pack.boqSummary.priceable} carrying a quantity), plus

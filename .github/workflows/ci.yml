@@ -1,0 +1,64 @@
+# CI — typecheck and unit tests for both Node packages.
+#
+# No secrets and no database. All four *.integration.test.ts files guard on DATABASE_URL
+# and self-skip when it is absent, so what runs here is the five unit suites (ittEmail,
+# emailService, documentLinkProvider, buildflowDocumentLinksClient, buildflowSpecClauseClient)
+# — a real gate that needs no infrastructure. There is no Python job: api/ has no tests and
+# the repo carries no ruff or mypy configuration.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bff:
+    name: BFF typecheck + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `version:` — action-setup reads packageManager (pnpm@10.18.0) from
+      # package.json, so the pinned version cannot drift away from the lockfile.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm --filter @tps/bff typecheck
+
+      - name: Unit tests
+        run: pnpm --filter @tps/bff test -- --reporter=verbose
+
+  web:
+    name: Web typecheck + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm --filter @tps/web typecheck
+
+      - name: Unit tests
+        run: pnpm --filter @tps/web test -- --reporter=verbose

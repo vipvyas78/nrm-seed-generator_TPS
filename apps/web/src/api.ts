@@ -146,14 +146,20 @@ export type IttPack = {
   };
   /** Section 1 — what a compliant tender return must contain. */
   return_forms: Array<{ id: string; seq: number; name: string; description: string | null; is_required: boolean; ignored: boolean }>;
-  /** Section 2 — what the subcontractor carries around the measured bill. */
+  /**
+   * Section 2 — what the subcontractor carries around the measured bill.
+   *
+   * Ordered by section, as the email prints it. `applies_to_all_trades` is the library's
+   * own answer to general-vs-package-specific, so nothing stores a designation any more.
+   */
   scope_items: Array<{
-    id: string; ref: number; description: string;
-    procurement_stage: string | null; designation: string | null; ignored: boolean;
+    id: string; section: string; section_code: string; description: string;
+    procurement_stage: string | null; applies_to_all_trades: boolean; ignored: boolean;
   }>;
   scope_summary: {
     total: number; package_specific: number; general: number;
     contract: number; profit_plan: number;
+    by_section: Array<{ section: string; total: number }>;
   };
   /** Section 3 — who provides what. SC subcontractor, H main contractor, J joint, N/A. */
   attendances: Array<{ seq: number; group_name: string; description: string; owner: string; notes: string | null }>;

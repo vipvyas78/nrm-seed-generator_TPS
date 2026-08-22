@@ -111,6 +111,12 @@ code { font-family: monospace; font-size: 0.85em; background: #f3f4f6; padding: 
 .itt-pack h4 { font-size: 0.85rem; margin: 16px 0 6px; padding-bottom: 4px; border-bottom: 1px solid #e5e7eb; }
 .itt-pack h4:first-of-type { margin-top: 8px; }
 .itt-boq .scope-only td { background: #fffbeb; }
+/* The scope of works is a sectioned document, not a flat list — the subheading
+   rows are what make the preview read as the thing the tenderer receives. */
+.itt-boq .scope-section th {
+  background: #1f3864; color: #fff; text-align: left; font-size: 0.72rem;
+  padding: 4px 6px; font-weight: 600;
+}
 .doc-group { margin-bottom: 4px; }
 .doc-group summary { cursor: pointer; font-size: 0.8rem; padding: 3px 0; }
 .doc-list { margin: 4px 0 8px 20px; font-size: 0.72rem; color: #4b5563; }

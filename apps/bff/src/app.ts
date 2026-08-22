@@ -210,7 +210,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     });
 
     protectedApi.get('/api/tender-prep/config/scope-coverage', async (request) =>
-      tpDb.scopeMatrixCoverage(requireActor(request)));
+      tpDb.scopeTradeCoverage(requireActor(request)));
 
     protectedApi.put('/api/tender-prep/config/scope-items', async (request) => {
       const { items } = body(request, z.object({

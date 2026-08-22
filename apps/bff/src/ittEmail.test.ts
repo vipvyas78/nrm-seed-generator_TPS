@@ -19,9 +19,12 @@ const pack: IttEmailPack = {
   billLines: [
     { ref: 'B1', section: 'Preliminaries', description: 'Site survey', quantity: 1, unit: 'item', requiredFor: 'Steel frame erection' }
   ],
+  // Ordered by section, as listScopeItems returns them. Two clauses share the first
+  // section and one opens a second, so the grouping has something to get wrong.
   scopeItems: [
-    { ref: 1, description: 'Steel frame erection', procurementStage: 'Contract' },
-    { ref: 2, description: 'Fire protection to steelwork', procurementStage: 'Profit Plan' }
+    { section: 'General & Contractual', description: 'Steel frame erection', procurementStage: 'Contract' },
+    { section: 'General & Contractual', description: 'Fire protection to steelwork', procurementStage: 'Profit Plan' },
+    { section: 'Health, Safety & Environmental', description: 'Operate permit to work system', procurementStage: null }
   ],
   specClauses: [
     { chunkId: 'c1', geCode: '5.10', elementCode: '5.10.10', subElementCode: null, subsectionTitle: 'Structural steelwork', rawText: 'All steelwork to be hot-dip galvanised.', nbsCode: 'NBS-123' }
@@ -99,6 +102,43 @@ describe('renderIttEmail', () => {
     const noClausesPack: IttEmailPack = { ...pack, specClauses: [] };
     const { html } = renderIttEmail(noClausesPack, { name: 'Jo Bloggs', email: 'jo@example.com' }, []);
     expect(html).not.toContain('Specification clauses');
+  });
+
+  it('groups the scope of works under its subheadings, in the order given', () => {
+    const { html, text } = renderIttEmail(pack, { name: 'Jo Bloggs', email: 'jo@example.com' }, []);
+    expect(text).toContain('General & Contractual');
+    expect(text).toContain('Health, Safety & Environmental');
+    expect(html).toContain('General &amp; Contractual');
+    // The second section's heading falls BETWEEN the two groups, not before both: that is
+    // the difference between a grouped list and a flat one with headings bolted on top.
+    const heading = html.indexOf('Health, Safety &amp; Environmental');
+    expect(heading).toBeGreaterThan(html.indexOf('Fire protection to steelwork'));
+    expect(heading).toBeLessThan(html.indexOf('Operate permit to work system'));
+  });
+
+  it('numbers the scope straight through the sections, from one, per package', () => {
+    const { text } = renderIttEmail(pack, { name: 'Jo Bloggs', email: 'jo@example.com' }, []);
+    expect(text).toMatch(/1 {2}Steel frame erection/);
+    expect(text).toMatch(/3 {2}Operate permit to work system/);
+  });
+
+  it('emits one heading per section even when a section repeats later in the list', () => {
+    // The caller orders by section; if it ever did not, a naive grouper would silently
+    // interleave. Two headings for one section is the visible symptom, so assert on it.
+    const interleaved: IttEmailPack = { ...pack, scopeItems: [
+      { section: 'A', description: 'first', procurementStage: null },
+      { section: 'B', description: 'second', procurementStage: null },
+      { section: 'A', description: 'third', procurementStage: null }
+    ] };
+    const { html } = renderIttEmail(interleaved, { name: null, email: 'jo@example.com' }, []);
+    expect(html.match(/<h3[^>]*>A<\/h3>/g)).toHaveLength(2);
+  });
+
+  it('falls back to the attached matrix when a package resolves to no scope at all', () => {
+    const noScope: IttEmailPack = { ...pack, scopeItems: [] };
+    const { html, text } = renderIttEmail(noScope, { name: null, email: 'jo@example.com' }, []);
+    expect(html).toContain('See attached scope of works matrix.');
+    expect(text).toContain('See attached scope of works matrix.');
   });
 
   it('never includes a rate or cost figure anywhere in the email', () => {

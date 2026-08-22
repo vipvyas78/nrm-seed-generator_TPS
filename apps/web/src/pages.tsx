@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { FormEvent, useState } from 'react';
+import { Fragment, FormEvent, useState } from 'react';
 import { Outlet, useNavigate, useParams } from 'react-router-dom';
 import { api, type ConfirmIttResult, type IttDispatch, type IttLineSection, type IttPack, type LaunchTableRow, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
 import { oidc, signIn } from './auth';
@@ -596,29 +596,43 @@ function IttPackView({ pack, workflowId, packageName }: { pack: IttPack; workflo
       </div>
     </>}
 
-    <h4>2c. Scope of works matrix</h4>
+    <h4>2c. Scope of works</h4>
     <p className="muted tiny">
-      What the subcontractor carries around the measured bill — {pack.scope_summary.total} items:
+      What the subcontractor carries around the measured bill — {pack.scope_summary.total} items
+      across {pack.scope_summary.by_section.length} sections:
       {' '}{pack.scope_summary.package_specific} specific to this package, {pack.scope_summary.general} general.
       {' '}<strong>{pack.scope_summary.contract}</strong> are Contract items to be priced;
       {' '}<strong>{pack.scope_summary.profit_plan}</strong> are Profit Plan and must <em>not</em> be priced by the tenderer.
     </p>
     {pack.scope_items.length === 0
-      ? <p className="muted tiny">No scope items for this package.</p>
+      ? <p className="muted tiny">
+          No scope of works for this package. Every clause is assigned to a trade, and a
+          package reaches its trade through its work package — so this reads empty until
+          that trade carries this package&rsquo;s code in Configuration &rarr; Tenders.
+          It is deliberately empty rather than partial: a tenderer prices what they are
+          sent, and a half-issued scope reads exactly like a complete one.
+        </p>
       : <details className="doc-group">
           <summary><strong>Show {pack.scope_items.length} scope items</strong></summary>
           <div className="table-scroll">
             <table className="data-table itt-boq">
-              <thead><tr><th>Ref</th><th>Item</th><th>Designation</th><th>Cost basis</th><th>Ignore for ITT</th></tr></thead>
-              <tbody>{pack.scope_items.map((s) => <tr key={s.id} className={s.procurement_stage === 'Profit Plan' ? 'scope-only' : ''}>
-                <td className="tiny">{s.ref}</td>
-                <td className="tiny">{s.description}</td>
-                <td className="tiny">{s.designation ?? '—'}</td>
-                <td className="tiny">{s.procurement_stage
-                  ? <span className={`badge badge-${s.procurement_stage === 'Contract' ? 'blue' : 'amber'}`}>{s.procurement_stage}</span>
-                  : '—'}</td>
-                <td><IgnoreToggle workflowId={workflowId} packageName={packageName} section="scope_item" itemId={s.id} ignored={s.ignored} label="" /></td>
-              </tr>)}</tbody>
+              <thead><tr><th>No.</th><th>Item</th><th>Applies to</th><th>Cost basis</th><th>Ignore for ITT</th></tr></thead>
+              {/* Grouped and numbered exactly as renderIttEmail does, so the reviewer is
+                  reading the document the tenderer will receive rather than a different
+                  view of the same rows. */}
+              <tbody>{pack.scope_items.map((s, index) => <Fragment key={s.id}>
+                {(index === 0 || pack.scope_items[index - 1].section !== s.section) &&
+                  <tr className="scope-section"><th colSpan={5}>{s.section}</th></tr>}
+                <tr className={s.procurement_stage === 'Profit Plan' ? 'scope-only' : ''}>
+                  <td className="tiny num">{index + 1}</td>
+                  <td className="tiny">{s.description}</td>
+                  <td className="tiny">{s.applies_to_all_trades ? 'All trades' : 'This trade'}</td>
+                  <td className="tiny">{s.procurement_stage
+                    ? <span className={`badge badge-${s.procurement_stage === 'Contract' ? 'blue' : 'amber'}`}>{s.procurement_stage}</span>
+                    : '—'}</td>
+                  <td><IgnoreToggle workflowId={workflowId} packageName={packageName} section="scope_item" itemId={s.id} ignored={s.ignored} label="" /></td>
+                </tr>
+              </Fragment>)}</tbody>
             </table>
           </div>
         </details>}
