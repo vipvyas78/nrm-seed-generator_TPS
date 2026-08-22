@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { renderIttEmail, type IttEmailPack } from './ittEmail.js';
+import { COMPOSE_BODY_MAX_CHARS, renderIttComposeText, renderIttEmail, type IttEmailPack } from './ittEmail.js';
 
 const pack: IttEmailPack = {
   packageName: 'Secondary Structural Steel',
@@ -177,5 +177,74 @@ describe('renderIttEmail', () => {
     const { html, text } = renderIttEmail([pack, secondPack], jo, opts);
     expect(html.toLowerCase()).not.toMatch(/unit_rate|total_cost|£\d/);
     expect(text.toLowerCase()).not.toMatch(/unit_rate|total_cost|£\d/);
+  });
+});
+
+describe('renderIttComposeText', () => {
+  const bundled: IttEmailPack = {
+    ...pack,
+    bundle: { url: 'https://buildflow.example/bundles/steel', documentCount: 14, allSheetsFallback: false }
+  };
+  const withComplete = { projectName: 'Riverside House', completeBundleUrl: 'https://buildflow.example/bundles/all' };
+
+  it('names the project, package, ref and route', () => {
+    const body = renderIttComposeText(bundled, withComplete);
+    expect(body).toContain('Riverside House');
+    expect(body).toContain('Secondary Structural Steel (ref 12)');
+    expect(body).toContain('Subcontract — Design & Build');
+  });
+
+  it('carries both document links, and carries them early', () => {
+    const body = renderIttComposeText(bundled, withComplete);
+    expect(body).toContain('https://buildflow.example/bundles/steel');
+    expect(body).toContain('https://buildflow.example/bundles/all');
+    // Ahead of anything the cap would ever trim, so truncation can never cost a tenderer the
+    // only route to the documents.
+    expect(body.indexOf('bundles/all')).toBeLessThan(600);
+  });
+
+  it('states the figures without claiming a pricing schedule is attached', () => {
+    // A compose link cannot carry files. Saying otherwise sends the tenderer looking for an
+    // attachment that is not there.
+    const body = renderIttComposeText(bundled, withComplete);
+    expect(body).toContain('42 measured lines attributed to this package (38 carrying a quantity)');
+    expect(body).toContain('Rates are not shown');
+    expect(body).not.toContain('attached');
+  });
+
+  it('summarises rather than reproducing the bill and scope tables', () => {
+    const body = renderIttComposeText(bundled, withComplete);
+    expect(body).toContain('Scope of works: 2 clauses');
+    expect(body).not.toContain('Structural steel frame');
+    expect(body).not.toContain('GE Code');
+  });
+
+  it('says the documents follow when the package has no bundle', () => {
+    // The flat per-document list is every document in the project and would exhaust the whole
+    // budget on its own — so it is not printed, and the message says so plainly.
+    const body = renderIttComposeText(pack, withComplete);
+    expect(body).toContain('to follow separately');
+    expect(body).not.toContain('bundles/steel');
+  });
+
+  it('stays inside what a compose URL can carry, however many forms a package has', () => {
+    const many: IttEmailPack = {
+      ...bundled,
+      returnForms: Array.from({ length: 60 }, (_, i) => ({
+        name: `Return form ${i + 1} — a deliberately long name to blow the budget`,
+        description: null,
+        isRequired: true
+      }))
+    };
+    const body = renderIttComposeText(many, withComplete);
+    expect(body.length).toBeLessThanOrEqual(COMPOSE_BODY_MAX_CHARS);
+    expect(body).toContain('60 required forms');
+    // The links survive the trim; the forms list is what gives way.
+    expect(body).toContain('https://buildflow.example/bundles/steel');
+    expect(body).toContain('https://buildflow.example/bundles/all');
+  });
+
+  it('never includes a rate or cost figure', () => {
+    expect(renderIttComposeText(bundled, withComplete).toLowerCase()).not.toMatch(/unit_rate|total_cost|£\d/);
   });
 });

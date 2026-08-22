@@ -6,8 +6,9 @@ import type { Database, Row } from './db.js';
 import type { DocumentLinkProvider } from './documentLinkProvider.js';
 import type { EmailAttachment, EmailService } from './emailService.js';
 import { conflict, notFound } from './errors.js';
+import { buildEml } from './emlMessage.js';
 import { ittAttachmentsFor, type IttAttachment } from './ittAttachments.js';
-import { renderIttEmail, type IttEmailDocumentLink, type IttEmailPack } from './ittEmail.js';
+import { renderIttComposeText, renderIttEmail, type IttEmailDocumentLink, type IttEmailPack } from './ittEmail.js';
 import type { ScmsReadDatabase } from './scmsReadDb.js';
 import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js';
 import type { Actor } from './types.js';
@@ -124,6 +125,25 @@ function attributionFor(pkg: Row): Attribution {
     // its attribution has not been set. That is the honest answer, and a QS can see it.
     trade_terms: []
   };
+}
+
+/**
+ * Everything about a draft ITT except the draft itself.
+ *
+ * Separated from the `.eml` bytes so the route serving JSON cannot accidentally serialise a
+ * multi-megabyte message file into it. See `draftIttEmail`.
+ */
+export interface IttDraftMetadata {
+  packageName: string;
+  subject: string;
+  /** The short covering note the Gmail / Outlook Web compose links carry. */
+  composeBody: string;
+  bundleUrl: string | null;
+  completeBundleUrl: string | null;
+  /** What the .eml carries. Empty for a web-mail compose link, which cannot carry files. */
+  attachments: Array<{ filename: string; contentType: string; bytes: number }>;
+  /** The files were dropped for exceeding what a send would carry — see MAX_ATTACHMENT_BYTES. */
+  attachmentsOmittedOversize: boolean;
 }
 
 export class TenderPrepDatabase {
@@ -1601,6 +1621,67 @@ export class TenderPrepDatabase {
     }
     const totalBytes = built.reduce((sum, a) => sum + a.content.length, 0);
     return totalBytes > MAX_ATTACHMENT_BYTES ? [] : built;
+  }
+
+  /**
+   * One package's ITT as a draft the user sends themselves, rather than one this service sends.
+   *
+   * Step 2 otherwise offers only "read it on screen" or "it has gone". This is the step in
+   * between: the same email Confirm ITT would send, handed over as a file a mail app opens in
+   * compose mode, so a covering sentence can be added, a colleague copied in, or the message
+   * sent from the sender's own mailbox.
+   *
+   * SAME CONTENT AS A REAL SEND. It goes through bundlesForWorkflow → assemblePackageForEmail →
+   * renderIttEmail → ittAttachmentsFor, exactly as confirmAndSendItt does. A draft that
+   * described the package differently from the send would be worse than no draft, and
+   * assemblePackageForEmail exists precisely so the paths cannot drift.
+   *
+   * ADDRESSED TO NOBODY. The sender types the address. That is deliberate: an ITT goes to
+   * every firm shortlisted for the package and each must be sent separately, so a draft
+   * pre-filled with the whole list would put competitors on one message.
+   *
+   * No confirmation is required — reviewing a draft BEFORE confirming the package is most of
+   * the point — and nothing is written to itt_dispatch, because nothing has been sent. Only
+   * the user's own mail app knows whether it ever was.
+   */
+  async draftIttEmail(actor: Actor, workflowId: string, packageName: string): Promise<{
+    metadata: IttDraftMetadata; eml: Buffer;
+  }> {
+    await this.assertWorkflowAccess(actor, workflowId);
+
+    const bundles = await this.bundlesForWorkflow(workflowId);
+    const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
+    const { emailPack, projectName } = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles);
+
+    // No recipient name, so the body greets "Dear Sir/Madam,". The email address is never
+    // printed in the body — only the name reaches the greeting — so an empty one leaves no
+    // trace in what the tenderer reads.
+    const rendered = renderIttEmail([emailPack], { name: null, email: '' }, { projectName, completeBundleUrl });
+
+    // The same budget a real send applies, measured the same way (on the encoded length, which
+    // is what would travel) — so a package that would send without its attachments drafts
+    // without them too, rather than producing a draft that could not be sent.
+    const files = await ittAttachmentsFor(emailPack, projectName);
+    const encodedBytes = files.reduce((sum, f) => sum + Math.ceil(f.content.length / 3) * 4, 0);
+    const attachmentsOmittedOversize = encodedBytes > MAX_ATTACHMENT_BYTES;
+    const attachments = attachmentsOmittedOversize ? [] : files;
+
+    return {
+      metadata: {
+        packageName: emailPack.packageName,
+        subject: rendered.subject,
+        composeBody: renderIttComposeText(emailPack, { projectName, completeBundleUrl }),
+        bundleUrl: emailPack.bundle?.url ?? null,
+        completeBundleUrl,
+        attachments: attachments.map((f) => ({
+          filename: f.filename, contentType: f.contentType, bytes: f.content.length
+        })),
+        attachmentsOmittedOversize
+      },
+      eml: buildEml({
+        subject: rendered.subject, html: rendered.html, text: rendered.text, attachments
+      })
+    };
   }
 
   /**

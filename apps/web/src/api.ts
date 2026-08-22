@@ -254,6 +254,26 @@ export type SendAllIttsResult = {
   }>;
 };
 
+/**
+ * A draft of one package's ITT, for the user to send from their own mail app.
+ *
+ * `composeBody` is a short covering note, NOT the email body: a Gmail or Outlook Web compose
+ * link carries its body inside a URL and cannot carry files at all. The downloaded .eml is the
+ * only complete message — HTML body, scope PDF and pricing schedule.
+ *
+ * Addressed to nobody by design. The sender types the address, so a draft can never put the
+ * firms competing for one package on a single message.
+ */
+export type IttDraft = {
+  packageName: string;
+  subject: string;
+  composeBody: string;
+  bundleUrl: string | null;
+  completeBundleUrl: string | null;
+  attachments: Array<{ filename: string; contentType: string; bytes: number }>;
+  attachmentsOmittedOversize: boolean;
+};
+
 export type IttDispatch = {
   id: string;
   shortlist_entry_id: string;
@@ -290,7 +310,11 @@ export type TenderSubmission = {
 
 const baseUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:3200';
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+/**
+ * One authenticated call. Shared by the JSON and the file callers below, so a new endpoint
+ * cannot quietly go out unauthenticated or miss the dev-header fallback.
+ */
+async function send(path: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   if (init.body !== undefined && init.body !== null) headers.set('content-type', 'application/json');
   const token = await accessToken();
@@ -305,8 +329,18 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const detail = await response.json().catch(() => ({})) as { message?: string };
     throw new Error(detail.message ?? `Request failed (${response.status})`);
   }
+  return response;
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const response = await send(path, init);
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
+}
+
+/** For the endpoints that return a file rather than JSON — currently the ITT draft .eml. */
+async function requestBlob(path: string): Promise<Blob> {
+  return (await send(path)).blob();
 }
 
 export const api = {
@@ -366,6 +400,11 @@ export const api = {
     request<ConfirmIttResult>(`/api/tender-prep/${workflowId}/itts/${encodeURIComponent(packageName)}/confirm`, { method: 'POST' }),
   sendAllItts: (workflowId: string) =>
     request<SendAllIttsResult>(`/api/tender-prep/${workflowId}/itts/send-all`, { method: 'POST' }),
+  getIttDraft: (workflowId: string, packageName: string) =>
+    request<IttDraft>(`/api/tender-prep/${workflowId}/itts/${encodeURIComponent(packageName)}/draft`),
+  /** The full draft as a mail-app file. Opens as an editable unsent message in Outlook. */
+  getIttDraftEml: (workflowId: string, packageName: string) =>
+    requestBlob(`/api/tender-prep/${workflowId}/itts/${encodeURIComponent(packageName)}/draft.eml`),
   recordIttResponse: (dispatchId: string, response: IttDispatch['response']) =>
     request<IttDispatch>(`/api/tender-prep/itt/${dispatchId}`, { method: 'PATCH', body: JSON.stringify({ response }) }),
 

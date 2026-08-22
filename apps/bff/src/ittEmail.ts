@@ -174,8 +174,25 @@ export const billRowsFor = (pack: IttEmailPack): string[][] =>
 const specRowsFor = (pack: IttEmailPack): string[][] =>
   pack.specClauses.map((c) => [c.geCode ?? '—', [c.elementCode, c.subElementCode].filter(Boolean).join(' / ') || '—', c.rawText]);
 
+/**
+ * What the measured bill amounts to, and the no-rates statement.
+ *
+ * Split from `boqIntro` because the compose-link body (`renderIttComposeText`) says the same
+ * thing WITHOUT the attachment sentence: a Gmail or Outlook Web compose URL cannot carry
+ * files, and telling a tenderer a pricing schedule is attached when none is would send them
+ * hunting for something that is not there.
+ */
+const boqFigures = (pack: IttEmailPack): string =>
+  `${pack.boqSummary.total} measured lines attributed to this package (${pack.boqSummary.priceable} carrying a quantity), plus ${pack.boqSummary.authored} authored line${pack.boqSummary.authored === 1 ? '' : 's'}. Rates are not shown — please price independently.`;
+
 const boqIntro = (pack: IttEmailPack): string =>
-  `${pack.boqSummary.total} measured lines attributed to this package (${pack.boqSummary.priceable} carrying a quantity), plus ${pack.boqSummary.authored} authored line${pack.boqSummary.authored === 1 ? '' : 's'}. Rates are not shown — please price independently. A pricing schedule is attached for you to complete.`;
+  `${boqFigures(pack)} A pricing schedule is attached for you to complete.`;
+
+/** Stated identically in the text body, the HTML body and the compose-link body. */
+const VALUE_ENGINEERING_SENTENCE =
+  'Every tenderer must submit at least one Value Engineering proposal stating the saving, the '
+  + 'programme effect, any departure from the specification and the clause affected. A return '
+  + 'without one is not compliant.';
 
 const attendanceSentence = (pack: IttEmailPack): string =>
   `${pack.attendanceSummary.subcontractor} item${pack.attendanceSummary.subcontractor === 1 ? '' : 's'} carried by the subcontractor, ${pack.attendanceSummary.mainContractor} by the main contractor${pack.attendanceSummary.joint > 0 ? `, ${pack.attendanceSummary.joint} joint` : ''}.`;
@@ -226,7 +243,7 @@ ${optionalForms.length > 0 ? `\nOptional:\n${optionalForms.map((f) => ` - ${f.na
 
 SCHEDULE OF ATTENDANCES
 ${attendanceSentence(pack)}
-${pack.valueEngineeringRequired ? '\nVALUE ENGINEERING\nEvery tenderer must submit at least one Value Engineering proposal stating the saving, the programme effect, any departure from the specification and the clause affected. A return without one is not compliant.\n' : ''}`;
+${pack.valueEngineeringRequired ? `\nVALUE ENGINEERING\n${VALUE_ENGINEERING_SENTENCE}\n` : ''}`;
 };
 
 const packageHtmlBlock = (pack: IttEmailPack): string => {
@@ -292,11 +309,84 @@ const packageHtmlBlock = (pack: IttEmailPack): string => {
 
   ${pack.valueEngineeringRequired ? `
   <h3 style="font-size: 15px;">Value Engineering</h3>
-  <p><strong>Mandatory.</strong> Every tenderer must submit at least one Value Engineering proposal stating the
-  saving, the programme effect, any departure from the specification and the clause affected. A return without
-  one is not compliant.</p>` : ''}
+  <p><strong>Mandatory.</strong> ${esc(VALUE_ENGINEERING_SENTENCE)}</p>` : ''}
   </div>`;
 };
+
+/**
+ * The most a compose URL can carry.
+ *
+ * "Open draft Email" can hand the whole ITT to a desktop mail app as a .eml, but Gmail and
+ * Outlook Web are reached by a link, and a link carries its body as a query parameter. The
+ * full text body runs to tens of KB; Gmail truncates a URL long before that and the browser
+ * may refuse it outright. So the web-mail route gets its own short covering note, capped
+ * here, rather than a full body that would arrive mangled.
+ */
+export const COMPOSE_BODY_MAX_CHARS = 1800;
+
+/**
+ * A short covering note for one package, for the Gmail / Outlook Web compose links.
+ *
+ * NOT a shortened `text` body — a different document with a different job. It carries the two
+ * document links and the figures, and says outright that the detail lives in the documents,
+ * because that is all a compose link can honestly deliver: no attachments, no HTML.
+ *
+ * THE LINKS COME FIRST, immediately after the header. If the cap ever bites, it bites the
+ * forms list and then the tail — never the two URLs, which are the only things in here a
+ * tenderer cannot proceed without.
+ */
+export function renderIttComposeText(pack: IttEmailPack, options: IttEmailOptions): string {
+  const { projectName, completeBundleUrl } = options;
+  const requiredForms = pack.returnForms.filter((f) => f.isRequired);
+
+  const documents = pack.bundle
+    ? `Documents for this package (${pack.bundle.documentCount} document${pack.bundle.documentCount === 1 ? '' : 's'}):\n  ${pack.bundle.url}`
+    // The flat per-document list is every document in the project and would exhaust the whole
+    // budget on its own, so it is not printed here. Saying the documents follow separately is
+    // true; listing forty URLs and then truncating them would not be.
+    : 'Documents for this package: to follow separately.';
+
+  const complete = completeBundleUrl
+    ? `\n\nComplete tender document set:\n  ${completeBundleUrl}`
+    : '';
+
+  const scope = pack.scopeItems.length > 0
+    ? `Scope of works: ${pack.scopeItems.length} clause${pack.scopeItems.length === 1 ? '' : 's'}, issued in full with the documents above.`
+    : 'Scope of works: none is configured for this package.';
+
+  const head = `INVITATION TO TENDER
+
+Project: ${projectName}
+Package: ${pack.packageName} (ref ${pack.displayRef})
+Route:   ${pack.routeOfProcurement ?? 'Not stated'}
+
+Dear Sir/Madam,
+
+You are invited to tender for the package above.
+
+${documents}${complete}
+
+${scope}
+Bill of quantities: ${boqFigures(pack)}
+`;
+
+  const tail = `${pack.valueEngineeringRequired ? `\n${VALUE_ENGINEERING_SENTENCE}\n` : ''}
+Please raise all technical and commercial queries in writing before the return date.
+`;
+
+  const fullForms = requiredForms.length > 0
+    ? `\nA compliant return must contain:\n${requiredForms.map((f) => ` - ${f.name}`).join('\n')}\n`
+    : '';
+  const shortForms = requiredForms.length > 0
+    ? `\nA compliant return must contain ${requiredForms.length} required form${requiredForms.length === 1 ? '' : 's'}, listed in the documents above.\n`
+    : '';
+
+  const assemble = (forms: string) => `${head}${forms}${tail}`;
+  let body = assemble(fullForms);
+  if (body.length > COMPOSE_BODY_MAX_CHARS) body = assemble(shortForms);
+  if (body.length > COMPOSE_BODY_MAX_CHARS) body = `${body.slice(0, COMPOSE_BODY_MAX_CHARS - 1).trimEnd()}…`;
+  return body;
+}
 
 export function renderIttEmail(
   packages: IttEmailPack[],
