@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Fragment, FormEvent, useState } from 'react';
 import { Outlet, useNavigate, useParams } from 'react-router-dom';
-import { api, type ConfirmIttResult, type IttDispatch, type IttLineSection, type IttPack, type LaunchTableRow, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
+import { api, type ConfirmIttResult, type IttDispatch, type IttLineSection, type IttPack, type LaunchTableRow, type SendAllIttsResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
 import { oidc, signIn } from './auth';
 
 function ErrorMessage({ error }: { error: unknown }) {
@@ -721,9 +721,152 @@ function IttPackView({ pack, workflowId, packageName }: { pack: IttPack; workflo
   </div>;
 }
 
+/**
+ * "Open draft Email" — one package's ITT handed to the user to send themselves.
+ *
+ * A browser cannot put a message into a mail app's Drafts folder. The desktop option therefore
+ * downloads a `.eml`, which Outlook opens as an editable unsent message; Gmail and Outlook Web
+ * are reached by a compose link, which carries a plain-text body in a URL and CANNOT carry
+ * files. That difference is real and is stated in the options rather than glossed over — a
+ * tenderer who never receives the pricing schedule cannot price the job.
+ */
+type DraftApp = 'desktop' | 'gmail' | 'outlook-web';
+
+const DRAFT_APP_KEY = 'tps.ittDraftApp';
+
+const DRAFT_APPS: Array<{ id: DraftApp; label: string; note: string }> = [
+  {
+    id: 'desktop',
+    label: 'Outlook / desktop mail app',
+    note: 'Downloads the draft as a .eml file carrying the whole email — HTML body, scope of works PDF and pricing schedule. Open the file and your mail app shows an unsent message you can address, edit and send.'
+  },
+  {
+    id: 'gmail',
+    label: 'Gmail',
+    note: 'Opens a compose tab. A compose link cannot carry files, so the scope PDF and pricing schedule are NOT attached — the body carries the document pack links instead.'
+  },
+  {
+    id: 'outlook-web',
+    label: 'Outlook Web (Microsoft 365)',
+    note: 'Opens a compose tab. Same limitation as Gmail: links only, no attachments.'
+  }
+];
+
+function IttDraftPanel({ workflowId, packageName }: { workflowId: string; packageName: string }) {
+  // Preselects the last answer but still asks, as specified. localStorage throws outright in
+  // some privacy modes, so every access is guarded.
+  const [app, setApp] = useState<DraftApp>(() => {
+    try {
+      const saved = localStorage.getItem(DRAFT_APP_KEY);
+      return saved === 'gmail' || saved === 'outlook-web' ? saved : 'desktop';
+    } catch { return 'desktop'; }
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const [done, setDone] = useState<string | null>(null);
+
+  // Fetched when the panel OPENS, not when "Open draft" is clicked: window.open() called after
+  // an await has lost its user gesture and is blocked by Safari and Firefox. With the draft
+  // already in hand, the compose branch below is synchronous.
+  const draft = useQuery({
+    queryKey: ['itt-draft', workflowId, packageName],
+    queryFn: () => api.getIttDraft(workflowId, packageName)
+  });
+
+  const openDraft = () => {
+    const data = draft.data;
+    if (!data) return;
+    setError(null);
+    setDone(null);
+    try { localStorage.setItem(DRAFT_APP_KEY, app); } catch { /* private browsing — the choice just is not remembered */ }
+
+    if (app === 'desktop') {
+      setBusy(true);
+      api.getIttDraftEml(workflowId, packageName)
+        .then((blob) => {
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          // The server sends no Content-Disposition (it would need a CORS change to read back),
+          // so the filename is composed here. Same characters stripped as the attachments.
+          link.download = `ITT - ${packageName.replace(/[\\/:*?"<>|]+/g, ' ').trim()}.eml`;
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          // Revoked on the next tick: revoking synchronously cancels the download in Safari.
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+          setDone('Draft downloaded. Open the file and your mail app will show it as an unsent message.');
+        })
+        .catch((e: unknown) => setError(e))
+        .finally(() => setBusy(false));
+      return;
+    }
+
+    const subject = encodeURIComponent(data.subject);
+    const body = encodeURIComponent(data.composeBody);
+    window.open(
+      app === 'gmail'
+        ? `https://mail.google.com/mail/?view=cm&fs=1&to=&su=${subject}&body=${body}`
+        : `https://outlook.office.com/mail/deeplink/compose?subject=${subject}&body=${body}`,
+      '_blank',
+      'noopener'
+    );
+    setDone('Compose tab opened. Add the subcontractor’s address before sending.');
+  };
+
+  return <div className="alert alert-grey" style={{ marginBottom: 0 }}>
+    <strong>Open a draft of this ITT in your own mail app</strong>
+    <p className="tiny" style={{ margin: '4px 0 10px' }}>
+      The same email Confirm ITT would send, <strong>addressed to nobody</strong> — you add the
+      subcontractor yourself, so no firm ever sees a competitor on the message. Nothing is
+      recorded against this ITT until you send it from your own mail app.
+    </p>
+    {draft.isLoading ? <Busy>Building the draft…</Busy>
+      : draft.error ? <ErrorMessage error={draft.error} />
+      : draft.data ? <>
+        <div style={{ display: 'grid', gap: 8, marginBottom: 10 }}>
+          {DRAFT_APPS.map((choice) => <label key={choice.id} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', cursor: 'pointer' }}>
+            <input
+              type="radio"
+              name={`draft-app-${packageName}`}
+              checked={app === choice.id}
+              onChange={() => setApp(choice.id)}
+              style={{ marginTop: 3, width: 'auto' }}
+            />
+            <span>
+              <strong>{choice.label}</strong>
+              <span className="tiny muted" style={{ display: 'block' }}>{choice.note}</span>
+            </span>
+          </label>)}
+        </div>
+
+        <div className="tiny muted" style={{ marginBottom: 10 }}>
+          <div>Subject: {draft.data.subject}</div>
+          <div>
+            {draft.data.attachments.length > 0
+              ? `Carried by the .eml: ${draft.data.attachments.map((a) => `${a.filename} (${Math.max(1, Math.round(a.bytes / 1024))} KB)`).join(', ')}`
+              : draft.data.attachmentsOmittedOversize
+                ? 'No attachments — the generated files exceed what one email can carry, so a real send would drop them too.'
+                : 'No attachments were generated for this package.'}
+          </div>
+          {!draft.data.bundleUrl && <div>
+            No document pack has been built for this package yet, so the draft carries no
+            package-specific document link.
+          </div>}
+        </div>
+
+        <button className="small" disabled={busy} onClick={openDraft}>{busy ? 'Building…' : 'Open draft'}</button>
+        {done && <p className="tiny" style={{ marginTop: 8, marginBottom: 0 }}>{done}</p>}
+        <ErrorMessage error={error} />
+      </> : null}
+  </div>;
+}
+
 function Step2IttDispatch({ workflowId }: { workflowId: string }) {
   const [open, setOpen] = useState<string | null>(null);
+  const [draftOpen, setDraftOpen] = useState<string | null>(null);
   const [lastResult, setLastResult] = useState<ConfirmIttResult | null>(null);
+  const [sendAllResult, setSendAllResult] = useState<SendAllIttsResult | null>(null);
   const queryClient = useQueryClient();
   const itts = useQuery({ queryKey: ['itts', workflowId], queryFn: () => api.listItts(workflowId) });
   const pack = useQuery({
@@ -738,10 +881,19 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
       void queryClient.invalidateQueries({ queryKey: ['itts', workflowId] });
     }
   });
+  const sendAll = useMutation({
+    mutationFn: () => api.sendAllItts(workflowId),
+    onSuccess: (result) => {
+      setSendAllResult(result);
+      setLastResult(null);
+      void queryClient.invalidateQueries({ queryKey: ['itts', workflowId] });
+    }
+  });
 
   if (itts.isLoading) return <Busy />;
   if (itts.error) return <ErrorMessage error={itts.error} />;
   const rows = itts.data ?? [];
+  const confirmedPackages = rows.filter((r) => r.confirmed_at && Number(r.recipients) > 0).length;
 
   if (rows.length === 0) {
     return <div className="panel">
@@ -762,8 +914,42 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
     <p className="muted" style={{ marginBottom: 12 }}>
       Built from the live take-off, package configuration and document set. Review below —
       untick anything that should not go out under "Ignore for ITT" — then confirm to email
-      the selected subcontractors.
+      the selected subcontractors. Each email carries the scope of works as a PDF, a blank
+      pricing schedule, and a link to that firm's document pack.
     </p>
+
+    <div className="alert" style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+      <div style={{ flex: 1, minWidth: 260 }}>
+        <strong>Send one ITT per subcontractor</strong>
+        <div className="tiny muted">
+          {confirmedPackages === 0
+            ? 'No packages are confirmed yet — confirm them at the Tender Launch Pack step first.'
+            : `A firm invited to several of the ${confirmedPackages} confirmed package${confirmedPackages === 1 ? '' : 's'} receives a single email covering all of them, rather than one per package.`}
+        </div>
+      </div>
+      <button className="small" disabled={confirmedPackages === 0 || sendAll.isPending} onClick={() => sendAll.mutate()}>
+        {sendAll.isPending ? 'Sending…' : 'Send all ITTs'}
+      </button>
+    </div>
+
+    {sendAll.error && <ErrorMessage error={sendAll.error} />}
+
+    {sendAllResult && <div className={`alert ${sendAllResult.failed > 0 ? 'alert-red' : 'alert-green'}`} style={{ marginBottom: 12 }}>
+      <div>
+        Sent {sendAllResult.sent} email{sendAllResult.sent === 1 ? '' : 's'} to {sendAllResult.subcontractors} subcontractor
+        {sendAllResult.subcontractors === 1 ? '' : 's'} across {sendAllResult.packages} package
+        {sendAllResult.packages === 1 ? '' : 's'} — failed {sendAllResult.failed}, no email on file {sendAllResult.skipped_no_email}.
+      </div>
+      {sendAllResult.unassembled_packages.length > 0 && <div className="tiny" style={{ marginTop: 6 }}>
+        Not sent — could not be built: {sendAllResult.unassembled_packages.map((p) => p.packageName).join(', ')}.
+      </div>}
+      <ul className="tiny" style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+        {sendAllResult.recipients.map((r) => <li key={r.subcontractorId}>
+          {r.status === 'sent' ? '✓' : '✗'} {r.packages.join(', ')}
+          {r.status !== 'sent' && ` — ${r.error ?? r.status.replace(/_/g, ' ')}`}
+        </li>)}
+      </ul>
+    </div>}
     <div className="table-scroll">
       <table className="data-table">
         <thead><tr><th>#</th><th>Package</th><th>Route of Procurement</th><th>Recipients</th><th>Status</th><th></th><th></th></tr></thead>
@@ -780,9 +966,13 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
               {Number(r.sent) === 0 && Number(r.failed) === 0 && Number(r.skipped_no_email) === 0 &&
                 <span className="badge badge-grey">not sent</span>}
             </td>
-            <td>
+            <td style={{ whiteSpace: 'nowrap' }}>
               <button className="small secondary" onClick={() => setOpen(open === r.package_name ? null : r.package_name)}>
                 {open === r.package_name ? 'Close' : 'View ITT'}
+              </button>
+              {' '}
+              <button className="small secondary" onClick={() => setDraftOpen(draftOpen === r.package_name ? null : r.package_name)}>
+                {draftOpen === r.package_name ? 'Close draft' : 'Open draft Email'}
               </button>
             </td>
             <td>
@@ -802,6 +992,11 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
                 Sent {lastResult.sent}, failed {lastResult.failed}, no email on file {lastResult.skipped_no_email}.
                 {lastResult.failed > 0 && ' Check the recipients below and try again.'}
               </div>
+            </td>
+          </tr>}
+          {draftOpen === r.package_name && <tr key={`${r.package_name}-draft`}>
+            <td colSpan={7} className="itt-cell">
+              <IttDraftPanel workflowId={workflowId} packageName={r.package_name} />
             </td>
           </tr>}
           {open === r.package_name && <tr key={`${r.package_name}-pack`}>

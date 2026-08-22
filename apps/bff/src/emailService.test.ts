@@ -29,4 +29,33 @@ describe('EmailService', () => {
       text: 'Welcome!'
     });
   });
+
+  it('passes attachments through when there are any', async () => {
+    const service = new EmailService({ cloudflareApiToken: 'token', cloudflareAccountId: 'account-1' });
+    const client = (service as unknown as { client: { emailSending: { send: ReturnType<typeof vi.fn> } } }).client;
+    const attachments = [{
+      content: 'YmFzZTY0', filename: 'Bill of Quantities - Flooring.xlsx',
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      disposition: 'attachment' as const
+    }];
+
+    await service.send({
+      from: 'tenders@novamerx.ai', to: 'someone@example.com', subject: 'ITT',
+      html: '<p>ITT</p>', text: 'ITT', attachments
+    });
+
+    expect(client.emailSending.send).toHaveBeenCalledWith(expect.objectContaining({ attachments }));
+  });
+
+  it('omits the attachments field entirely when the list is empty', async () => {
+    const service = new EmailService({ cloudflareApiToken: 'token', cloudflareAccountId: 'account-1' });
+    const client = (service as unknown as { client: { emailSending: { send: ReturnType<typeof vi.fn> } } }).client;
+
+    await service.send({
+      from: 'tenders@novamerx.ai', to: 'someone@example.com', subject: 'ITT',
+      html: '<p>ITT</p>', text: 'ITT', attachments: []
+    });
+
+    expect(client.emailSending.send.mock.calls[0][0]).not.toHaveProperty('attachments');
+  });
 });

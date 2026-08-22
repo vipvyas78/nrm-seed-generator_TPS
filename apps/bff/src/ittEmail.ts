@@ -1,7 +1,13 @@
 /**
- * Renders the Invitation to Tender email body for one recipient of one package.
+ * Renders the Invitation to Tender email body for one recipient.
  *
- * Pure function: every fact it prints comes from the pack passed in. It does not re-derive
+ * ONE EMAIL, ONE RECIPIENT, ONE OR MORE PACKAGES. A subcontractor shortlisted against three
+ * packages gets a single invitation covering all three, not three separate emails — so this
+ * takes an array. Everything that varies by package (scope, bill, forms, attendances, the
+ * package's own document bundle) renders once per package; everything shared by the send
+ * (the project, the complete document set, the greeting) renders once for the message.
+ *
+ * Pure function: every fact it prints comes from the packs passed in. It does not re-derive
  * scope, BoQ attribution or forms/attendances — that assembly already exists in
  * `getPackageItt` and stays there. The caller is responsible for filtering out anything
  * marked "Ignore for ITT" before this runs; this file has no notion of overrides.
@@ -14,6 +20,18 @@ export interface IttEmailRecipient {
 export interface IttEmailDocumentLink {
   displayName: string;
   url: string;
+}
+
+/** A work package's own document pack — BuildFlow's per-WP zip. */
+export interface IttEmailBundle {
+  url: string;
+  documentCount: number;
+  /**
+   * True when the package cited no drawing sheet and was issued every sheet instead. Said
+   * out loud in the email: a tenderer handed the whole drawing set should know that is what
+   * they are holding, rather than assuming it has been narrowed to their trade.
+   */
+  allSheetsFallback: boolean;
 }
 
 export interface IttEmailBoqLine {
@@ -54,7 +72,6 @@ export interface IttEmailSpecClause {
 export interface IttEmailPack {
   packageName: string;
   displayRef: string;
-  projectName: string;
   routeOfProcurement: string | null;
   returnForms: Array<{ name: string; description: string | null; isRequired: boolean }>;
   boqSummary: { total: number; priceable: number; authored: number };
@@ -70,13 +87,28 @@ export interface IttEmailPack {
    * tenderer pricing this trade opens first.
    */
   specDocuments: string[];
+  /**
+   * The flat per-document link list, from BuildFlow's document-links contract.
+   *
+   * A FALLBACK, not the primary route: it is every document in the project, unnarrowed, so
+   * it issues a flooring subcontractor the drainage sheets too. `bundle` supersedes it, and
+   * this is only printed for a take-off that has no bundle yet.
+   */
+  documentLinks: IttEmailDocumentLink[];
+  bundle: IttEmailBundle | null;
   attendanceSummary: { subcontractor: number; mainContractor: number; joint: number };
   valueEngineeringRequired: boolean;
 }
 
+export interface IttEmailOptions {
+  projectName: string;
+  /** Everything the tender pack contains, as one zip. The safety net beside each package pack. */
+  completeBundleUrl: string | null;
+}
+
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-const stageLabel = (stage: string | null): string => {
+export const stageLabel = (stage: string | null): string => {
   if (stage === 'Contract') return 'Contract — must be priced';
   if (stage === 'Profit Plan') return 'Profit Plan — not priced';
   return stage ?? '';
@@ -94,45 +126,130 @@ const htmlTable = (headers: string[], rows: string[][]): string => `
     <tbody>${rows.map((r) => `<tr>${r.map((c) => `<td style="border-bottom: 1px solid #eee; padding: 4px 6px;">${c}</td>`).join('')}</tr>`).join('')}</tbody>
   </table>`;
 
-export function renderIttEmail(
-  pack: IttEmailPack,
-  recipient: IttEmailRecipient,
-  documentLinks: IttEmailDocumentLink[]
-): { subject: string; html: string; text: string } {
-  const subject = `Invitation to Tender — ${pack.packageName} — ${pack.projectName}`;
-  const greeting = recipient.name ? `Dear ${recipient.name},` : 'Dear Sir/Madam,';
+export interface IttScopeSection {
+  section: string;
+  lines: Array<{ number: number; text: string }>;
+}
 
-  const requiredForms = pack.returnForms.filter((f) => f.isRequired);
-  const optionalForms = pack.returnForms.filter((f) => !f.isRequired);
-
-  // The scope of works prints exactly as the client's own trade scope sheets do: grouped
-  // under subheadings, in the order the library gives them, numbered straight through.
-  //
-  // The caller supplies the items ALREADY ORDERED by section — this only has to detect
-  // where one section ends and the next begins. Re-sorting here would need this file to
-  // hold a second opinion about section order, and the two would drift the first time a
-  // client reordered their sections in the config editor.
-  //
-  // The number is assigned HERE, per package, not carried from the library. A clause's
-  // number is a position in one document: the same clause is item 29 in one trade's scope
-  // and item 43 in another's, and a bill referring to "item 29" has to mean the 29th line
-  // of the scope the tenderer was actually sent.
+/**
+ * Group a package's scope clauses under their subheadings and number them straight through.
+ *
+ * The items arrive ALREADY ORDERED by section — this only has to detect where one section
+ * ends and the next begins. Re-sorting here would need this file to hold a second opinion
+ * about section order, and the two would drift the first time a client reordered their
+ * sections in the config editor.
+ *
+ * The number is assigned HERE, per package, not carried from the library. A clause's number
+ * is a position in one document: the same clause is item 29 in one trade's scope and item 43
+ * in another's, and a bill referring to "item 29" has to mean the 29th line of the scope the
+ * tenderer was actually sent.
+ *
+ * Exported because the scope-of-works PDF attachment must number identically to the email
+ * body. Two implementations would drift, and the drift would be invisible until a
+ * subcontractor priced against the wrong item number.
+ */
+export function groupScopeSections(scopeItems: IttEmailScopeItem[]): IttScopeSection[] {
   let scopeNumber = 0;
-  const scopeSections: Array<{ section: string; lines: Array<{ number: number; text: string }> }> = [];
-  for (const item of pack.scopeItems) {
+  const sections: IttScopeSection[] = [];
+  for (const item of scopeItems) {
     scopeNumber += 1;
     const text = `${item.description}${item.procurementStage ? ` (${stageLabel(item.procurementStage)})` : ''}`;
-    const current = scopeSections[scopeSections.length - 1];
+    const current = sections[sections.length - 1];
     if (current && current.section === item.section) current.lines.push({ number: scopeNumber, text });
-    else scopeSections.push({ section: item.section, lines: [{ number: scopeNumber, text }] });
+    else sections.push({ section: item.section, lines: [{ number: scopeNumber, text }] });
   }
+  return sections;
+}
 
+export const BOQ_HEADERS = ['GE Code', 'Element', 'Description', 'Qty', 'Unit'];
+export const BILL_HEADERS = ['Ref', 'Section', 'Description', 'Qty', 'Unit', 'Required for'];
+const SPEC_HEADERS = ['GE Code', 'Element / Sub-element', 'Clause'];
+
+export const boqRowsFor = (pack: IttEmailPack): string[][] =>
+  pack.boqLines.map((l) => [l.geCode ?? '—', l.elementCode ?? '—', l.description, qty(l.quantity), l.unit ?? '—']);
+
+export const billRowsFor = (pack: IttEmailPack): string[][] =>
+  pack.billLines.map((l) => [l.ref ?? '—', l.section ?? '—', l.description, qty(l.quantity), l.unit ?? '—', l.requiredFor ?? '—']);
+
+const specRowsFor = (pack: IttEmailPack): string[][] =>
+  pack.specClauses.map((c) => [c.geCode ?? '—', [c.elementCode, c.subElementCode].filter(Boolean).join(' / ') || '—', c.rawText]);
+
+/**
+ * What the measured bill amounts to, and the no-rates statement.
+ *
+ * Split from `boqIntro` because the compose-link body (`renderIttComposeText`) says the same
+ * thing WITHOUT the attachment sentence: a Gmail or Outlook Web compose URL cannot carry
+ * files, and telling a tenderer a pricing schedule is attached when none is would send them
+ * hunting for something that is not there.
+ */
+const boqFigures = (pack: IttEmailPack): string =>
+  `${pack.boqSummary.total} measured lines attributed to this package (${pack.boqSummary.priceable} carrying a quantity), plus ${pack.boqSummary.authored} authored line${pack.boqSummary.authored === 1 ? '' : 's'}. Rates are not shown — please price independently.`;
+
+const boqIntro = (pack: IttEmailPack): string =>
+  `${boqFigures(pack)} A pricing schedule is attached for you to complete.`;
+
+/** Stated identically in the text body, the HTML body and the compose-link body. */
+const VALUE_ENGINEERING_SENTENCE =
+  'Every tenderer must submit at least one Value Engineering proposal stating the saving, the '
+  + 'programme effect, any departure from the specification and the clause affected. A return '
+  + 'without one is not compliant.';
+
+const attendanceSentence = (pack: IttEmailPack): string =>
+  `${pack.attendanceSummary.subcontractor} item${pack.attendanceSummary.subcontractor === 1 ? '' : 's'} carried by the subcontractor, ${pack.attendanceSummary.mainContractor} by the main contractor${pack.attendanceSummary.joint > 0 ? `, ${pack.attendanceSummary.joint} joint` : ''}.`;
+
+const bundleSentence = (bundle: IttEmailBundle): string =>
+  `${bundle.documentCount} document${bundle.documentCount === 1 ? '' : 's'}${bundle.allSheetsFallback ? '. No drawing sheet was cited against this package, so the complete drawing set is included rather than a narrowed selection' : ''}`;
+
+const RULE = '='.repeat(78);
+
+const packageTextBlock = (pack: IttEmailPack): string => {
+  const scopeSections = groupScopeSections(pack.scopeItems);
   const scopeText = scopeSections
     .map((group) => `${group.section}\n${group.lines.map((l) => `  ${String(l.number).padStart(3)}  ${l.text}`).join('\n')}`)
     .join('\n\n');
+  const boqRows = boqRowsFor(pack);
+  const billRows = billRowsFor(pack);
+  const specRows = specRowsFor(pack);
+  const requiredForms = pack.returnForms.filter((f) => f.isRequired);
+  const optionalForms = pack.returnForms.filter((f) => !f.isRequired);
 
+  return `${RULE}
+PACKAGE: ${pack.packageName} (ref ${pack.displayRef})
+Route:   ${pack.routeOfProcurement ?? 'Not stated'}
+${RULE}
+
+SCOPE OF WORKS
+${scopeSections.length > 0 ? scopeText : ' - No scope of works is configured for this package.'}
+${scopeSections.length > 0 ? '\nThe full scope of works is attached as a PDF.\n' : ''}
+BILL OF QUANTITIES
+${boqIntro(pack)}
+
+${boqRows.length > 0 ? textTable(BOQ_HEADERS, boqRows) : 'No measured lines are attributed to this package.'}
+${billRows.length > 0 ? `\nBILL OF QUANTITIES — AUTHORED ITEMS\n${textTable(BILL_HEADERS, billRows)}\n` : ''}
+${specRows.length > 0 ? `\nSPECIFICATION CLAUSES\n${textTable(SPEC_HEADERS, specRows)}\n` : ''}
+${pack.specDocuments.length > 0 ? `SPECIFICATION REFERENCED BY THIS PACKAGE
+${pack.specDocuments.map((d) => ` - ${d}`).join('\n')}
+
+` : ''}DOCUMENTS FOR THIS PACKAGE
+${pack.bundle
+  ? ` - Package document pack (${bundleSentence(pack.bundle)}): ${pack.bundle.url}`
+  : pack.documentLinks.length > 0
+    ? pack.documentLinks.map((d) => ` - ${d.displayName}: ${d.url}`).join('\n')
+    : ' - No documents are available to link at this time.'}
+
+TENDER RETURN — a compliant submission must contain
+${requiredForms.length > 0 ? requiredForms.map((f) => ` - ${f.name}${f.description ? ` — ${f.description}` : ''}`).join('\n') : ' - See attached return forms.'}
+${optionalForms.length > 0 ? `\nOptional:\n${optionalForms.map((f) => ` - ${f.name}`).join('\n')}` : ''}
+
+SCHEDULE OF ATTENDANCES
+${attendanceSentence(pack)}
+${pack.valueEngineeringRequired ? `\nVALUE ENGINEERING\n${VALUE_ENGINEERING_SENTENCE}\n` : ''}`;
+};
+
+const packageHtmlBlock = (pack: IttEmailPack): string => {
+  const scopeSections = groupScopeSections(pack.scopeItems);
   const scopeHtml = scopeSections.map((group) => `
-  <h3 style="font-size: 13px; margin: 14px 0 4px;">${esc(group.section)}</h3>
+  <h4 style="font-size: 13px; margin: 14px 0 4px;">${esc(group.section)}</h4>
   <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
     <tbody>${group.lines.map((l) => `<tr>
       <td style="width: 34px; vertical-align: top; padding: 2px 6px 2px 0; color: #888;">${l.number}</td>
@@ -140,118 +257,196 @@ export function renderIttEmail(
     </tr>`).join('')}</tbody>
   </table>`).join('');
 
-  const boqHeaders = ['GE Code', 'Element', 'Description', 'Qty', 'Unit'];
-  const boqRows = pack.boqLines.map((l) => [l.geCode ?? '—', l.elementCode ?? '—', l.description, qty(l.quantity), l.unit ?? '—']);
-  const boqHtmlRows = boqRows.map((r) => r.map(esc));
+  const boqHtmlRows = boqRowsFor(pack).map((r) => r.map(esc));
+  const billHtmlRows = billRowsFor(pack).map((r) => r.map(esc));
+  const specHtmlRows = specRowsFor(pack).map((r) => r.map(esc));
+  const requiredForms = pack.returnForms.filter((f) => f.isRequired);
+  const optionalForms = pack.returnForms.filter((f) => !f.isRequired);
 
-  const billHeaders = ['Ref', 'Section', 'Description', 'Qty', 'Unit', 'Required for'];
-  const billRows = pack.billLines.map((l) => [l.ref ?? '—', l.section ?? '—', l.description, qty(l.quantity), l.unit ?? '—', l.requiredFor ?? '—']);
-  const billHtmlRows = billRows.map((r) => r.map(esc));
+  return `
+  <div style="border-top: 3px solid #1a1a1a; margin-top: 28px; padding-top: 8px;">
+  <h2 style="font-size: 17px; margin-bottom: 2px;">${esc(pack.packageName)} <span style="color:#888; font-weight: normal;">(ref ${esc(pack.displayRef)})</span></h2>
+  <p style="color: #555; margin-top: 0; font-size: 13px;">Route: ${esc(pack.routeOfProcurement ?? 'Not stated')}</p>
 
-  const specHeaders = ['GE Code', 'Element / Sub-element', 'Clause'];
-  const specRows = pack.specClauses.map((c) => [c.geCode ?? '—', [c.elementCode, c.subElementCode].filter(Boolean).join(' / ') || '—', c.rawText]);
-  const specHtmlRows = specRows.map((r) => r.map(esc));
+  <h3 style="font-size: 15px;">Scope of works</h3>
+  ${scopeSections.length > 0
+    ? `${scopeHtml}<p style="font-size: 13px; color: #555;">The full scope of works is attached as a PDF.</p>`
+    : '<p>No scope of works is configured for this package.</p>'}
+
+  <h3 style="font-size: 15px;">Bill of quantities</h3>
+  <p>${esc(boqIntro(pack))}</p>
+  ${boqHtmlRows.length > 0 ? htmlTable(BOQ_HEADERS, boqHtmlRows) : '<p>No measured lines are attributed to this package.</p>'}
+
+  ${billHtmlRows.length > 0 ? `
+  <h3 style="font-size: 15px;">Bill of quantities — authored items</h3>
+  ${htmlTable(BILL_HEADERS, billHtmlRows)}` : ''}
+
+  ${specHtmlRows.length > 0 ? `
+  <h3 style="font-size: 15px;">Specification clauses</h3>
+  ${htmlTable(SPEC_HEADERS, specHtmlRows)}` : ''}
+
+  ${pack.specDocuments.length > 0 ? `
+  <h3 style="font-size: 15px;">Specification referenced by this package</h3>
+  <p style="font-size: 13px;">The measured lines above were read from these documents. They are issued with the document pack below.</p>
+  <ul>${pack.specDocuments.map((d) => `<li>${esc(d)}</li>`).join('')}</ul>` : ''}
+
+  <h3 style="font-size: 15px;">Documents for this package</h3>
+  ${pack.bundle
+    ? `<p><a href="${esc(pack.bundle.url)}"><strong>Download the ${esc(pack.packageName)} document pack</strong></a><br>
+       <span style="color:#555; font-size: 13px;">${esc(bundleSentence(pack.bundle))}.</span></p>`
+    : pack.documentLinks.length > 0
+      ? `<ul>${pack.documentLinks.map((d) => `<li><a href="${esc(d.url)}">${esc(d.displayName)}</a></li>`).join('')}</ul>`
+      : '<p>No documents are available to link at this time.</p>'}
+
+  <h3 style="font-size: 15px;">Tender return — a compliant submission must contain</h3>
+  ${requiredForms.length > 0
+    ? `<ul>${requiredForms.map((f) => `<li><strong>${esc(f.name)}</strong>${f.description ? ` — ${esc(f.description)}` : ''}</li>`).join('')}</ul>`
+    : '<p>See attached return forms.</p>'}
+  ${optionalForms.length > 0 ? `<p style="color:#555;">Optional: ${optionalForms.map((f) => esc(f.name)).join(', ')}</p>` : ''}
+
+  <h3 style="font-size: 15px;">Schedule of attendances</h3>
+  <p>${esc(attendanceSentence(pack))}</p>
+
+  ${pack.valueEngineeringRequired ? `
+  <h3 style="font-size: 15px;">Value Engineering</h3>
+  <p><strong>Mandatory.</strong> ${esc(VALUE_ENGINEERING_SENTENCE)}</p>` : ''}
+  </div>`;
+};
+
+/**
+ * The most a compose URL can carry.
+ *
+ * "Open draft Email" can hand the whole ITT to a desktop mail app as a .eml, but Gmail and
+ * Outlook Web are reached by a link, and a link carries its body as a query parameter. The
+ * full text body runs to tens of KB; Gmail truncates a URL long before that and the browser
+ * may refuse it outright. So the web-mail route gets its own short covering note, capped
+ * here, rather than a full body that would arrive mangled.
+ */
+export const COMPOSE_BODY_MAX_CHARS = 1800;
+
+/**
+ * A short covering note for one package, for the Gmail / Outlook Web compose links.
+ *
+ * NOT a shortened `text` body — a different document with a different job. It carries the two
+ * document links and the figures, and says outright that the detail lives in the documents,
+ * because that is all a compose link can honestly deliver: no attachments, no HTML.
+ *
+ * THE LINKS COME FIRST, immediately after the header. If the cap ever bites, it bites the
+ * forms list and then the tail — never the two URLs, which are the only things in here a
+ * tenderer cannot proceed without.
+ */
+export function renderIttComposeText(pack: IttEmailPack, options: IttEmailOptions): string {
+  const { projectName, completeBundleUrl } = options;
+  const requiredForms = pack.returnForms.filter((f) => f.isRequired);
+
+  const documents = pack.bundle
+    ? `Documents for this package (${pack.bundle.documentCount} document${pack.bundle.documentCount === 1 ? '' : 's'}):\n  ${pack.bundle.url}`
+    // The flat per-document list is every document in the project and would exhaust the whole
+    // budget on its own, so it is not printed here. Saying the documents follow separately is
+    // true; listing forty URLs and then truncating them would not be.
+    : 'Documents for this package: to follow separately.';
+
+  const complete = completeBundleUrl
+    ? `\n\nComplete tender document set:\n  ${completeBundleUrl}`
+    : '';
+
+  const scope = pack.scopeItems.length > 0
+    ? `Scope of works: ${pack.scopeItems.length} clause${pack.scopeItems.length === 1 ? '' : 's'}, issued in full with the documents above.`
+    : 'Scope of works: none is configured for this package.';
+
+  const head = `INVITATION TO TENDER
+
+Project: ${projectName}
+Package: ${pack.packageName} (ref ${pack.displayRef})
+Route:   ${pack.routeOfProcurement ?? 'Not stated'}
+
+Dear Sir/Madam,
+
+You are invited to tender for the package above.
+
+${documents}${complete}
+
+${scope}
+Bill of quantities: ${boqFigures(pack)}
+`;
+
+  const tail = `${pack.valueEngineeringRequired ? `\n${VALUE_ENGINEERING_SENTENCE}\n` : ''}
+Please raise all technical and commercial queries in writing before the return date.
+`;
+
+  const fullForms = requiredForms.length > 0
+    ? `\nA compliant return must contain:\n${requiredForms.map((f) => ` - ${f.name}`).join('\n')}\n`
+    : '';
+  const shortForms = requiredForms.length > 0
+    ? `\nA compliant return must contain ${requiredForms.length} required form${requiredForms.length === 1 ? '' : 's'}, listed in the documents above.\n`
+    : '';
+
+  const assemble = (forms: string) => `${head}${forms}${tail}`;
+  let body = assemble(fullForms);
+  if (body.length > COMPOSE_BODY_MAX_CHARS) body = assemble(shortForms);
+  if (body.length > COMPOSE_BODY_MAX_CHARS) body = `${body.slice(0, COMPOSE_BODY_MAX_CHARS - 1).trimEnd()}…`;
+  return body;
+}
+
+export function renderIttEmail(
+  packages: IttEmailPack[],
+  recipient: IttEmailRecipient,
+  options: IttEmailOptions
+): { subject: string; html: string; text: string } {
+  const { projectName, completeBundleUrl } = options;
+  const many = packages.length > 1;
+  const subject = many
+    ? `Invitation to Tender — ${packages.length} packages — ${projectName}`
+    : `Invitation to Tender — ${packages[0]?.packageName ?? 'Tender'} — ${projectName}`;
+  const greeting = recipient.name ? `Dear ${recipient.name},` : 'Dear Sir/Madam,';
+  const packageList = packages.map((p) => `${p.packageName} (ref ${p.displayRef})`);
+
+  const intro = many
+    ? `You are invited to tender for the ${packages.length} packages listed below. Each package is set out in full — its scope of works, bill of quantities, document pack and return requirements — and each carries its own attached scope of works and pricing schedule. Please price each package separately.`
+    : 'You are invited to tender for the package below. Please find its scope of works, bill of quantities, the documents this invitation carries and what a compliant return must contain. The scope of works and a pricing schedule are attached.';
+
+  const completeTextBlock = completeBundleUrl
+    ? `\nCOMPLETE TENDER DOCUMENT SET\nEverything issued with this tender, as a single download. Your package pack${many ? 's' : ''} above ${many ? 'are' : 'is'} a narrowed selection of it.\n - ${completeBundleUrl}\n`
+    : '';
 
   const text = `INVITATION TO TENDER
 
-Project:  ${pack.projectName}
-Package:  ${pack.packageName} (ref ${pack.displayRef})
-Route:    ${pack.routeOfProcurement ?? 'Not stated'}
+Project:  ${projectName}
+Package${many ? 's' : ''}: ${packageList.join('\n          ')}
 
 ${greeting}
 
-You are invited to tender for the above package. Please find below the scope of works,
-the bill of quantities coverage, the documents this invitation carries and what a
-compliant return must contain.
+${intro}
 
-SCOPE OF WORKS
-${scopeSections.length > 0 ? scopeText : ' - See attached scope of works matrix.'}
-
-BILL OF QUANTITIES
-${pack.boqSummary.total} measured lines attributed to this package (${pack.boqSummary.priceable} carrying a quantity), plus ${pack.boqSummary.authored} authored line${pack.boqSummary.authored === 1 ? '' : 's'}. Rates are not shown — please price independently.
-
-${boqRows.length > 0 ? textTable(boqHeaders, boqRows) : 'See attached bill of quantities.'}
-${billRows.length > 0 ? `\nBILL OF QUANTITIES — AUTHORED ITEMS\n${textTable(billHeaders, billRows)}\n` : ''}
-${specRows.length > 0 ? `\nSPECIFICATION CLAUSES\n${textTable(specHeaders, specRows)}\n` : ''}
-${pack.specDocuments.length > 0 ? `SPECIFICATION REFERENCED BY THIS PACKAGE
-${pack.specDocuments.map((d) => ` - ${d}`).join('\n')}
-
-` : ''}TENDER DOCUMENTS
-${documentLinks.length > 0
-  ? documentLinks.map((d) => ` - ${d.displayName}: ${d.url}`).join('\n')
-  : ' - No documents are available to link at this time.'}
-
-TENDER RETURN — a compliant submission must contain
-${requiredForms.length > 0 ? requiredForms.map((f) => ` - ${f.name}${f.description ? ` — ${f.description}` : ''}`).join('\n') : ' - See attached return forms.'}
-${optionalForms.length > 0 ? `\nOptional:\n${optionalForms.map((f) => ` - ${f.name}`).join('\n')}` : ''}
-
-SCHEDULE OF ATTENDANCES
-${pack.attendanceSummary.subcontractor} item${pack.attendanceSummary.subcontractor === 1 ? '' : 's'} carried by the subcontractor, ${pack.attendanceSummary.mainContractor} by the main contractor${pack.attendanceSummary.joint > 0 ? `, ${pack.attendanceSummary.joint} joint` : ''}.
-
-${pack.valueEngineeringRequired ? 'VALUE ENGINEERING\nEvery tenderer must submit at least one Value Engineering proposal stating the saving, the programme effect, any departure from the specification and the clause affected. A return without one is not compliant.\n' : ''}
+${packages.map(packageTextBlock).join('\n')}
+${completeTextBlock}
 Please raise all technical and commercial queries in writing before the return date.
 `;
 
   const html = `
 <div style="font-family: Arial, Helvetica, sans-serif; max-width: 640px; margin: 0 auto; color: #1a1a1a;">
   <h1 style="font-size: 20px; margin-bottom: 4px;">Invitation to Tender</h1>
-  <p style="color: #555; margin-top: 0;">${esc(pack.packageName)} — ${esc(pack.projectName)}</p>
+  <p style="color: #555; margin-top: 0;">${esc(projectName)}</p>
 
   <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
-    <tr><td style="padding: 4px 0; color: #555;">Project</td><td style="padding: 4px 0;">${esc(pack.projectName)}</td></tr>
-    <tr><td style="padding: 4px 0; color: #555;">Package</td><td style="padding: 4px 0;">${esc(pack.packageName)} (ref ${esc(pack.displayRef)})</td></tr>
-    <tr><td style="padding: 4px 0; color: #555;">Route</td><td style="padding: 4px 0;">${esc(pack.routeOfProcurement ?? 'Not stated')}</td></tr>
+    <tr><td style="padding: 4px 0; color: #555; vertical-align: top;">Project</td><td style="padding: 4px 0;">${esc(projectName)}</td></tr>
+    <tr><td style="padding: 4px 0; color: #555; vertical-align: top;">Package${many ? 's' : ''}</td><td style="padding: 4px 0;">${packageList.map(esc).join('<br>')}</td></tr>
   </table>
 
   <p>${esc(greeting)}</p>
 
-  <p>You are invited to tender for the above package. Please find below the scope of works,
-  the bill of quantities coverage, the documents this invitation carries and what a
-  compliant return must contain.</p>
+  <p>${esc(intro)}</p>
 
-  <h2 style="font-size: 15px;">Scope of works</h2>
-  ${scopeSections.length > 0 ? scopeHtml : '<p>See attached scope of works matrix.</p>'}
+  ${packages.map(packageHtmlBlock).join('')}
 
-  <h2 style="font-size: 15px;">Bill of quantities</h2>
-  <p>${pack.boqSummary.total} measured lines attributed to this package (${pack.boqSummary.priceable} carrying a quantity), plus
-  ${pack.boqSummary.authored} authored line${pack.boqSummary.authored === 1 ? '' : 's'}. Rates are not shown — please price independently.</p>
-  ${boqHtmlRows.length > 0 ? htmlTable(boqHeaders, boqHtmlRows) : '<p>See attached bill of quantities.</p>'}
+  ${completeBundleUrl ? `
+  <div style="border-top: 3px solid #1a1a1a; margin-top: 28px; padding-top: 8px;">
+  <h2 style="font-size: 17px;">Complete tender document set</h2>
+  <p>Everything issued with this tender, as a single download. Your package pack${many ? 's' : ''} above ${many ? 'are' : 'is'} a narrowed selection of it.</p>
+  <p><a href="${esc(completeBundleUrl)}"><strong>Download the complete tender document set</strong></a></p>
+  </div>` : ''}
 
-  ${billHtmlRows.length > 0 ? `
-  <h2 style="font-size: 15px;">Bill of quantities — authored items</h2>
-  ${htmlTable(billHeaders, billHtmlRows)}` : ''}
-
-  ${specHtmlRows.length > 0 ? `
-  <h2 style="font-size: 15px;">Specification clauses</h2>
-  ${htmlTable(specHeaders, specHtmlRows)}` : ''}
-
-  ${pack.specDocuments.length > 0 ? `
-  <h2 style="font-size: 15px;">Specification referenced by this package</h2>
-  <p style="font-size: 13px;">The measured lines above were read from these documents. They are issued with the full document schedule below.</p>
-  <ul>${pack.specDocuments.map((d) => `<li>${esc(d)}</li>`).join('')}</ul>` : ''}
-
-  <h2 style="font-size: 15px;">Tender documents</h2>
-  ${documentLinks.length > 0
-    ? `<ul>${documentLinks.map((d) => `<li><a href="${esc(d.url)}">${esc(d.displayName)}</a></li>`).join('')}</ul>`
-    : '<p>No documents are available to link at this time.</p>'}
-
-  <h2 style="font-size: 15px;">Tender return — a compliant submission must contain</h2>
-  ${requiredForms.length > 0
-    ? `<ul>${requiredForms.map((f) => `<li><strong>${esc(f.name)}</strong>${f.description ? ` — ${esc(f.description)}` : ''}</li>`).join('')}</ul>`
-    : '<p>See attached return forms.</p>'}
-  ${optionalForms.length > 0 ? `<p style="color:#555;">Optional: ${optionalForms.map((f) => esc(f.name)).join(', ')}</p>` : ''}
-
-  <h2 style="font-size: 15px;">Schedule of attendances</h2>
-  <p>${pack.attendanceSummary.subcontractor} item${pack.attendanceSummary.subcontractor === 1 ? '' : 's'} carried by the subcontractor,
-  ${pack.attendanceSummary.mainContractor} by the main contractor${pack.attendanceSummary.joint > 0 ? `, ${pack.attendanceSummary.joint} joint` : ''}.</p>
-
-  ${pack.valueEngineeringRequired ? `
-  <h2 style="font-size: 15px;">Value Engineering</h2>
-  <p><strong>Mandatory.</strong> Every tenderer must submit at least one Value Engineering proposal stating the
-  saving, the programme effect, any departure from the specification and the clause affected. A return without
-  one is not compliant.</p>` : ''}
-
-  <p style="color: #888; font-size: 12px;">Please raise all technical and commercial queries in writing before the return date.</p>
+  <p style="color: #888; font-size: 12px; margin-top: 24px;">Please raise all technical and commercial queries in writing before the return date.</p>
 </div>
 `;
 
