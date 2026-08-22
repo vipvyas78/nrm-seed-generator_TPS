@@ -6,9 +6,8 @@ import type { Database, Row } from './db.js';
 import type { DocumentLinkProvider } from './documentLinkProvider.js';
 import type { EmailAttachment, EmailService } from './emailService.js';
 import { conflict, notFound } from './errors.js';
-import { buildEml } from './emlMessage.js';
 import { ittAttachmentsFor, type IttAttachment } from './ittAttachments.js';
-import { renderIttComposeText, renderIttEmail, type IttEmailDocumentLink, type IttEmailPack } from './ittEmail.js';
+import { renderIttEmail, type IttEmailPack } from './ittEmail.js';
 import type { ScmsReadDatabase } from './scmsReadDb.js';
 import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js';
 import type { Actor } from './types.js';
@@ -127,20 +126,32 @@ function attributionFor(pkg: Row): Attribution {
   };
 }
 
+/** One firm shortlisted for the package, as the compose box offers it. */
+export interface IttDraftRecipient {
+  shortlistEntryId: string;
+  subcontractorId: string;
+  /** The firm. Null only if SCMS no longer holds the subcontractor at all. */
+  name: string | null;
+  /** The individual the address belongs to, for showing beside it. */
+  contactName: string | null;
+  /** Null when SCMS holds no contact email — shown as unreachable, never silently dropped. */
+  email: string | null;
+}
+
 /**
- * Everything about a draft ITT except the draft itself.
+ * One package's ITT as the compose modal shows it, before anything is sent.
  *
- * Separated from the `.eml` bytes so the route serving JSON cannot accidentally serialise a
- * multi-megabyte message file into it. See `draftIttEmail`.
+ * `html` and `text` are a PREVIEW: the modal displays them read-only and never sends them back.
+ * `sendIttDraft` rebuilds both from the same assembly, so the body cannot be edited in transit.
  */
-export interface IttDraftMetadata {
+export interface IttDraft {
   packageName: string;
   subject: string;
-  /** The short covering note the Gmail / Outlook Web compose links carry. */
-  composeBody: string;
+  html: string;
+  text: string;
+  recipients: IttDraftRecipient[];
   bundleUrl: string | null;
   completeBundleUrl: string | null;
-  /** What the .eml carries. Empty for a web-mail compose link, which cannot carry files. */
   attachments: Array<{ filename: string; contentType: string; bytes: number }>;
   /** The files were dropped for exceeding what a send would carry — see MAX_ATTACHMENT_BYTES. */
   attachmentsOmittedOversize: boolean;
@@ -257,10 +268,9 @@ export class TenderPrepDatabase {
       // show what would actually be sent, and this needs no workflow, only the session the
       // take-off's BoQ belongs to.
       specDocuments: previewSpecDocuments,
-      // A preview has no workflow, so it has no take-off release to read bundles from and no
-      // packageVersionId to resolve links against. The documents section renders its
-      // "nothing to link" branch rather than inventing a link that would not be sent.
-      documentLinks: [],
+      // A preview has no workflow, so it has no take-off release to read bundles from. The
+      // documents section states that they will be issued separately rather than inventing a
+      // link that would not be sent.
       bundle: null,
       attendanceSummary: {
         subcontractor: attendances.filter((a) => a.owner === 'SC').length,
@@ -502,11 +512,15 @@ export class TenderPrepDatabase {
           `Cited but not in the tender pack: ${unresolvedSpecFiles.join(', ')}.`,
         Boolean(pkg.wp_code) && boqLines.length > 0 && citingLines === 0 &&
           'No line in this package cites a specification, so the ITT names none. These lines were measured without a clause reference.',
-        // An unconfigured integration and an empty one are different facts, and both clients
-        // return [] either way. Without this the ITT emails with no document links at all and
+        // An unconfigured integration and an empty one are different facts, and the client
+        // returns [] either way. Without this the ITT emails with no document link at all and
         // reads exactly as though the project had none.
-        !this.buildflowLinks &&
-          'Document links unavailable: BUILDFLOW_BASE_URL and BUILDFLOW_DOCUMENT_LINKS_TOKEN are not configured, so this ITT would be emailed with no document links.',
+        //
+        // Tests the BUNDLES client, not the per-document one: the email links a work package's
+        // zip and nothing else, so that is the integration whose absence would leave a tenderer
+        // with no documents.
+        !this.bundles &&
+          'Document packs unavailable: BUILDFLOW_BASE_URL and BUILDFLOW_DOCUMENT_LINKS_TOKEN are not configured, so this ITT would be emailed with no link to its documents.',
         // Scope and attendances are what make the pricing document coordinate: they define
         // everything the subcontractor carries around the measured bill. Missing either and
         // every tenderer guesses differently, so neither the price nor the comparison holds.
@@ -1508,32 +1522,18 @@ export class TenderPrepDatabase {
     const boqLines = notIgnored(pack.boq_lines as Row[]);
     const billLines = notIgnored(pack.bill_lines as Row[]);
     const scopeItems = notIgnored(pack.scope_items as Row[]);
-    const documents = pack.documents as Row[];
-    const ignoredDocuments = documents.filter((d) => d.ignored === true);
-    const ignoredDocIds = new Set(ignoredDocuments.map((d) => String(d.id)));
-    const ignoredFilenames = new Set(ignoredDocuments.map((d) => String(d.filename)));
 
     const takeoff = pack.takeoff as Record<string, unknown>;
 
-    // The package's own document zip. Matched on the wp_code the package was derived from;
-    // a legacy hand-loaded package carries none and simply gets no bundle, falling back to
-    // the flat link list below.
+    // The package's own document zip, matched on the wp_code the package was derived from.
+    //
+    // THE ONLY DOCUMENT LINK THE EMAIL CARRIES. There was a fallback here that fetched
+    // BuildFlow's flat per-document list when no bundle existed, and on the first real send it
+    // printed all 140 documents in the project into the email — the drainage sheets to the
+    // flooring subcontractor, and the four drawings that mattered lost among them. A package
+    // with no bundle now says so and points at the complete set; see `documentsSentence`.
     const wpCode = typeof pack.wp_code === 'string' ? pack.wp_code : null;
     const packageBundle = wpCode ? bundles.find((b) => b.wpCode === wpCode) : undefined;
-
-    // BuildFlow's document-links contract is keyed by packageVersionId, carried verbatim on
-    // the workflow since the take-off completed. A workflow started by hand, or one where
-    // BuildFlow can't be reached, sends without links rather than blocking the ITT.
-    //
-    // Only fetched when there is no bundle: a bundle supersedes this list entirely, and
-    // fetching a list nothing will print is a wasted round trip per package.
-    const packageVersionId = typeof takeoff?.packageVersionId === 'string' ? takeoff.packageVersionId : null;
-    let documentLinks: IttEmailDocumentLink[] = [];
-    if (!packageBundle && packageVersionId && this.buildflowLinks) {
-      documentLinks = (await this.buildflowLinks.linksFor(packageVersionId))
-        .filter((l) => !ignoredDocIds.has(l.fileId) && !ignoredFilenames.has(l.displayName))
-        .map((l) => ({ displayName: l.displayName, url: l.url }));
-    }
 
     const priceable = boqLines.filter((l) => l.is_priceable).length;
 
@@ -1574,7 +1574,6 @@ export class TenderPrepDatabase {
       specDocuments: ((pack.spec_documents as Row[]) ?? [])
         .filter((d) => d.ignored !== true)
         .map((d) => String(d.filename)),
-      documentLinks,
       bundle: packageBundle
         ? {
             url: packageBundle.url,
@@ -1624,63 +1623,198 @@ export class TenderPrepDatabase {
   }
 
   /**
-   * One package's ITT as a draft the user sends themselves, rather than one this service sends.
+   * Everything the in-app compose box needs to show one package's ITT before it is sent.
    *
    * Step 2 otherwise offers only "read it on screen" or "it has gone". This is the step in
-   * between: the same email Confirm ITT would send, handed over as a file a mail app opens in
-   * compose mode, so a covering sentence can be added, a colleague copied in, or the message
-   * sent from the sender's own mailbox.
+   * between: the exact email Confirm ITT would send, opened in a modal with To, Cc and Subject
+   * so it can be addressed by hand, copied to a colleague, and sent when the sender is ready.
    *
    * SAME CONTENT AS A REAL SEND. It goes through bundlesForWorkflow → assemblePackageForEmail →
-   * renderIttEmail → ittAttachmentsFor, exactly as confirmAndSendItt does. A draft that
-   * described the package differently from the send would be worse than no draft, and
-   * assemblePackageForEmail exists precisely so the paths cannot drift.
+   * renderIttEmail → ittAttachmentsFor, exactly as confirmAndSendItt does. The body is shown
+   * read-only and `sendIttDraft` rebuilds it from this same assembly rather than accepting it
+   * back from the browser, so what a tenderer is bound by has exactly one origin.
    *
-   * ADDRESSED TO NOBODY. The sender types the address. That is deliberate: an ITT goes to
-   * every firm shortlisted for the package and each must be sent separately, so a draft
-   * pre-filled with the whole list would put competitors on one message.
+   * The greeting stays "Dear Sir/Madam,": one message may be addressed to several firms, so it
+   * cannot open with any one recipient's name.
    *
-   * No confirmation is required — reviewing a draft BEFORE confirming the package is most of
-   * the point — and nothing is written to itt_dispatch, because nothing has been sent. Only
-   * the user's own mail app knows whether it ever was.
+   * No confirmation is required. Reviewing the email BEFORE confirming the package is most of
+   * the point, and getPackageItt imposes no such precondition either.
    */
-  async draftIttEmail(actor: Actor, workflowId: string, packageName: string): Promise<{
-    metadata: IttDraftMetadata; eml: Buffer;
-  }> {
+  async draftIttEmail(actor: Actor, workflowId: string, packageName: string): Promise<IttDraft> {
     await this.assertWorkflowAccess(actor, workflowId);
 
-    const bundles = await this.bundlesForWorkflow(workflowId);
-    const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
-    const { emailPack, projectName } = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles);
-
-    // No recipient name, so the body greets "Dear Sir/Madam,". The email address is never
-    // printed in the body — only the name reaches the greeting — so an empty one leaves no
-    // trace in what the tenderer reads.
+    const { emailPack, projectName, completeBundleUrl, attachments, attachmentsOmittedOversize, recipients } =
+      await this.buildIttDraft(actor, workflowId, packageName);
     const rendered = renderIttEmail([emailPack], { name: null, email: '' }, { projectName, completeBundleUrl });
 
+    return {
+      packageName: emailPack.packageName,
+      subject: rendered.subject,
+      html: rendered.html,
+      text: rendered.text,
+      recipients,
+      bundleUrl: emailPack.bundle?.url ?? null,
+      completeBundleUrl,
+      attachments: attachments.map((f) => ({
+        filename: f.filename, contentType: f.contentType, bytes: f.content.length
+      })),
+      attachmentsOmittedOversize
+    };
+  }
+
+  /**
+   * The assembly `draftIttEmail` and `sendIttDraft` share.
+   *
+   * Both must see the same package, the same attachments and the same shortlist, or the modal
+   * would preview one email and send another.
+   */
+  private async buildIttDraft(actor: Actor, workflowId: string, packageName: string): Promise<{
+    emailPack: IttEmailPack;
+    projectName: string;
+    completeBundleUrl: string | null;
+    attachments: IttAttachment[];
+    attachmentsOmittedOversize: boolean;
+    recipients: IttDraftRecipient[];
+  }> {
+    const bundles = await this.bundlesForWorkflow(workflowId);
+    const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
+    const assembled = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles);
+
     // The same budget a real send applies, measured the same way (on the encoded length, which
-    // is what would travel) — so a package that would send without its attachments drafts
-    // without them too, rather than producing a draft that could not be sent.
-    const files = await ittAttachmentsFor(emailPack, projectName);
+    // is what actually travels) — so a package that would send without its attachments previews
+    // without them too, rather than promising files the send would drop.
+    const files = await ittAttachmentsFor(assembled.emailPack, assembled.projectName);
     const encodedBytes = files.reduce((sum, f) => sum + Math.ceil(f.content.length / 3) * 4, 0);
     const attachmentsOmittedOversize = encodedBytes > MAX_ATTACHMENT_BYTES;
-    const attachments = attachmentsOmittedOversize ? [] : files;
+
+    // Every firm the tender launch meeting selected for this package, with whatever contact
+    // SCMS holds. A firm with no email on file is returned with email: null rather than dropped
+    // — "there is nobody to write to at this firm" is a fact the sender needs to see.
+    const contacts = new Map(
+      (await this.scms.getContactsForSubcontractors(assembled.recipients.map((r) => String(r.subcontractor_id))))
+        .map((c) => [String(c.subcontractor_id), c])
+    );
+    const recipients: IttDraftRecipient[] = assembled.recipients.map((r) => {
+      const contact = contacts.get(String(r.subcontractor_id));
+      return {
+        shortlistEntryId: String(r.shortlist_entry_id),
+        subcontractorId: String(r.subcontractor_id),
+        name: contact?.name ? String(contact.name) : null,
+        contactName: contact?.contact_name ? String(contact.contact_name) : null,
+        email: contact?.contact_email ? String(contact.contact_email) : null
+      };
+    });
 
     return {
-      metadata: {
-        packageName: emailPack.packageName,
-        subject: rendered.subject,
-        composeBody: renderIttComposeText(emailPack, { projectName, completeBundleUrl }),
-        bundleUrl: emailPack.bundle?.url ?? null,
-        completeBundleUrl,
-        attachments: attachments.map((f) => ({
-          filename: f.filename, contentType: f.contentType, bytes: f.content.length
-        })),
-        attachmentsOmittedOversize
-      },
-      eml: buildEml({
-        subject: rendered.subject, html: rendered.html, text: rendered.text, attachments
-      })
+      emailPack: assembled.emailPack,
+      projectName: assembled.projectName,
+      completeBundleUrl,
+      attachments: attachmentsOmittedOversize ? [] : files,
+      attachmentsOmittedOversize,
+      recipients
+    };
+  }
+
+  /**
+   * Send the ITT the compose modal is showing, to the addresses typed into it.
+   *
+   * THE BODY IS NOT ACCEPTED FROM THE CLIENT. Only To, Cc and Subject cross the wire; the
+   * scope, bill, document links and attachments are rebuilt here from the same assembly the
+   * preview was rendered from. A tenderer's obligations must not be editable in a browser on
+   * their way out, and re-deriving them is what guarantees that rather than trusting the UI.
+   *
+   * ONE MESSAGE, however many recipients — that is what a compose box means. It differs
+   * deliberately from confirmAndSendItt, which addresses each firm separately so that no firm
+   * ever sees a competitor's address; here the sender chose who shares the message.
+   *
+   * Recorded where it can be. An address matching a shortlisted firm's SCMS contact gets an
+   * itt_dispatch row so the Status column tells the truth about what has gone out; a hand-typed
+   * address matching nobody is still sent to, and the result says how many did not record.
+   */
+  async sendIttDraft(actor: Actor, workflowId: string, packageName: string, input: {
+    to: string[]; cc: string[]; subject: string;
+  }): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.emailService) {
+      throw conflict('Email is not configured in this environment, so this ITT cannot be sent from here.');
+    }
+
+    const { emailPack, projectName, completeBundleUrl, attachments, recipients } =
+      await this.buildIttDraft(actor, workflowId, packageName);
+    const rendered = renderIttEmail([emailPack], { name: null, email: '' }, { projectName, completeBundleUrl });
+
+    const normalise = (address: string) => address.trim().toLowerCase();
+    const to = [...new Set(input.to.map((a) => a.trim()).filter(Boolean))];
+    const cc = [...new Set(input.cc.map((a) => a.trim()).filter(Boolean))]
+      .filter((address) => !to.some((t) => normalise(t) === normalise(address)));
+    if (to.length === 0) throw conflict('Add at least one recipient before sending.');
+
+    const addressed = new Set([...to, ...cc].map(normalise));
+    const matched = recipients.filter((r) => r.email && addressed.has(normalise(r.email)));
+    const notRecorded = addressed.size - new Set(matched.map((r) => normalise(r.email!))).size;
+
+    // Test mode redirects the whole message to one inbox and drops the cc list, so exercising
+    // this against a real package cannot reach a real subcontractor. The subject names who it
+    // was meant for, since every test send lands in the same place.
+    const from = this.testEmailOverride?.from ?? ITT_FROM_ADDRESS;
+    const subject = this.testEmailOverride
+      ? `[TEST → ${[...to, ...cc].join(', ')}] ${input.subject}`
+      : input.subject;
+
+    const encoded: EmailAttachment[] = attachments.map((file) => ({
+      content: file.content.toString('base64'),
+      filename: file.filename,
+      type: file.contentType,
+      disposition: 'attachment'
+    }));
+
+    let messageId: string | null = null;
+    let failure: string | null = null;
+    try {
+      const result = await this.emailService.send({
+        from,
+        to: this.testEmailOverride ? this.testEmailOverride.to : to,
+        cc: this.testEmailOverride ? [] : cc,
+        // A subcontractor replying to a message a person composed should reach that person, not
+        // the shared service mailbox every automated ITT is sent from.
+        replyTo: actor.email,
+        subject,
+        html: rendered.html,
+        text: rendered.text,
+        attachments: encoded
+      });
+      messageId = (result as { message_id?: string } | null)?.message_id ?? null;
+    } catch (error) {
+      failure = error instanceof Error ? error.message : 'Unknown error sending email';
+    }
+
+    // A failure is recorded too. A firm that did not receive its ITT because the provider
+    // rejected the message must not keep showing as "not sent" with no explanation.
+    for (const recipient of matched) {
+      await this.db.query(
+        `INSERT INTO itt_dispatch (shortlist_entry_id, dispatched_at, email_status, email_error, email_sent_at, email_message_id)
+         VALUES ($1, NOW(), $2, $3, CASE WHEN $2 = 'sent' THEN NOW() ELSE NULL END, $4)
+         ON CONFLICT (shortlist_entry_id) DO UPDATE
+           SET dispatched_at = NOW(), email_status = $2, email_error = $3,
+               email_sent_at = CASE WHEN $2 = 'sent' THEN NOW() ELSE NULL END,
+               email_message_id = $4`,
+        [recipient.shortlistEntryId, failure ? 'failed' : 'sent', failure, messageId]
+      );
+    }
+
+    if (failure) throw conflict(`The email could not be sent: ${failure}`);
+
+    return {
+      package_name: emailPack.packageName,
+      to,
+      cc,
+      recipients: to.length + cc.length,
+      recorded: matched.length,
+      // Named rather than hidden: an address nobody on the shortlist owns is a perfectly good
+      // thing to send to, but it leaves no trace on this ITT's dispatch record.
+      not_recorded: notRecorded,
+      attachments: encoded.length,
+      email_message_id: messageId
     };
   }
 

@@ -174,3 +174,41 @@ code { font-family: monospace; font-size: 0.85em; background: #f3f4f6; padding: 
 .bill-section td { background: #f3f4f6; font-size: 0.75rem; padding: 5px 8px; }
 .placeholder-row td { background: #fef3c7; }
 .placeholder-row .sub-name { font-style: italic; color: #92400e; }
+
+/* ── Modal ─────────────────────────────────────────────────────────────────
+   Used by the ITT compose box. The panel scrolls internally rather than the
+   page, so a 60-clause email cannot push the Send button off screen. */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(17, 24, 39, 0.55);
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+}
+.modal {
+  background: #fff; border-radius: 10px; width: 100%; max-width: 780px;
+  max-height: 90vh; display: flex; flex-direction: column;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
+}
+.modal-header {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  padding: 16px 20px; border-bottom: 1px solid #e5e7eb;
+}
+.modal-header h3 { margin: 0; font-size: 1rem; }
+.modal-body { padding: 16px 20px; overflow-y: auto; }
+.modal-footer {
+  display: flex; align-items: center; justify-content: flex-end; gap: 10px;
+  padding: 14px 20px; border-top: 1px solid #e5e7eb;
+}
+.modal-close {
+  background: none; border: none; font-size: 1.4rem; line-height: 1;
+  color: #6b7280; cursor: pointer; padding: 0 4px;
+}
+.compose-field { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 10px; }
+.compose-field > label {
+  width: 62px; flex: none; padding-top: 7px;
+  font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.04em; color: #6b7280;
+}
+.compose-field > input, .compose-field > textarea { flex: 1; margin: 0; }
+.compose-preview {
+  width: 100%; height: 340px; border: 1px solid #e5e7eb; border-radius: 6px; background: #fff;
+}

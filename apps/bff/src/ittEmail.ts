@@ -17,11 +17,6 @@ export interface IttEmailRecipient {
   email: string;
 }
 
-export interface IttEmailDocumentLink {
-  displayName: string;
-  url: string;
-}
-
 /** A work package's own document pack — BuildFlow's per-WP zip. */
 export interface IttEmailBundle {
   url: string;
@@ -82,19 +77,18 @@ export interface IttEmailPack {
   /**
    * The specification documents this package's own lines were read from, by name.
    *
-   * Distinct from `documentLinks`, which is every tender document issued with the project.
-   * This says which of them the take-off actually measured against, and it is the one a
-   * tenderer pricing this trade opens first.
+   * Names, not links — which of the tender documents the take-off actually measured against,
+   * and the ones a tenderer pricing this trade opens first inside the document pack.
    */
   specDocuments: string[];
   /**
-   * The flat per-document link list, from BuildFlow's document-links contract.
+   * This package's document pack, as one zip.
    *
-   * A FALLBACK, not the primary route: it is every document in the project, unnarrowed, so
-   * it issues a flooring subcontractor the drainage sheets too. `bundle` supersedes it, and
-   * this is only printed for a take-off that has no bundle yet.
+   * THE ONLY DOCUMENT LINK AN ITT CARRIES. There was once a per-document fallback listing
+   * every file in the project, and on a real pack it printed 140 links — issuing a flooring
+   * subcontractor the drainage sheets and burying the ones that matter. A tenderer gets this
+   * zip or, failing that, the complete set; never a file-by-file index.
    */
-  documentLinks: IttEmailDocumentLink[];
   bundle: IttEmailBundle | null;
   attendanceSummary: { subcontractor: number; mainContractor: number; joint: number };
   valueEngineeringRequired: boolean;
@@ -144,9 +138,9 @@ export interface IttScopeSection {
  * in another's, and a bill referring to "item 29" has to mean the 29th line of the scope the
  * tenderer was actually sent.
  *
- * Exported because the scope-of-works PDF attachment must number identically to the email
- * body. Two implementations would drift, and the drift would be invisible until a
- * subcontractor priced against the wrong item number.
+ * Exported for the scope-of-works PDF, which is now the ONLY place the clauses are numbered:
+ * the email body carries a sentence pointing at the attachment rather than a second copy of
+ * it. The grouping and numbering live here because the types they read do.
  */
 export function groupScopeSections(scopeItems: IttEmailScopeItem[]): IttScopeSection[] {
   let scopeNumber = 0;
@@ -174,19 +168,8 @@ export const billRowsFor = (pack: IttEmailPack): string[][] =>
 const specRowsFor = (pack: IttEmailPack): string[][] =>
   pack.specClauses.map((c) => [c.geCode ?? '—', [c.elementCode, c.subElementCode].filter(Boolean).join(' / ') || '—', c.rawText]);
 
-/**
- * What the measured bill amounts to, and the no-rates statement.
- *
- * Split from `boqIntro` because the compose-link body (`renderIttComposeText`) says the same
- * thing WITHOUT the attachment sentence: a Gmail or Outlook Web compose URL cannot carry
- * files, and telling a tenderer a pricing schedule is attached when none is would send them
- * hunting for something that is not there.
- */
-const boqFigures = (pack: IttEmailPack): string =>
-  `${pack.boqSummary.total} measured lines attributed to this package (${pack.boqSummary.priceable} carrying a quantity), plus ${pack.boqSummary.authored} authored line${pack.boqSummary.authored === 1 ? '' : 's'}. Rates are not shown — please price independently.`;
-
 const boqIntro = (pack: IttEmailPack): string =>
-  `${boqFigures(pack)} A pricing schedule is attached for you to complete.`;
+  `${pack.boqSummary.total} measured lines attributed to this package (${pack.boqSummary.priceable} carrying a quantity), plus ${pack.boqSummary.authored} authored line${pack.boqSummary.authored === 1 ? '' : 's'}. Rates are not shown — please price independently. A pricing schedule is attached for you to complete.`;
 
 /** Stated identically in the text body, the HTML body and the compose-link body. */
 const VALUE_ENGINEERING_SENTENCE =
@@ -200,13 +183,42 @@ const attendanceSentence = (pack: IttEmailPack): string =>
 const bundleSentence = (bundle: IttEmailBundle): string =>
   `${bundle.documentCount} document${bundle.documentCount === 1 ? '' : 's'}${bundle.allSheetsFallback ? '. No drawing sheet was cited against this package, so the complete drawing set is included rather than a narrowed selection' : ''}`;
 
+/** The name of the file the scope of works travels as. Matches `ittAttachments.safeName`. */
+const scopePdfName = (pack: IttEmailPack): string =>
+  `Scope of Works - ${pack.packageName.replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim() || 'Package'}.pdf`;
+
+/**
+ * The scope of works, BY REFERENCE.
+ *
+ * The clauses themselves are NOT printed here. They run to 171 lines on a real package, and
+ * printing them below an attachment carrying the identical text gave a tenderer two copies of
+ * the same document and no way to know which one governed. The PDF is the issued document;
+ * this is the pointer to it.
+ */
+const scopeSentence = (pack: IttEmailPack): string => {
+  const count = pack.scopeItems.length;
+  return count === 0
+    ? 'No scope of works is configured for this package.'
+    : `${count} clause${count === 1 ? '' : 's'}, issued in full as the attached "${scopePdfName(pack)}". Price the works in accordance with it.`;
+};
+
+/**
+ * Where this package's documents are, in one link or one sentence.
+ *
+ * ONE ZIP OR A STATEMENT — never a file-by-file list. A tenderer needs the pack their trade was
+ * issued, and if that pack does not exist they need to be told so plainly and pointed at the
+ * complete set, not handed every document in the project to sort through themselves.
+ */
+const documentsSentence = (pack: IttEmailPack, completeBundleUrl: string | null): string => {
+  if (pack.bundle) return `Package document pack (${bundleSentence(pack.bundle)})`;
+  return completeBundleUrl
+    ? 'No document pack has been produced for this package. Refer to the complete tender document set below, which carries every document issued with this tender.'
+    : 'The tender documents for this package will be issued separately.';
+};
+
 const RULE = '='.repeat(78);
 
-const packageTextBlock = (pack: IttEmailPack): string => {
-  const scopeSections = groupScopeSections(pack.scopeItems);
-  const scopeText = scopeSections
-    .map((group) => `${group.section}\n${group.lines.map((l) => `  ${String(l.number).padStart(3)}  ${l.text}`).join('\n')}`)
-    .join('\n\n');
+const packageTextBlock = (pack: IttEmailPack, completeBundleUrl: string | null): string => {
   const boqRows = boqRowsFor(pack);
   const billRows = billRowsFor(pack);
   const specRows = specRowsFor(pack);
@@ -219,8 +231,8 @@ Route:   ${pack.routeOfProcurement ?? 'Not stated'}
 ${RULE}
 
 SCOPE OF WORKS
-${scopeSections.length > 0 ? scopeText : ' - No scope of works is configured for this package.'}
-${scopeSections.length > 0 ? '\nThe full scope of works is attached as a PDF.\n' : ''}
+${scopeSentence(pack)}
+
 BILL OF QUANTITIES
 ${boqIntro(pack)}
 
@@ -232,10 +244,8 @@ ${pack.specDocuments.map((d) => ` - ${d}`).join('\n')}
 
 ` : ''}DOCUMENTS FOR THIS PACKAGE
 ${pack.bundle
-  ? ` - Package document pack (${bundleSentence(pack.bundle)}): ${pack.bundle.url}`
-  : pack.documentLinks.length > 0
-    ? pack.documentLinks.map((d) => ` - ${d.displayName}: ${d.url}`).join('\n')
-    : ' - No documents are available to link at this time.'}
+  ? ` - ${documentsSentence(pack, completeBundleUrl)}: ${pack.bundle.url}`
+  : documentsSentence(pack, completeBundleUrl)}
 
 TENDER RETURN — a compliant submission must contain
 ${requiredForms.length > 0 ? requiredForms.map((f) => ` - ${f.name}${f.description ? ` — ${f.description}` : ''}`).join('\n') : ' - See attached return forms.'}
@@ -246,17 +256,7 @@ ${attendanceSentence(pack)}
 ${pack.valueEngineeringRequired ? `\nVALUE ENGINEERING\n${VALUE_ENGINEERING_SENTENCE}\n` : ''}`;
 };
 
-const packageHtmlBlock = (pack: IttEmailPack): string => {
-  const scopeSections = groupScopeSections(pack.scopeItems);
-  const scopeHtml = scopeSections.map((group) => `
-  <h4 style="font-size: 13px; margin: 14px 0 4px;">${esc(group.section)}</h4>
-  <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
-    <tbody>${group.lines.map((l) => `<tr>
-      <td style="width: 34px; vertical-align: top; padding: 2px 6px 2px 0; color: #888;">${l.number}</td>
-      <td style="vertical-align: top; padding: 2px 0;">${esc(l.text)}</td>
-    </tr>`).join('')}</tbody>
-  </table>`).join('');
-
+const packageHtmlBlock = (pack: IttEmailPack, completeBundleUrl: string | null): string => {
   const boqHtmlRows = boqRowsFor(pack).map((r) => r.map(esc));
   const billHtmlRows = billRowsFor(pack).map((r) => r.map(esc));
   const specHtmlRows = specRowsFor(pack).map((r) => r.map(esc));
@@ -269,9 +269,7 @@ const packageHtmlBlock = (pack: IttEmailPack): string => {
   <p style="color: #555; margin-top: 0; font-size: 13px;">Route: ${esc(pack.routeOfProcurement ?? 'Not stated')}</p>
 
   <h3 style="font-size: 15px;">Scope of works</h3>
-  ${scopeSections.length > 0
-    ? `${scopeHtml}<p style="font-size: 13px; color: #555;">The full scope of works is attached as a PDF.</p>`
-    : '<p>No scope of works is configured for this package.</p>'}
+  <p>${esc(scopeSentence(pack))}</p>
 
   <h3 style="font-size: 15px;">Bill of quantities</h3>
   <p>${esc(boqIntro(pack))}</p>
@@ -294,9 +292,7 @@ const packageHtmlBlock = (pack: IttEmailPack): string => {
   ${pack.bundle
     ? `<p><a href="${esc(pack.bundle.url)}"><strong>Download the ${esc(pack.packageName)} document pack</strong></a><br>
        <span style="color:#555; font-size: 13px;">${esc(bundleSentence(pack.bundle))}.</span></p>`
-    : pack.documentLinks.length > 0
-      ? `<ul>${pack.documentLinks.map((d) => `<li><a href="${esc(d.url)}">${esc(d.displayName)}</a></li>`).join('')}</ul>`
-      : '<p>No documents are available to link at this time.</p>'}
+    : `<p>${esc(documentsSentence(pack, completeBundleUrl))}</p>`}
 
   <h3 style="font-size: 15px;">Tender return — a compliant submission must contain</h3>
   ${requiredForms.length > 0
@@ -312,81 +308,6 @@ const packageHtmlBlock = (pack: IttEmailPack): string => {
   <p><strong>Mandatory.</strong> ${esc(VALUE_ENGINEERING_SENTENCE)}</p>` : ''}
   </div>`;
 };
-
-/**
- * The most a compose URL can carry.
- *
- * "Open draft Email" can hand the whole ITT to a desktop mail app as a .eml, but Gmail and
- * Outlook Web are reached by a link, and a link carries its body as a query parameter. The
- * full text body runs to tens of KB; Gmail truncates a URL long before that and the browser
- * may refuse it outright. So the web-mail route gets its own short covering note, capped
- * here, rather than a full body that would arrive mangled.
- */
-export const COMPOSE_BODY_MAX_CHARS = 1800;
-
-/**
- * A short covering note for one package, for the Gmail / Outlook Web compose links.
- *
- * NOT a shortened `text` body — a different document with a different job. It carries the two
- * document links and the figures, and says outright that the detail lives in the documents,
- * because that is all a compose link can honestly deliver: no attachments, no HTML.
- *
- * THE LINKS COME FIRST, immediately after the header. If the cap ever bites, it bites the
- * forms list and then the tail — never the two URLs, which are the only things in here a
- * tenderer cannot proceed without.
- */
-export function renderIttComposeText(pack: IttEmailPack, options: IttEmailOptions): string {
-  const { projectName, completeBundleUrl } = options;
-  const requiredForms = pack.returnForms.filter((f) => f.isRequired);
-
-  const documents = pack.bundle
-    ? `Documents for this package (${pack.bundle.documentCount} document${pack.bundle.documentCount === 1 ? '' : 's'}):\n  ${pack.bundle.url}`
-    // The flat per-document list is every document in the project and would exhaust the whole
-    // budget on its own, so it is not printed here. Saying the documents follow separately is
-    // true; listing forty URLs and then truncating them would not be.
-    : 'Documents for this package: to follow separately.';
-
-  const complete = completeBundleUrl
-    ? `\n\nComplete tender document set:\n  ${completeBundleUrl}`
-    : '';
-
-  const scope = pack.scopeItems.length > 0
-    ? `Scope of works: ${pack.scopeItems.length} clause${pack.scopeItems.length === 1 ? '' : 's'}, issued in full with the documents above.`
-    : 'Scope of works: none is configured for this package.';
-
-  const head = `INVITATION TO TENDER
-
-Project: ${projectName}
-Package: ${pack.packageName} (ref ${pack.displayRef})
-Route:   ${pack.routeOfProcurement ?? 'Not stated'}
-
-Dear Sir/Madam,
-
-You are invited to tender for the package above.
-
-${documents}${complete}
-
-${scope}
-Bill of quantities: ${boqFigures(pack)}
-`;
-
-  const tail = `${pack.valueEngineeringRequired ? `\n${VALUE_ENGINEERING_SENTENCE}\n` : ''}
-Please raise all technical and commercial queries in writing before the return date.
-`;
-
-  const fullForms = requiredForms.length > 0
-    ? `\nA compliant return must contain:\n${requiredForms.map((f) => ` - ${f.name}`).join('\n')}\n`
-    : '';
-  const shortForms = requiredForms.length > 0
-    ? `\nA compliant return must contain ${requiredForms.length} required form${requiredForms.length === 1 ? '' : 's'}, listed in the documents above.\n`
-    : '';
-
-  const assemble = (forms: string) => `${head}${forms}${tail}`;
-  let body = assemble(fullForms);
-  if (body.length > COMPOSE_BODY_MAX_CHARS) body = assemble(shortForms);
-  if (body.length > COMPOSE_BODY_MAX_CHARS) body = `${body.slice(0, COMPOSE_BODY_MAX_CHARS - 1).trimEnd()}…`;
-  return body;
-}
 
 export function renderIttEmail(
   packages: IttEmailPack[],
@@ -418,7 +339,7 @@ ${greeting}
 
 ${intro}
 
-${packages.map(packageTextBlock).join('\n')}
+${packages.map((p) => packageTextBlock(p, completeBundleUrl)).join('\n')}
 ${completeTextBlock}
 Please raise all technical and commercial queries in writing before the return date.
 `;
@@ -437,7 +358,7 @@ Please raise all technical and commercial queries in writing before the return d
 
   <p>${esc(intro)}</p>
 
-  ${packages.map(packageHtmlBlock).join('')}
+  ${packages.map((p) => packageHtmlBlock(p, completeBundleUrl)).join('')}
 
   ${completeBundleUrl ? `
   <div style="border-top: 3px solid #1a1a1a; margin-top: 28px; padding-top: 8px;">

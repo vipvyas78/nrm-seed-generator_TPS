@@ -11,7 +11,22 @@ export interface EmailAttachment {
 
 export interface SendEmailParams {
   from: string;
-  to: string;
+  /**
+   * One address, or several on one message.
+   *
+   * The automated sends address one firm at a time. The in-app compose box lets a person put
+   * several people on a single message deliberately, which is a different thing and their call
+   * to make — so both shapes are allowed.
+   */
+  to: string | string[];
+  cc?: string[];
+  /**
+   * Where a reply goes, when that should not be `from`.
+   *
+   * Every ITT is sent from the service address. A message a person composed and sent by hand
+   * should come back to that person, not to a shared mailbox nobody is watching.
+   */
+  replyTo?: string;
   subject: string;
   html: string;
   text: string;
@@ -27,7 +42,7 @@ export class EmailService {
     this.accountId = config.cloudflareAccountId;
   }
 
-  async send({ from, to, subject, html, text, attachments }: SendEmailParams) {
+  async send({ from, to, cc, replyTo, subject, html, text, attachments }: SendEmailParams) {
     return this.client.emailSending.send({
       account_id: this.accountId,
       from,
@@ -37,7 +52,9 @@ export class EmailService {
       text,
       // Omitted rather than sent empty: the API treats an absent field and an empty array
       // differently in its own validation, and a message with no attachments should look
-      // exactly as it did before attachments existed.
+      // exactly as it did before attachments existed. The same holds for cc and reply_to.
+      ...(cc && cc.length > 0 ? { cc } : {}),
+      ...(replyTo ? { reply_to: replyTo } : {}),
       ...(attachments && attachments.length > 0 ? { attachments } : {})
     });
   }
