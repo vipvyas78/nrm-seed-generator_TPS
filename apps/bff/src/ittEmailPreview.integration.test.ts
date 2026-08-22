@@ -47,7 +47,7 @@ describe('previewIttEmail', () => {
     const actor: Actor = { userId: 'itt-preview-test', organizationId: ORGANIZATION_ID, subject: 'itt-preview-test' };
 
     try {
-      const { subject, html, text } = await tpDb.previewIttEmail(actor, {
+      const { subject, html, text, attachments } = await tpDb.previewIttEmail(actor, {
         boqId: BOQ_ID, takeoffId: TAKEOFF_ID, packageName: PACKAGE_NAME
       });
 
@@ -57,11 +57,24 @@ describe('previewIttEmail', () => {
       // discloses a rate.
       expect(html.toLowerCase()).not.toMatch(/unit_rate|total_cost/);
 
+      // The two files a real send would carry, byte for byte — the scope of works and the
+      // blank pricing schedule.
+      expect(attachments.map((a) => a.contentType)).toEqual([
+        'application/pdf',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      ]);
+      expect(attachments[0].content.subarray(0, 5).toString()).toBe('%PDF-');
+
       mkdirSync(OUTPUT_DIR, { recursive: true });
-      const outFile = join(OUTPUT_DIR, `${PACKAGE_NAME.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.html`);
+      const slug = PACKAGE_NAME.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      const outFile = join(OUTPUT_DIR, `${slug}.html`);
       writeFileSync(outFile, html, 'utf-8');
       writeFileSync(outFile.replace(/\.html$/, '.txt'), text, 'utf-8');
+      for (const attachment of attachments) {
+        writeFileSync(join(OUTPUT_DIR, attachment.filename), attachment.content);
+      }
       console.log(`Wrote ITT email preview to ${outFile}`);
+      console.log(`Wrote ${attachments.length} attachments: ${attachments.map((a) => a.filename).join(', ')}`);
     } finally {
       await db.close();
     }

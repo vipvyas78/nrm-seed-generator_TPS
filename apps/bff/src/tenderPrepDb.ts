@@ -1,17 +1,30 @@
 import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
+import type { BuildflowBundle, BuildflowDocumentBundlesClient } from './buildflowDocumentBundlesClient.js';
 import type { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
 import type { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
 import type { Database, Row } from './db.js';
 import type { DocumentLinkProvider } from './documentLinkProvider.js';
-import type { EmailService } from './emailService.js';
+import type { EmailAttachment, EmailService } from './emailService.js';
 import { conflict, notFound } from './errors.js';
-import { renderIttEmail } from './ittEmail.js';
+import { ittAttachmentsFor, type IttAttachment } from './ittAttachments.js';
+import { renderIttEmail, type IttEmailDocumentLink, type IttEmailPack } from './ittEmail.js';
 import type { ScmsReadDatabase } from './scmsReadDb.js';
 import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js';
 import type { Actor } from './types.js';
 
 /** Every ITT email is sent from this address, regardless of who confirms it in the UI. */
 const ITT_FROM_ADDRESS = 'tenders@novamerx.ai';
+
+/**
+ * Total base64 attachment budget for one ITT email.
+ *
+ * A scope PDF and a pricing workbook run to tens of KB each, so even a firm invited to ten
+ * packages sits far under this — it exists so a pathological package (a bill of tens of
+ * thousands of lines) degrades to a link-only email instead of the provider rejecting the
+ * message outright. Base64 costs ~33% over raw bytes, and this is measured on the encoded
+ * string, which is what actually travels.
+ */
+const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;
 
 /**
  * The one-line "why was this firm suggested" shown beside each name at the tender launch
@@ -124,6 +137,9 @@ export class TenderPrepDatabase {
     private readonly buildflowLinks?: BuildflowDocumentLinksClient,
     // Optional: without one configured, ITT emails send without a specification clauses section.
     private readonly specClauses?: BuildflowSpecClauseClient,
+    // Optional: without one configured, ITT emails fall back to the flat per-document link
+    // list — every document in the project, unnarrowed — instead of a per-package zip.
+    private readonly bundles?: BuildflowDocumentBundlesClient,
     // Optional: without one configured, confirmAndSendItt records what it would have sent
     // instead of actually sending — see confirmAndSendItt.
     private readonly emailService?: EmailService,
@@ -161,7 +177,7 @@ export class TenderPrepDatabase {
    */
   async previewIttEmail(actor: Actor, input: {
     boqId: string; takeoffId: string; packageName: string;
-  }): Promise<{ subject: string; html: string; text: string }> {
+  }): Promise<{ subject: string; html: string; text: string; attachments: IttAttachment[] }> {
     const [pkg] = await this.db.query<Row>(
       `SELECT pc.* FROM package_config pc WHERE pc.organization_id = $1 AND pc.name = $2
         ORDER BY pc.project_id NULLS LAST LIMIT 1`,
@@ -194,10 +210,9 @@ export class TenderPrepDatabase {
       : [];
 
     const priceable = boqLines.filter((l) => l.is_priceable).length;
-    const emailPack = {
+    const emailPack: IttEmailPack = {
       packageName: pkg.name as string,
       displayRef: pkg.sub_seq == null ? String(pkg.seq) : `${pkg.seq}.${pkg.sub_seq}`,
-      projectName: 'the project',
       routeOfProcurement: (pkg.route_of_procurement as string | null) ?? null,
       returnForms: returnForms.map((f) => ({
         name: String(f.name), description: (f.description as string | null) ?? null, isRequired: Boolean(f.is_required)
@@ -222,6 +237,11 @@ export class TenderPrepDatabase {
       // show what would actually be sent, and this needs no workflow, only the session the
       // take-off's BoQ belongs to.
       specDocuments: previewSpecDocuments,
+      // A preview has no workflow, so it has no take-off release to read bundles from and no
+      // packageVersionId to resolve links against. The documents section renders its
+      // "nothing to link" branch rather than inventing a link that would not be sent.
+      documentLinks: [],
+      bundle: null,
       attendanceSummary: {
         subcontractor: attendances.filter((a) => a.owner === 'SC').length,
         mainContractor: attendances.filter((a) => a.owner === 'H').length,
@@ -230,7 +250,13 @@ export class TenderPrepDatabase {
       valueEngineeringRequired: true
     };
 
-    return renderIttEmail(emailPack, { name: null, email: '' }, []);
+    const projectName = 'the project';
+    return {
+      ...renderIttEmail([emailPack], { name: null, email: '' }, { projectName, completeBundleUrl: null }),
+      // The real attachments, byte for byte — so a preview can be opened and checked without
+      // anything being sent. Returned unencoded; only the send path base64s them.
+      attachments: await ittAttachmentsFor(emailPack, projectName)
+    };
   }
 
   /**
@@ -568,21 +594,22 @@ export class TenderPrepDatabase {
             AND NOT EXISTS (SELECT 1 FROM by_wp)
        ),
        trade AS (SELECT trade_code FROM by_wp UNION ALL SELECT trade_code FROM by_label)
-       SELECT i.id,
+       SELECT DISTINCT
+              i.id,
               i.description,
               i.procurement_stage,
-              i.applies_to_all_trades,
               s.section_code,
               s.label AS section,
-              s.sort_order AS section_sort
+              s.sort_order AS section_sort,
+              i.seq
          FROM tender_scope_items i
+         -- No trade, no scope: this inner join yields nothing when the package resolved to no
+         -- trade. Widening it to a LEFT JOIN would hand an unmapped package the whole library
+         -- and make an ITT with no scope of works look like a working one.
+         JOIN tender_scope_item_trades it ON it.item_id = i.id
+         JOIN trade t ON t.trade_code = it.trade_code
          JOIN tender_scope_sections s ON s.section_code = i.section_code
         WHERE i.is_active AND s.is_active
-          -- No trade, no scope. Without this an unmapped package would still collect every
-          -- applies_to_all_trades clause and look like a working ITT.
-          AND EXISTS (SELECT 1 FROM trade)
-          AND (i.applies_to_all_trades
-               OR EXISTS (SELECT 1 FROM trade t WHERE t.trade_code = ANY (i.trade_codes)))
         ORDER BY s.sort_order, i.seq`,
       [wpCode, pkg.name]
     );
@@ -1421,28 +1448,39 @@ export class TenderPrepDatabase {
   // ── Step 2: ITT Dispatch ──────────────────────────────────────────────────
 
   /**
-   * Sends the Invitation to Tender for one package to every subcontractor selected at the
-   * tender launch meeting, once the package itself is confirmed there. Replaces the old
-   * dispatchItt, which only stamped a timestamp — this builds the same content the "View
-   * ITT" preview shows (via getPackageItt), drops anything marked "Ignore for ITT", resolves
-   * document links and recipient emails, and actually sends.
+   * The per-work-package document zips BuildFlow built for this workflow's take-off.
    *
-   * A per-recipient failure — no email on file, BuildFlow unreachable for one firm, a
-   * Cloudflare error — never stops the others: every outcome is recorded on itt_dispatch and
-   * rolled up into the summary this returns. Re-running this (the button is re-clickable)
-   * resends to everyone currently selected; it does not skip firms already marked sent.
+   * Keyed on takeoffId, not packageVersionId: a take-off re-run mints a new takeoffId, so
+   * this can never hand out documents belonging to a superseded run. Fetched ONCE per send
+   * and passed down, because one call answers for every package in the workflow.
+   *
+   * Best-effort, like every other BuildFlow call here — an unconfigured client, an
+   * unreachable BuildFlow, or a take-off whose bundles have not been built yet all mean
+   * "no bundles this time", never a failed ITT.
    */
-  async confirmAndSendItt(actor: Actor, workflowId: string, packageName: string): Promise<Row> {
-    await this.assertWorkflowAccess(actor, workflowId);
-
-    const [shortlist] = await this.db.query<{ confirmed_at: string | null }>(
-      `SELECT confirmed_at FROM shortlists WHERE workflow_id = $1 AND package_name = $2`,
-      [workflowId, packageName]
+  private async bundlesForWorkflow(workflowId: string): Promise<BuildflowBundle[]> {
+    if (!this.bundles) return [];
+    const wf = await this.db.one<{ step_data: { takeoff?: { takeoffId?: string } } }>(
+      `SELECT step_data FROM workflows WHERE id = $1`, [workflowId]
     );
-    if (!shortlist?.confirmed_at) {
-      throw conflict('This package has not been confirmed at the Tender Launch Pack step yet.');
-    }
+    const takeoffId = wf.step_data?.takeoff?.takeoffId;
+    if (!takeoffId) return [];
+    return this.bundles.bundlesFor(takeoffId);
+  }
 
+  /**
+   * Turn one package's full ITT assembly into the shape the email renderer reads.
+   *
+   * Shared by both send paths — the per-package Confirm ITT button and the workflow-level
+   * per-subcontractor send — so the two can never disagree about what a package contains.
+   * Everything marked "Ignore for ITT" is dropped here, once.
+   */
+  private async assemblePackageForEmail(
+    actor: Actor,
+    workflowId: string,
+    packageName: string,
+    bundles: BuildflowBundle[]
+  ): Promise<{ emailPack: IttEmailPack; recipients: Row[]; projectName: string }> {
     const pack = await this.getPackageItt(actor, workflowId, packageName);
     const notIgnored = (items: Row[]) => items.filter((i) => i.ignored !== true);
 
@@ -1455,17 +1493,27 @@ export class TenderPrepDatabase {
     const ignoredDocIds = new Set(ignoredDocuments.map((d) => String(d.id)));
     const ignoredFilenames = new Set(ignoredDocuments.map((d) => String(d.filename)));
 
+    const takeoff = pack.takeoff as Record<string, unknown>;
+
+    // The package's own document zip. Matched on the wp_code the package was derived from;
+    // a legacy hand-loaded package carries none and simply gets no bundle, falling back to
+    // the flat link list below.
+    const wpCode = typeof pack.wp_code === 'string' ? pack.wp_code : null;
+    const packageBundle = wpCode ? bundles.find((b) => b.wpCode === wpCode) : undefined;
+
     // BuildFlow's document-links contract is keyed by packageVersionId, carried verbatim on
     // the workflow since the take-off completed. A workflow started by hand, or one where
     // BuildFlow can't be reached, sends without links rather than blocking the ITT.
-    const takeoff = pack.takeoff as Record<string, unknown>;
+    //
+    // Only fetched when there is no bundle: a bundle supersedes this list entirely, and
+    // fetching a list nothing will print is a wasted round trip per package.
     const packageVersionId = typeof takeoff?.packageVersionId === 'string' ? takeoff.packageVersionId : null;
-    const buildflowLinks = packageVersionId && this.buildflowLinks
-      ? await this.buildflowLinks.linksFor(packageVersionId)
-      : [];
-    const documentLinks = buildflowLinks
-      .filter((l) => !ignoredDocIds.has(l.fileId) && !ignoredFilenames.has(l.displayName))
-      .map((l) => ({ displayName: l.displayName, url: l.url }));
+    let documentLinks: IttEmailDocumentLink[] = [];
+    if (!packageBundle && packageVersionId && this.buildflowLinks) {
+      documentLinks = (await this.buildflowLinks.linksFor(packageVersionId))
+        .filter((l) => !ignoredDocIds.has(l.fileId) && !ignoredFilenames.has(l.displayName))
+        .map((l) => ({ displayName: l.displayName, url: l.url }));
+    }
 
     const priceable = boqLines.filter((l) => l.is_priceable).length;
 
@@ -1474,10 +1522,9 @@ export class TenderPrepDatabase {
     const chunkIds = [...new Set(boqLines.flatMap((l) => (l.spec_chunk_ids as string[] | null) ?? []))];
     const specClauses = this.specClauses ? await this.specClauses.clausesFor(chunkIds) : [];
 
-    const emailPack = {
+    const emailPack: IttEmailPack = {
       packageName: pack.package_name as string,
       displayRef: pack.display_ref as string,
-      projectName: (takeoff?.projectName as string | undefined) ?? 'the project',
       routeOfProcurement: (pack.route_of_procurement as string | null) ?? null,
       returnForms: returnForms.map((f) => ({
         name: String(f.name), description: (f.description as string | null) ?? null, isRequired: Boolean(f.is_required)
@@ -1507,6 +1554,14 @@ export class TenderPrepDatabase {
       specDocuments: ((pack.spec_documents as Row[]) ?? [])
         .filter((d) => d.ignored !== true)
         .map((d) => String(d.filename)),
+      documentLinks,
+      bundle: packageBundle
+        ? {
+            url: packageBundle.url,
+            documentCount: packageBundle.documentCount,
+            allSheetsFallback: packageBundle.allSheetsFallback
+          }
+        : null,
       attendanceSummary: {
         subcontractor: Number((pack.attendance_summary as Row).subcontractor ?? 0),
         mainContractor: Number((pack.attendance_summary as Row).main_contractor ?? 0),
@@ -1515,7 +1570,236 @@ export class TenderPrepDatabase {
       valueEngineeringRequired: Boolean(pack.value_engineering_required)
     };
 
-    const recipients = pack.recipients as Row[];
+    return {
+      emailPack,
+      recipients: pack.recipients as Row[],
+      projectName: (takeoff?.projectName as string | undefined) ?? 'the project'
+    };
+  }
+
+  /**
+   * The scope-of-works PDF and BoQ pricing schedule for each package on the message.
+   *
+   * Generated once per send, not once per recipient — the files are identical for every firm
+   * invited to the same package, and rebuilding them per recipient would be pure waste.
+   *
+   * Oversized sends drop their attachments rather than failing: the email still carries the
+   * inline tables and the document-pack links, which is far better than a provider rejecting
+   * the whole message and the subcontractor receiving nothing.
+   */
+  private async attachmentsFor(packs: IttEmailPack[], projectName: string): Promise<EmailAttachment[]> {
+    const built: EmailAttachment[] = [];
+    for (const pack of packs) {
+      for (const file of await ittAttachmentsFor(pack, projectName)) {
+        built.push({
+          content: file.content.toString('base64'),
+          filename: file.filename,
+          type: file.contentType,
+          disposition: 'attachment'
+        });
+      }
+    }
+    const totalBytes = built.reduce((sum, a) => sum + a.content.length, 0);
+    return totalBytes > MAX_ATTACHMENT_BYTES ? [] : built;
+  }
+
+  /**
+   * Send one Invitation to Tender per SUBCONTRACTOR, covering every confirmed package that
+   * firm was shortlisted against.
+   *
+   * The per-package Confirm ITT button sends one email per package, so a firm shortlisted
+   * against Flooring, Carpentry and Dry Lining receives three separate invitations naming
+   * three separate scopes. This sends one, listing all three — which is what a tenderer
+   * expects and what makes the "price each package separately" instruction legible.
+   *
+   * Grouping is only correct with every package in view at once, which is why this is a
+   * workflow-level action rather than something the per-package route could do: confirming
+   * Flooring cannot know whether Carpentry is about to be confirmed too.
+   *
+   * Only CONFIRMED packages are included — the same precondition confirmAndSendItt enforces
+   * per package, applied across the workflow. A firm whose packages are all still unconfirmed
+   * is not emailed at all rather than emailed a partial invitation.
+   *
+   * Audit rows keep their existing grain: itt_dispatch is one row per (package ×
+   * subcontractor), so an email covering three packages writes three rows sharing one
+   * email_message_id. A per-firm failure never stops the others.
+   */
+  async sendIttsForWorkflow(actor: Actor, workflowId: string): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+
+    const entries = await this.db.query<{
+      subcontractor_id: string; shortlist_entry_id: string; package_name: string;
+    }>(
+      `SELECT se.subcontractor_id, se.id AS shortlist_entry_id, sl.package_name
+         FROM shortlist_entries se
+         JOIN shortlists sl ON sl.id = se.shortlist_id
+        WHERE sl.workflow_id = $1
+          AND se.selected = TRUE
+          AND sl.confirmed_at IS NOT NULL
+          -- The launch table injects this sentinel for packages with no supply chain. It is
+          -- never selectable, so it should not reach here; excluded anyway rather than
+          -- risking an email addressed to a firm that does not exist.
+          AND se.subcontractor_id <> $2
+        ORDER BY se.subcontractor_id, sl.package_seq NULLS LAST, sl.package_name`,
+      [workflowId, PLACEHOLDER_SUBCONTRACTOR_ID]
+    );
+
+    if (entries.length === 0) {
+      throw conflict('No confirmed packages with selected subcontractors to send. Confirm the packages at the Tender Launch Pack step first.');
+    }
+
+    const bundles = await this.bundlesForWorkflow(workflowId);
+    const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
+
+    // One assembly per package, shared across every firm invited to it. getPackageItt is the
+    // expensive call in this flow and most packages have several recipients.
+    //
+    // A package that cannot be assembled — deactivated by a take-off rebuild, missing its
+    // configuration — is dropped rather than allowed to abort the send. One broken package
+    // out of forty must not stop the other thirty-nine going out, which is the same reason
+    // the send loop below isolates per-firm failures.
+    const assembled = new Map<string, { emailPack: IttEmailPack; projectName: string }>();
+    const unassembled: Array<{ packageName: string; error: string }> = [];
+    const requestedPackages = [...new Set(entries.map((e) => e.package_name))];
+    for (const name of requestedPackages) {
+      try {
+        const { emailPack, projectName } = await this.assemblePackageForEmail(actor, workflowId, name, bundles);
+        assembled.set(name, { emailPack, projectName });
+      } catch (error) {
+        unassembled.push({ packageName: name, error: error instanceof Error ? error.message : 'Could not assemble this package' });
+      }
+    }
+    if (assembled.size === 0) {
+      throw conflict(`No package could be assembled for sending. First error: ${unassembled[0]?.error ?? 'unknown'}`);
+    }
+    const packageNames = [...assembled.keys()];
+    const projectName = assembled.get(packageNames[0])!.projectName;
+
+    // Nothing stops a firm appearing twice on one package's shortlist, so dedupe by package.
+    // A firm left with no assembled package is simply not emailed — better than sending an
+    // invitation naming no scope at all.
+    const byFirm = new Map<string, Map<string, string>>();
+    for (const entry of entries) {
+      if (!assembled.has(entry.package_name)) continue;
+      const firm = String(entry.subcontractor_id);
+      if (!byFirm.has(firm)) byFirm.set(firm, new Map());
+      const packages = byFirm.get(firm)!;
+      if (!packages.has(entry.package_name)) packages.set(entry.package_name, String(entry.shortlist_entry_id));
+    }
+
+    const contacts = new Map(
+      (await this.scms.getContactsForSubcontractors([...byFirm.keys()]))
+        .map((c) => [String(c.subcontractor_id), c])
+    );
+
+    let sent = 0, failed = 0, skippedNoEmail = 0;
+    const detail: Array<{ subcontractorId: string; packages: string[]; status: string; error?: string }> = [];
+    const from = this.testEmailOverride?.from ?? ITT_FROM_ADDRESS;
+
+    for (const [subcontractorId, packages] of byFirm) {
+      const packageNamesForFirm = [...packages.keys()];
+      const entryIds = [...packages.values()];
+      const contact = contacts.get(subcontractorId);
+      const realEmail = contact?.contact_email ? String(contact.contact_email) : null;
+      const email = this.testEmailOverride?.to ?? realEmail;
+
+      const record = async (status: string, error: string | null, messageId: string | null) => {
+        for (const entryId of entryIds) {
+          await this.db.query(
+            `INSERT INTO itt_dispatch (shortlist_entry_id, dispatched_at, email_status, email_error, email_sent_at, email_message_id)
+             VALUES ($1, NOW(), $2, $3, CASE WHEN $2 = 'sent' THEN NOW() ELSE NULL END, $4)
+             ON CONFLICT (shortlist_entry_id) DO UPDATE
+               SET dispatched_at = NOW(), email_status = $2, email_error = $3,
+                   email_sent_at = CASE WHEN $2 = 'sent' THEN NOW() ELSE NULL END,
+                   email_message_id = $4`,
+            [entryId, status, error, messageId]
+          );
+        }
+      };
+
+      if (!email) {
+        skippedNoEmail += 1;
+        detail.push({ subcontractorId, packages: packageNamesForFirm, status: 'skipped_no_email' });
+        await record('skipped_no_email', null, null);
+        continue;
+      }
+
+      const packs = packageNamesForFirm.map((name) => assembled.get(name)!.emailPack);
+      const rendered = renderIttEmail(
+        packs,
+        { name: contact?.contact_name ? String(contact.contact_name) : null, email },
+        { projectName, completeBundleUrl }
+      );
+      const subject = this.testEmailOverride
+        ? `[TEST → ${contact?.contact_name ? String(contact.contact_name) : 'unknown'} <${realEmail ?? 'no email on file'}>] ${rendered.subject}`
+        : rendered.subject;
+
+      try {
+        if (!this.emailService) throw new Error('EmailService not configured in this environment');
+        const attachments = await this.attachmentsFor(packs, projectName);
+        const result = await this.emailService.send({
+          from, to: email, subject, html: rendered.html, text: rendered.text, attachments
+        });
+        const messageId = (result as { message_id?: string } | null)?.message_id ?? null;
+        await record('sent', null, messageId);
+        sent += 1;
+        detail.push({ subcontractorId, packages: packageNamesForFirm, status: 'sent' });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error sending email';
+        await record('failed', message, null);
+        failed += 1;
+        detail.push({ subcontractorId, packages: packageNamesForFirm, status: 'failed', error: message });
+      }
+    }
+
+    return {
+      packages: packageNames.length,
+      subcontractors: byFirm.size,
+      sent,
+      failed,
+      skipped_no_email: skippedNoEmail,
+      // Named rather than silently absent: a package that dropped out here was shortlisted
+      // and confirmed, so somebody expects it to have gone out.
+      unassembled_packages: unassembled,
+      recipients: detail
+    };
+  }
+
+  /**
+   * Sends the Invitation to Tender for one package to every subcontractor selected at the
+   * tender launch meeting, once the package itself is confirmed there. Replaces the old
+   * dispatchItt, which only stamped a timestamp — this builds the same content the "View
+   * ITT" preview shows (via getPackageItt), drops anything marked "Ignore for ITT", resolves
+   * document links and recipient emails, and actually sends.
+   *
+   * A per-recipient failure — no email on file, BuildFlow unreachable for one firm, a
+   * Cloudflare error — never stops the others: every outcome is recorded on itt_dispatch and
+   * rolled up into the summary this returns. Re-running this (the button is re-clickable)
+   * resends to everyone currently selected; it does not skip firms already marked sent.
+   *
+   * ONE PACKAGE PER EMAIL. A firm shortlisted against three packages receives three separate
+   * invitations from this route — see sendIttsForWorkflow for the per-subcontractor send that
+   * covers all of a firm's packages in one message. Both build their content the same way,
+   * through assemblePackageForEmail, so the two can never describe a package differently.
+   */
+  async confirmAndSendItt(actor: Actor, workflowId: string, packageName: string): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+
+    const [shortlist] = await this.db.query<{ confirmed_at: string | null }>(
+      `SELECT confirmed_at FROM shortlists WHERE workflow_id = $1 AND package_name = $2`,
+      [workflowId, packageName]
+    );
+    if (!shortlist?.confirmed_at) {
+      throw conflict('This package has not been confirmed at the Tender Launch Pack step yet.');
+    }
+
+    const bundles = await this.bundlesForWorkflow(workflowId);
+    const assembled = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles);
+    const { emailPack, projectName } = assembled;
+    const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
+    const attachments = await this.attachmentsFor([emailPack], projectName);
+
+    const recipients = assembled.recipients;
     const subcontractorIds = recipients.map((r) => String(r.subcontractor_id));
     const contacts = new Map(
       (await this.scms.getContactsForSubcontractors(subcontractorIds))
@@ -1550,9 +1834,9 @@ export class TenderPrepDatabase {
       }
 
       const rendered = renderIttEmail(
-        emailPack,
+        [emailPack],
         { name: contact?.contact_name ? String(contact.contact_name) : null, email },
-        documentLinks
+        { projectName, completeBundleUrl }
       );
       // Keeps test-inbox messages distinguishable across packages/recipients when every
       // send lands in the same TEST_TO_EMAIL_ACCOUNT.
@@ -1563,7 +1847,7 @@ export class TenderPrepDatabase {
 
       try {
         if (this.emailService) {
-          const result = await this.emailService.send({ from, to: email, subject, html, text });
+          const result = await this.emailService.send({ from, to: email, subject, html, text, attachments });
           const messageId = (result as { message_id?: string } | null)?.message_id ?? null;
           await this.db.query(
             `INSERT INTO itt_dispatch (shortlist_entry_id, dispatched_at, email_status, email_sent_at, email_message_id, email_error)
@@ -1626,11 +1910,11 @@ export class TenderPrepDatabase {
   async listIttDispatch(actor: Actor, workflowId: string): Promise<Row[]> {
     await this.assertWorkflowAccess(actor, workflowId);
     return this.db.query(
-      `SELECT d.*, se.rank, se.subcontractor_id, sl.trade_category
+      `SELECT d.*, se.rank, se.subcontractor_id, sl.package_name
        FROM itt_dispatch d
        JOIN shortlist_entries se ON se.id = d.shortlist_entry_id
        JOIN shortlists sl ON sl.id = se.shortlist_id
-       WHERE sl.workflow_id = $1 ORDER BY sl.trade_category, se.rank`,
+       WHERE sl.workflow_id = $1 ORDER BY sl.package_name, se.rank`,
       [workflowId]
     );
   }

@@ -6,6 +6,7 @@ import type { Config } from './config.js';
 import { Database } from './db.js';
 import { AppError } from './errors.js';
 import { BoqReadDatabase } from './boqReadDb.js';
+import { BuildflowDocumentBundlesClient } from './buildflowDocumentBundlesClient.js';
 import { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
 import { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
 import { DropboxDocumentLinkProvider } from './documentLinkProvider.js';
@@ -47,13 +48,16 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const specClauses = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
     ? new BuildflowSpecClauseClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
     : undefined;
+  const documentBundles = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
+    ? new BuildflowDocumentBundlesClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
+    : undefined;
   const emailService = config.CLOUDFLARE_ACCOUNT_ID && config.CLOUDFLARE_EMAIL_TOKEN
     ? new EmailService({ cloudflareAccountId: config.CLOUDFLARE_ACCOUNT_ID, cloudflareApiToken: config.CLOUDFLARE_EMAIL_TOKEN })
     : undefined;
   const testEmailOverride = config.TEST_EMAIL_FLAG
     ? { from: config.TEST_FROM_EMAIL_ACCOUNT!, to: config.TEST_TO_EMAIL_ACCOUNT! }
     : null;
-  const tpDb = new TenderPrepDatabase(db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, emailService, testEmailOverride);
+  const tpDb = new TenderPrepDatabase(db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, documentBundles, emailService, testEmailOverride);
 
   app.decorate('tps', { config, db, tpDb, scmsDb });
   await app.register(cors, { origin: config.WEB_ORIGIN, credentials: false });
@@ -341,6 +345,15 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     protectedApi.post('/api/tender-prep/:workflowId/itts/:packageName/confirm', async (request) => {
       const { workflowId, packageName } = params(request, z.object({ workflowId: uuid, packageName: z.string().trim().min(1).max(200) }));
       return tpDb.confirmAndSendItt(requireActor(request), workflowId, packageName);
+    });
+
+    // Sends ONE ITT per subcontractor, covering every confirmed package that firm was
+    // shortlisted against, rather than one email per package. Declared before the
+    // :packageName route reads as a package named "send-all" — it is a different arity, so
+    // there is no conflict, but keeping them adjacent makes that obvious.
+    protectedApi.post('/api/tender-prep/:workflowId/itts/send-all', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.sendIttsForWorkflow(requireActor(request), workflowId);
     });
 
     protectedApi.patch('/api/tender-prep/itt/:dispatchId', async (request) => {

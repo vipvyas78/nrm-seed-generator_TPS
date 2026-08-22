@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Fragment, FormEvent, useState } from 'react';
 import { Outlet, useNavigate, useParams } from 'react-router-dom';
-import { api, type ConfirmIttResult, type IttDispatch, type IttLineSection, type IttPack, type LaunchTableRow, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
+import { api, type ConfirmIttResult, type IttDispatch, type IttLineSection, type IttPack, type LaunchTableRow, type SendAllIttsResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
 import { oidc, signIn } from './auth';
 
 function ErrorMessage({ error }: { error: unknown }) {
@@ -724,6 +724,7 @@ function IttPackView({ pack, workflowId, packageName }: { pack: IttPack; workflo
 function Step2IttDispatch({ workflowId }: { workflowId: string }) {
   const [open, setOpen] = useState<string | null>(null);
   const [lastResult, setLastResult] = useState<ConfirmIttResult | null>(null);
+  const [sendAllResult, setSendAllResult] = useState<SendAllIttsResult | null>(null);
   const queryClient = useQueryClient();
   const itts = useQuery({ queryKey: ['itts', workflowId], queryFn: () => api.listItts(workflowId) });
   const pack = useQuery({
@@ -738,10 +739,19 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
       void queryClient.invalidateQueries({ queryKey: ['itts', workflowId] });
     }
   });
+  const sendAll = useMutation({
+    mutationFn: () => api.sendAllItts(workflowId),
+    onSuccess: (result) => {
+      setSendAllResult(result);
+      setLastResult(null);
+      void queryClient.invalidateQueries({ queryKey: ['itts', workflowId] });
+    }
+  });
 
   if (itts.isLoading) return <Busy />;
   if (itts.error) return <ErrorMessage error={itts.error} />;
   const rows = itts.data ?? [];
+  const confirmedPackages = rows.filter((r) => r.confirmed_at && Number(r.recipients) > 0).length;
 
   if (rows.length === 0) {
     return <div className="panel">
@@ -762,8 +772,42 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
     <p className="muted" style={{ marginBottom: 12 }}>
       Built from the live take-off, package configuration and document set. Review below —
       untick anything that should not go out under "Ignore for ITT" — then confirm to email
-      the selected subcontractors.
+      the selected subcontractors. Each email carries the scope of works as a PDF, a blank
+      pricing schedule, and a link to that firm's document pack.
     </p>
+
+    <div className="alert" style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+      <div style={{ flex: 1, minWidth: 260 }}>
+        <strong>Send one ITT per subcontractor</strong>
+        <div className="tiny muted">
+          {confirmedPackages === 0
+            ? 'No packages are confirmed yet — confirm them at the Tender Launch Pack step first.'
+            : `A firm invited to several of the ${confirmedPackages} confirmed package${confirmedPackages === 1 ? '' : 's'} receives a single email covering all of them, rather than one per package.`}
+        </div>
+      </div>
+      <button className="small" disabled={confirmedPackages === 0 || sendAll.isPending} onClick={() => sendAll.mutate()}>
+        {sendAll.isPending ? 'Sending…' : 'Send all ITTs'}
+      </button>
+    </div>
+
+    {sendAll.error && <ErrorMessage error={sendAll.error} />}
+
+    {sendAllResult && <div className={`alert ${sendAllResult.failed > 0 ? 'alert-red' : 'alert-green'}`} style={{ marginBottom: 12 }}>
+      <div>
+        Sent {sendAllResult.sent} email{sendAllResult.sent === 1 ? '' : 's'} to {sendAllResult.subcontractors} subcontractor
+        {sendAllResult.subcontractors === 1 ? '' : 's'} across {sendAllResult.packages} package
+        {sendAllResult.packages === 1 ? '' : 's'} — failed {sendAllResult.failed}, no email on file {sendAllResult.skipped_no_email}.
+      </div>
+      {sendAllResult.unassembled_packages.length > 0 && <div className="tiny" style={{ marginTop: 6 }}>
+        Not sent — could not be built: {sendAllResult.unassembled_packages.map((p) => p.packageName).join(', ')}.
+      </div>}
+      <ul className="tiny" style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+        {sendAllResult.recipients.map((r) => <li key={r.subcontractorId}>
+          {r.status === 'sent' ? '✓' : '✗'} {r.packages.join(', ')}
+          {r.status !== 'sent' && ` — ${r.error ?? r.status.replace(/_/g, ' ')}`}
+        </li>)}
+      </ul>
+    </div>}
     <div className="table-scroll">
       <table className="data-table">
         <thead><tr><th>#</th><th>Package</th><th>Route of Procurement</th><th>Recipients</th><th>Status</th><th></th><th></th></tr></thead>

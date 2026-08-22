@@ -234,6 +234,26 @@ export type ConfirmIttResult = {
   recipients: Array<{ subcontractorId: string; status: 'sent' | 'failed' | 'skipped_no_email'; error?: string }>;
 };
 
+/**
+ * One email per SUBCONTRACTOR, covering every confirmed package that firm was shortlisted
+ * against — so each recipient row names the packages its single email carried.
+ */
+export type SendAllIttsResult = {
+  packages: number;
+  subcontractors: number;
+  sent: number;
+  failed: number;
+  skipped_no_email: number;
+  /** Confirmed packages that could not be built, and so went to nobody. */
+  unassembled_packages: Array<{ packageName: string; error: string }>;
+  recipients: Array<{
+    subcontractorId: string;
+    packages: string[];
+    status: 'sent' | 'failed' | 'skipped_no_email';
+    error?: string;
+  }>;
+};
+
 export type IttDispatch = {
   id: string;
   shortlist_entry_id: string;
@@ -344,6 +364,8 @@ export const api = {
     }),
   confirmItt: (workflowId: string, packageName: string) =>
     request<ConfirmIttResult>(`/api/tender-prep/${workflowId}/itts/${encodeURIComponent(packageName)}/confirm`, { method: 'POST' }),
+  sendAllItts: (workflowId: string) =>
+    request<SendAllIttsResult>(`/api/tender-prep/${workflowId}/itts/send-all`, { method: 'POST' }),
   recordIttResponse: (dispatchId: string, response: IttDispatch['response']) =>
     request<IttDispatch>(`/api/tender-prep/itt/${dispatchId}`, { method: 'PATCH', body: JSON.stringify({ response }) }),
 
