@@ -849,6 +849,20 @@ function IttComposeModal({ workflowId, packageName, onClose, onSent }: {
                 : 'The email says the documents will be issued separately, because neither a package pack nor a complete set has been built. Re-release the take-off first if the tenderer should receive documents with this invitation.'}
             </div>}
 
+            {/* The preview below is sandboxed (no allow-downloads), so its embedded "Download…"
+                link cannot be clicked from inside the frame. Offer a working one here instead. */}
+            {draft.data.bundleUrl
+              ? <p style={{ margin: '0 0 10px' }}>
+                  <a href={draft.data.bundleUrl} target="_blank" rel="noreferrer" className="button-link">
+                    Download the {packageName} document pack →
+                  </a>
+                </p>
+              : draft.data.completeBundleUrl && <p style={{ margin: '0 0 10px' }}>
+                  <a href={draft.data.completeBundleUrl} target="_blank" rel="noreferrer" className="button-link">
+                    Download the complete tender document set →
+                  </a>
+                </p>}
+
             {/* Sandboxed: the ITT carries its own inline styles and must neither inherit the
                 app's nor leak into it. srcDoc keeps it entirely local — nothing is fetched. */}
             <iframe
