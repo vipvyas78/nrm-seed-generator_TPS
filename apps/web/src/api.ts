@@ -297,6 +297,19 @@ export type SendIttDraftResult = {
   email_message_id: string | null;
 };
 
+export type IttLetterDetails = {
+  workflow_id: string;
+  site_address: string | null;
+  tender_return_deadline: string | null;
+  clarifications_close_date: string | null;
+  site_visit_permitted: boolean | null;
+  estimator_name: string | null;
+  estimator_email: string | null;
+};
+export type IttLetterDetailsInput = {
+  siteAddress?: string | null; tenderReturnDeadline?: string | null; clarificationsCloseDate?: string | null;
+  siteVisitPermitted?: boolean | null; estimatorName?: string | null; estimatorEmail?: string | null;
+};
 export type IttDispatch = {
   id: string;
   shortlist_entry_id: string;
@@ -418,6 +431,10 @@ export const api = {
     }),
   recordIttResponse: (dispatchId: string, response: IttDispatch['response']) =>
     request<IttDispatch>(`/api/tender-prep/itt/${dispatchId}`, { method: 'PATCH', body: JSON.stringify({ response }) }),
+  getIttLetterDetails: (workflowId: string) =>
+    request<IttLetterDetails>(`/api/tender-prep/${workflowId}/itt-letter-details`),
+  saveIttLetterDetails: (workflowId: string, input: IttLetterDetailsInput) =>
+    request<IttLetterDetails>(`/api/tender-prep/${workflowId}/itt-letter-details`, { method: 'PUT', body: JSON.stringify(input) }),
 
   // Step 3: Comparative
   listComparative: (workflowId: string) => request<TenderComparative[]>(`/api/tender-prep/${workflowId}/comparative`),

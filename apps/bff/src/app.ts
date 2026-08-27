@@ -213,6 +213,34 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       return tpDb.replaceReturnForms(requireActor(request), forms);
     });
 
+    // Per-tender cover-letter facts nothing else models: site address, deadlines,
+    // the estimator. GET pre-fills estimator name/email from the confirming actor's
+    // own account when no row has been saved yet.
+    protectedApi.get('/api/tender-prep/:workflowId/itt-letter-details', async (request) => {
+      const actor = requireActor(request);
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const saved = await tpDb.getIttLetterDetails(actor, workflowId);
+      return saved ?? {
+        workflow_id: workflowId, site_address: null, tender_return_deadline: null,
+        clarifications_close_date: null, site_visit_permitted: null,
+        estimator_name: actor.displayName ?? null, estimator_email: actor.email ?? null
+      };
+    });
+
+    protectedApi.put('/api/tender-prep/:workflowId/itt-letter-details', async (request) => {
+      const actor = requireActor(request);
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const input = body(request, z.object({
+        siteAddress: z.string().trim().max(500).nullish(),
+        tenderReturnDeadline: z.string().trim().max(20).nullish(),
+        clarificationsCloseDate: z.string().trim().max(20).nullish(),
+        siteVisitPermitted: z.boolean().nullish(),
+        estimatorName: z.string().trim().max(200).nullish(),
+        estimatorEmail: z.string().trim().max(320).nullish()
+      }));
+      return tpDb.saveIttLetterDetails(actor, workflowId, input);
+    });
+
     protectedApi.get('/api/tender-prep/config/scope-coverage', async (request) =>
       tpDb.scopeTradeCoverage(requireActor(request)));
 

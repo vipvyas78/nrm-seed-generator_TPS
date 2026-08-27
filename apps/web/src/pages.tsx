@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Fragment, FormEvent, useEffect, useState } from 'react';
-import { Outlet, useNavigate, useParams } from 'react-router-dom';
-import { api, type ConfirmIttResult, type IttDispatch, type IttLineSection, type IttPack, type LaunchTableRow, type SendAllIttsResult, type SendIttDraftResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
+import { Link, Outlet, useNavigate, useParams } from 'react-router-dom';
+import { api, type ConfirmIttResult, type IttDispatch, type IttLetterDetailsInput, type IttLineSection, type IttPack, type LaunchTableRow, type SendAllIttsResult, type SendIttDraftResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
 import { oidc, signIn } from './auth';
 
 function ErrorMessage({ error }: { error: unknown }) {
@@ -60,7 +60,7 @@ export function PackagesListPage() {
             <td>{takeoff?.packageName ?? wf.package_id}</td>
             <td>Step {wf.current_step}: {STEP_TITLES[wf.current_step - 1]}</td>
             <td>{new Date(wf.updated_at).toLocaleString()}</td>
-            <td><a className="button-link" href={`/packages/${wf.package_id}/tender-prep`}>Open →</a></td>
+            <td><Link className="button-link" to={`/packages/${wf.package_id}/tender-prep`}>Open →</Link></td>
           </tr>;
         })}
       </tbody>
@@ -893,6 +893,72 @@ function IttComposeModal({ workflowId, packageName, onClose, onSent }: {
   </div>;
 }
 
+/**
+ * Site address, deadlines, site-visit and the estimator's own details — the facts
+ * the cover letter and Form 1A need that nothing else in the workflow captures.
+ * Estimator name/email arrive pre-filled from the confirming user's own account
+ * (server-side default) and are editable here before the first ITT goes out.
+ */
+function IttLetterDetailsPanel({ workflowId }: { workflowId: string }) {
+  const queryClient = useQueryClient();
+  const details = useQuery({ queryKey: ['itt-letter-details', workflowId], queryFn: () => api.getIttLetterDetails(workflowId) });
+  const [draft, setDraft] = useState<IttLetterDetailsInput | null>(null);
+  const current: IttLetterDetailsInput = draft ?? {
+    siteAddress: details.data?.site_address ?? '',
+    tenderReturnDeadline: details.data?.tender_return_deadline ?? '',
+    clarificationsCloseDate: details.data?.clarifications_close_date ?? '',
+    siteVisitPermitted: details.data?.site_visit_permitted ?? null,
+    estimatorName: details.data?.estimator_name ?? '',
+    estimatorEmail: details.data?.estimator_email ?? ''
+  };
+  const save = useMutation({
+    mutationFn: () => api.saveIttLetterDetails(workflowId, current),
+    onSuccess: () => { setDraft(null); void queryClient.invalidateQueries({ queryKey: ['itt-letter-details', workflowId] }); }
+  });
+
+  if (details.isLoading) return null;
+
+  return <details className="panel" style={{ marginBottom: 12 }}>
+    <summary style={{ cursor: 'pointer', fontWeight: 600 }}>ITT letter details</summary>
+    <p className="muted tiny">Used on the cover letter and Form 1A — site address, return deadline and who to contact.</p>
+    <div className="stack" style={{ marginTop: 8 }}>
+      <label className="field"><span>Site address</span>
+        <input value={current.siteAddress ?? ''} onChange={(e) => setDraft({ ...current, siteAddress: e.target.value })} />
+      </label>
+      <div className="two-column">
+        <label className="field"><span>Tender return deadline</span>
+          <input type="date" value={current.tenderReturnDeadline ?? ''} onChange={(e) => setDraft({ ...current, tenderReturnDeadline: e.target.value })} />
+        </label>
+        <label className="field"><span>Clarifications close</span>
+          <input type="date" value={current.clarificationsCloseDate ?? ''} onChange={(e) => setDraft({ ...current, clarificationsCloseDate: e.target.value })} />
+        </label>
+      </div>
+      <label className="field"><span>Site visit permitted</span>
+        <select value={current.siteVisitPermitted === null || current.siteVisitPermitted === undefined ? '' : String(current.siteVisitPermitted)}
+          onChange={(e) => setDraft({ ...current, siteVisitPermitted: e.target.value === '' ? null : e.target.value === 'true' })}>
+          <option value="">Not stated</option>
+          <option value="true">Yes</option>
+          <option value="false">No</option>
+        </select>
+      </label>
+      <div className="two-column">
+        <label className="field"><span>Estimator name</span>
+          <input value={current.estimatorName ?? ''} onChange={(e) => setDraft({ ...current, estimatorName: e.target.value })} />
+        </label>
+        <label className="field"><span>Estimator email</span>
+          <input value={current.estimatorEmail ?? ''} onChange={(e) => setDraft({ ...current, estimatorEmail: e.target.value })} />
+        </label>
+      </div>
+      <div>
+        <button type="button" disabled={save.isPending} onClick={() => save.mutate()}>
+          {save.isPending ? 'Saving…' : 'Save'}
+        </button>
+        {save.isError && <span className="tiny" style={{ color: '#c0392b', marginLeft: 8 }}>{(save.error as Error).message}</span>}
+      </div>
+    </div>
+  </details>;
+}
+
 function Step2IttDispatch({ workflowId }: { workflowId: string }) {
   const [open, setOpen] = useState<string | null>(null);
   const [draftOpen, setDraftOpen] = useState<string | null>(null);
@@ -938,6 +1004,7 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
   }
 
   return <div className="panel">
+    <IttLetterDetailsPanel workflowId={workflowId} />
     <div className="shortlist-header">
       <h3>Invitations to Tender</h3>
       <span className="muted">{rows.length} package{rows.length === 1 ? '' : 's'} · {rows.reduce((n, r) => n + Number(r.recipients), 0)} recipients</span>
@@ -945,8 +1012,10 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
     <p className="muted" style={{ marginBottom: 12 }}>
       Built from the live take-off, package configuration and document set. Review below —
       untick anything that should not go out under "Ignore for ITT" — then confirm to email
-      the selected subcontractors. Each email carries the scope of works as a PDF, a blank
-      pricing schedule, and a link to that firm's document pack.
+      the selected subcontractors. Each email is a cover letter addressed to that firm, with the
+      configured attachments for its trade — forms, scope of works, schedule of attendances and
+      a blank pricing schedule — plus a link to that firm's document pack. Which attachments a
+      trade receives, and their wording, is set in Configuration → ITT attachment templates.
     </p>
 
     <div className="alert" style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>

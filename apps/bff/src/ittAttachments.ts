@@ -22,12 +22,26 @@ import {
   groupScopeSections,
   type IttEmailPack
 } from './ittEmail.js';
+import { renderBlocksToPdf, resolveTokens, type Block, type RenderContext } from './blockPdfRenderer.js';
 
 export interface IttAttachment {
   filename: string;
   contentType: string;
   content: Buffer;
 }
+
+/** A resolved (org-override-or-global) itt_attachment_templates row — read by
+ * tenderPrepDb.ts, handed in here as plain data so this file stays a pure function
+ * of its inputs, same as scopeOfWorksPdf/boqPricingWorkbook always have been. */
+export interface ResolvedAttachmentTemplate {
+  attachmentCode: string;
+  filenamePattern: string;
+  blocks: Block[];
+}
+
+export type AttendanceRow = { groupName: string; description: string; owner: 'SC' | 'H' | 'J' | 'N/A'; notes: string | null };
+
+const OWNER_LABEL: Record<AttendanceRow['owner'], string> = { SC: 'SC', H: 'MC', J: 'J', 'N/A': 'N/A' };
 
 export const XLSX_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 export const PDF_CONTENT_TYPE = 'application/pdf';
@@ -206,10 +220,110 @@ export async function boqPricingWorkbook(pack: IttEmailPack, projectName: string
   };
 }
 
-/** Both attachments for one package, in the order they should appear on the message. */
-export async function ittAttachmentsFor(pack: IttEmailPack, projectName: string): Promise<IttAttachment[]> {
-  return [
-    await scopeOfWorksPdf(pack, projectName),
-    await boqPricingWorkbook(pack, projectName)
-  ];
+/** Renders one 'blocks'-kind attachment (cover letter, Form 1A/1B/1C, …) from its
+ * resolved template — the same renderer the Configuration → ITT Templates preview
+ * endpoint in the parent repo uses, so a preview can never disagree with a real send. */
+async function blocksAttachmentPdf(template: ResolvedAttachmentTemplate, context: RenderContext): Promise<IttAttachment> {
+  const content = await renderBlocksToPdf(template.blocks, context);
+  return {
+    filename: resolveTokens(template.filenamePattern, context),
+    contentType: PDF_CONTENT_TYPE,
+    content
+  };
+}
+
+/**
+ * The Schedule of Attendances as a PDF: the template row's blocks (title/intro,
+ * editable in Configuration) followed by the actual attendance_items table, which is
+ * real project data and NOT editable as a template. Owner is mapped H -> "MC" for
+ * display — the reference document's own label; the DB code is the client's ('SC',
+ * 'H', 'J', 'N/A' — see tps.attendance_items).
+ */
+export async function scheduleOfAttendancesPdf(
+  template: ResolvedAttachmentTemplate | null,
+  context: RenderContext,
+  attendanceItems: AttendanceRow[]
+): Promise<IttAttachment> {
+  const doc = new PDFDocument({ size: 'A4', margin: 56, bufferPages: true });
+  const chunks: Buffer[] = [];
+  doc.on('data', (c: Buffer) => chunks.push(c));
+  const done = new Promise<void>((resolve) => doc.on('end', () => resolve()));
+
+  if (template) {
+    // Reuses the shared block renderer for just the title/intro portion by drawing
+    // into the same document — renderBlocksToPdf owns its own PDFDocument, so the
+    // intro is rendered separately and its bytes are not reused here; instead the
+    // title/intro blocks are walked with the same primitives inline, kept simple
+    // since they are almost always a couple of text/heading blocks.
+    for (const block of template.blocks) {
+      if (block.type === 'heading') {
+        doc.font('Helvetica-Bold').fontSize(block.level === 1 ? 20 : block.level === 2 ? 16 : 13)
+          .text(resolveTokens(block.text, context));
+        doc.moveDown(0.4);
+      } else if (block.type === 'text') {
+        doc.font('Helvetica').fontSize(10).text(resolveTokens(block.text, context));
+        doc.moveDown(0.5);
+      }
+    }
+  }
+  doc.moveDown(0.3);
+
+  let currentGroup: string | null = null;
+  const colWidths = { group: 90, description: 300, owner: 40, notes: 100 };
+  for (const item of attendanceItems) {
+    if (item.groupName !== currentGroup) {
+      currentGroup = item.groupName;
+      doc.moveDown(0.4);
+      doc.font('Helvetica-Bold').fontSize(10).text(currentGroup);
+      doc.moveDown(0.1);
+    }
+    const top = doc.y;
+    const left = doc.page.margins.left;
+    doc.font('Helvetica').fontSize(9)
+      .text(item.description, left, top, { width: colWidths.description });
+    const afterDesc = doc.y;
+    doc.font('Helvetica-Bold').text(OWNER_LABEL[item.owner], left + colWidths.description + 8, top, { width: colWidths.owner });
+    if (item.notes) doc.font('Helvetica-Oblique').fontSize(8)
+      .text(item.notes, left + colWidths.description + colWidths.owner + 16, top, { width: colWidths.notes });
+    doc.y = Math.max(doc.y, afterDesc);
+    doc.moveDown(0.25);
+  }
+
+  doc.end();
+  await done;
+
+  return {
+    filename: template ? resolveTokens(template.filenamePattern, context) : 'Schedule of Attendances.pdf',
+    contentType: PDF_CONTENT_TYPE,
+    content: Buffer.concat(chunks)
+  };
+}
+
+/**
+ * All the attachments configured for this pack's trade, in the order
+ * `itt_attachment_trades`/`itt_attachment_types.sort_order` resolved them (see
+ * `pack.attachmentCodes`, set by `tenderPrepDb.ts`'s `attachmentCodesFor`).
+ *
+ * `scope_of_works` and `boq_pricing_workbook` keep their existing bespoke,
+ * measurement-driven generators regardless of configuration — those render_kind
+ * 'code' types are never template-driven. Everything else is looked up in
+ * `templates` (pre-resolved: org override if the org has one, else the seeded
+ * global default) and rendered through the shared block engine.
+ */
+export async function ittAttachmentsFor(
+  pack: IttEmailPack,
+  projectName: string,
+  context: RenderContext,
+  templates: Map<string, ResolvedAttachmentTemplate>,
+  attendanceItems: AttendanceRow[]
+): Promise<IttAttachment[]> {
+  const built: IttAttachment[] = [];
+  for (const code of pack.attachmentCodes) {
+    if (code === 'scope_of_works') { built.push(await scopeOfWorksPdf(pack, projectName)); continue; }
+    if (code === 'boq_pricing_workbook') { built.push(await boqPricingWorkbook(pack, projectName)); continue; }
+    if (code === 'schedule_of_attendances') { built.push(await scheduleOfAttendancesPdf(templates.get(code) ?? null, context, attendanceItems)); continue; }
+    const template = templates.get(code);
+    if (template) built.push(await blocksAttachmentPdf(template, context));
+  }
+  return built;
 }

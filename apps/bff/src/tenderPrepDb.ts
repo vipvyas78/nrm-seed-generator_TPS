@@ -6,8 +6,9 @@ import type { Database, Row } from './db.js';
 import type { DocumentLinkProvider } from './documentLinkProvider.js';
 import type { EmailAttachment, EmailService } from './emailService.js';
 import { conflict, notFound } from './errors.js';
-import { ittAttachmentsFor, type IttAttachment } from './ittAttachments.js';
-import { renderIttEmail, type IttEmailPack } from './ittEmail.js';
+import { ittAttachmentsFor, type AttendanceRow, type IttAttachment, type ResolvedAttachmentTemplate } from './ittAttachments.js';
+import { renderIttEmail, requiredReturnsList, sectionIndex, type IttEmailLetterContext, type IttEmailPack } from './ittEmail.js';
+import type { Block, RenderContext } from './blockPdfRenderer.js';
 import type { ScmsReadDatabase } from './scmsReadDb.js';
 import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js';
 import type { Actor } from './types.js';
@@ -277,15 +278,28 @@ export class TenderPrepDatabase {
         mainContractor: attendances.filter((a) => a.owner === 'H').length,
         joint: attendances.filter((a) => a.owner === 'J').length
       },
-      valueEngineeringRequired: true
+      valueEngineeringRequired: true,
+      attachmentCodes: await this.attachmentCodesFor({ name: input.packageName, wp_code: pkg.wp_code })
     };
 
     const projectName = 'the project';
+    // No workflow exists yet for a preview, so there is no itt_letter_details row to
+    // read — the letter context falls back to the confirming actor's own identity only.
+    const letterContext: IttEmailLetterContext = {
+      siteAddress: null, tenderReturnDeadline: null, clarificationsCloseDate: null, siteVisitPermitted: null,
+      estimatorName: actor.displayName ?? null, estimatorEmail: actor.email ?? null,
+      organizationName: await this.organizationName(actor)
+    };
+    const recipient = { name: null as string | null, email: '', address: null as string | null };
+    const { renderKinds, templates } = await this.resolvedTemplatesFor(actor, emailPack.attachmentCodes);
+    void renderKinds;
+    const context = await this.buildRenderContext(actor, emailPack, projectName, letterContext, recipient);
+    const attendanceRows = await this.attendanceRowsFor(actor, pkg);
     return {
-      ...renderIttEmail([emailPack], { name: null, email: '' }, { projectName, completeBundleUrl: null }),
+      ...renderIttEmail([emailPack], recipient, { projectName, completeBundleUrl: null, letterContext }),
       // The real attachments, byte for byte — so a preview can be opened and checked without
       // anything being sent. Returned unencoded; only the send path base64s them.
-      attachments: await ittAttachmentsFor(emailPack, projectName)
+      attachments: await ittAttachmentsFor(emailPack, projectName, context, templates, attendanceRows)
     };
   }
 
@@ -647,6 +661,171 @@ export class TenderPrepDatabase {
         ORDER BY s.sort_order, i.seq`,
       [wpCode, pkg.name]
     );
+  }
+
+  /**
+   * Which ITT attachment codes this package's trade should receive, in the order
+   * they should appear — same trade resolution as listScopeItems (wp_code first,
+   * label fallback), reading the parent repo's public-schema itt_attachment_trades
+   * / itt_attachment_types (migration 083) cross-schema, exactly as tender_scope_*
+   * already is. A trade with no rows here gets no attachments at all — the same
+   * "never a silent full-set fallback" rule as the scope-of-works library.
+   */
+  async attachmentCodesFor(pkg: { name: string; wp_code?: unknown }): Promise<string[]> {
+    const wpCode = typeof pkg.wp_code === 'string' && pkg.wp_code ? pkg.wp_code : null;
+    const rows = await this.db.query<Row>(
+      `WITH by_wp AS (
+         SELECT trade_code FROM tender_scope_trades
+          WHERE is_active AND $1::TEXT IS NOT NULL AND wp_code = $1
+       ),
+       by_label AS (
+         SELECT trade_code FROM tender_scope_trades
+          WHERE is_active AND lower(btrim(label)) = lower(btrim($2))
+            AND NOT EXISTS (SELECT 1 FROM by_wp)
+       ),
+       trade AS (SELECT trade_code FROM by_wp UNION ALL SELECT trade_code FROM by_label)
+       SELECT DISTINCT at.attachment_code, t.sort_order
+         FROM itt_attachment_trades at
+         JOIN trade tr ON tr.trade_code = at.trade_code
+         JOIN itt_attachment_types t ON t.attachment_code = at.attachment_code
+        WHERE t.is_active
+        ORDER BY t.sort_order`,
+      [wpCode, pkg.name]
+    );
+    return rows.map((r) => String(r.attachment_code));
+  }
+
+  /**
+   * The resolved (org override if present, else global default) template for each
+   * of `codes`, plus each code's render_kind — everything ittAttachmentsFor needs
+   * to dispatch, pre-fetched here so that file stays a pure function of its inputs.
+   */
+  private async resolvedTemplatesFor(
+    actor: Actor, codes: string[]
+  ): Promise<{ renderKinds: Map<string, string>; templates: Map<string, ResolvedAttachmentTemplate> }> {
+    const renderKinds = new Map<string, string>();
+    if (codes.length > 0) {
+      const types = await this.db.query<Row>(
+        `SELECT attachment_code, render_kind FROM itt_attachment_types WHERE attachment_code = ANY($1)`,
+        [codes]
+      );
+      for (const t of types) renderKinds.set(String(t.attachment_code), String(t.render_kind));
+    }
+    const templates = new Map<string, ResolvedAttachmentTemplate>();
+    if (codes.length > 0) {
+      const rows = await this.db.query<Row>(
+        `SELECT DISTINCT ON (attachment_code) attachment_code, title, filename_pattern, blocks
+           FROM itt_attachment_templates
+          WHERE attachment_code = ANY($1) AND (organization_id = $2 OR organization_id IS NULL)
+          ORDER BY attachment_code, organization_id NULLS LAST`,
+        [codes, actor.organizationId]
+      );
+      for (const r of rows) {
+        templates.set(String(r.attachment_code), {
+          attachmentCode: String(r.attachment_code),
+          filenamePattern: String(r.filename_pattern),
+          blocks: r.blocks as Block[]
+        });
+      }
+    }
+    return { renderKinds, templates };
+  }
+
+  /** scms.attendance_items rows for one package, shaped for scheduleOfAttendancesPdf. */
+  private async attendanceRowsFor(actor: Actor, pkg: Row): Promise<AttendanceRow[]> {
+    const rows = await this.listAttendances(actor, String(pkg.id));
+    return rows.map((r) => ({
+      groupName: String(r.group_name), description: String(r.description),
+      owner: r.owner as AttendanceRow['owner'], notes: (r.notes as string | null) ?? null
+    }));
+  }
+
+  /** bf_organizations.name for the letter's "On behalf of {org}" sign-off — read
+   * cross-schema from the parent repo's public schema, same as everything else here. */
+  private async organizationName(actor: Actor): Promise<string> {
+    const [row] = await this.db.query<Row>(`SELECT name FROM bf_organizations WHERE id = $1`, [actor.organizationId]);
+    return row ? String(row.name) : 'the Contractor';
+  }
+
+  async getIttLetterDetails(actor: Actor, workflowId: string): Promise<Row | null> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    const [row] = await this.db.query<Row>(`SELECT * FROM itt_letter_details WHERE workflow_id = $1`, [workflowId]);
+    return row ?? null;
+  }
+
+  async saveIttLetterDetails(actor: Actor, workflowId: string, input: {
+    siteAddress?: string | null; tenderReturnDeadline?: string | null; clarificationsCloseDate?: string | null;
+    siteVisitPermitted?: boolean | null; estimatorName?: string | null; estimatorEmail?: string | null;
+  }): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    const [row] = await this.db.query<Row>(
+      `INSERT INTO itt_letter_details
+         (workflow_id, site_address, tender_return_deadline, clarifications_close_date, site_visit_permitted, estimator_name, estimator_email)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (workflow_id) DO UPDATE SET
+         site_address = EXCLUDED.site_address, tender_return_deadline = EXCLUDED.tender_return_deadline,
+         clarifications_close_date = EXCLUDED.clarifications_close_date, site_visit_permitted = EXCLUDED.site_visit_permitted,
+         estimator_name = EXCLUDED.estimator_name, estimator_email = EXCLUDED.estimator_email, updated_at = NOW()
+       RETURNING *`,
+      [workflowId, input.siteAddress ?? null, input.tenderReturnDeadline ?? null, input.clarificationsCloseDate ?? null,
+        input.siteVisitPermitted ?? null, input.estimatorName ?? null, input.estimatorEmail ?? null]
+    );
+    return row;
+  }
+
+  private formatDate = (d: unknown): string | null => {
+    if (!d) return null;
+    const date = d instanceof Date ? d : new Date(String(d));
+    return Number.isNaN(date.getTime()) ? null : date.toLocaleDateString('en-GB');
+  };
+
+  /** Builds an IttEmailLetterContext for a workflow, pre-filling estimator name/email
+   * from the confirming actor's own account when no itt_letter_details row (or no
+   * value in it) has been saved yet — see GET /api/tender-prep/:workflowId/itt-letter-details. */
+  async letterContextFor(actor: Actor, workflowId: string): Promise<IttEmailLetterContext> {
+    const details = await this.getIttLetterDetails(actor, workflowId);
+    const orgName = await this.organizationName(actor);
+    return {
+      siteAddress: (details?.site_address as string | null) ?? null,
+      tenderReturnDeadline: this.formatDate(details?.tender_return_deadline),
+      clarificationsCloseDate: this.formatDate(details?.clarifications_close_date),
+      siteVisitPermitted: (details?.site_visit_permitted as boolean | null) ?? null,
+      estimatorName: (details?.estimator_name as string | null) ?? actor.displayName ?? null,
+      estimatorEmail: (details?.estimator_email as string | null) ?? actor.email ?? null,
+      organizationName: orgName
+    };
+  }
+
+  /** The {{token}} -> value map every template (email body and PDF alike) resolves
+   * against — system fields from send-time data, plus this org's custom variables
+   * (itt_template_variables, also read cross-schema from the parent's public schema). */
+  private async buildRenderContext(
+    actor: Actor, pack: IttEmailPack, projectName: string, letterContext: IttEmailLetterContext, recipient: { name: string | null; email: string; address: string | null }
+  ): Promise<RenderContext> {
+    const customRows = await this.db.query<Row>(
+      `SELECT DISTINCT ON (key) key, default_value FROM itt_template_variables
+        WHERE organization_id = $1 OR organization_id IS NULL
+        ORDER BY key, organization_id NULLS LAST`,
+      [actor.organizationId]
+    );
+    const context: RenderContext = {
+      projectName,
+      tradeName: pack.packageName,
+      siteAddress: letterContext.siteAddress ?? '',
+      recipientName: recipient.name ?? '',
+      recipientAddress: recipient.address ?? '',
+      todayDate: new Date().toLocaleDateString('en-GB'),
+      tenderReturnDeadline: letterContext.tenderReturnDeadline ?? 'to be confirmed',
+      clarificationsCloseDate: letterContext.clarificationsCloseDate ?? 'to be confirmed',
+      siteVisitPermitted: letterContext.siteVisitPermitted === null ? 'To be confirmed' : letterContext.siteVisitPermitted ? 'Yes' : 'No',
+      estimatorName: letterContext.estimatorName ?? '',
+      estimatorEmail: letterContext.estimatorEmail ?? '',
+      organizationName: letterContext.organizationName,
+      sectionIndex: sectionIndex(pack.attachmentCodes),
+      requiredReturnsList: requiredReturnsList(pack.attachmentCodes, pack.valueEngineeringRequired)
+    };
+    for (const r of customRows) context[String(r.key)] = String(r.default_value);
+    return context;
   }
 
   /**
@@ -1586,7 +1765,8 @@ export class TenderPrepDatabase {
         mainContractor: Number((pack.attendance_summary as Row).main_contractor ?? 0),
         joint: Number((pack.attendance_summary as Row).joint ?? 0)
       },
-      valueEngineeringRequired: Boolean(pack.value_engineering_required)
+      valueEngineeringRequired: Boolean(pack.value_engineering_required),
+      attachmentCodes: await this.attachmentCodesFor({ name: pack.package_name as string, wp_code: pack.wp_code })
     };
 
     return {
@@ -1597,19 +1777,29 @@ export class TenderPrepDatabase {
   }
 
   /**
-   * The scope-of-works PDF and BoQ pricing schedule for each package on the message.
-   *
-   * Generated once per send, not once per recipient — the files are identical for every firm
-   * invited to the same package, and rebuilding them per recipient would be pure waste.
+   * The configured attachment set (cover letter, forms, scope PDF, pricing workbook,
+   * schedule of attendances — see itt_attachment_trades) for each package on the
+   * message, addressed to one recipient — the cover letter and forms carry that
+   * recipient's own name/address, so unlike the old scope/BoQ-only pair these are
+   * NOT identical for every firm invited to the same package and must be rebuilt per
+   * recipient (still once per package within that recipient's own send, not once
+   * per package across every recipient).
    *
    * Oversized sends drop their attachments rather than failing: the email still carries the
    * inline tables and the document-pack links, which is far better than a provider rejecting
    * the whole message and the subcontractor receiving nothing.
    */
-  private async attachmentsFor(packs: IttEmailPack[], projectName: string): Promise<EmailAttachment[]> {
+  private async attachmentsFor(
+    actor: Actor, packs: IttEmailPack[], projectName: string,
+    letterContext: IttEmailLetterContext, recipient: { name: string | null; email: string; address: string | null }
+  ): Promise<EmailAttachment[]> {
     const built: EmailAttachment[] = [];
     for (const pack of packs) {
-      for (const file of await ittAttachmentsFor(pack, projectName)) {
+      const { templates } = await this.resolvedTemplatesFor(actor, pack.attachmentCodes);
+      const context = await this.buildRenderContext(actor, pack, projectName, letterContext, recipient);
+      const packageRow = await this.db.query<Row>(`SELECT id FROM package_config WHERE organization_id = $1 AND name = $2 LIMIT 1`, [actor.organizationId, pack.packageName]);
+      const attendanceRows = packageRow[0] ? await this.attendanceRowsFor(actor, packageRow[0]) : [];
+      for (const file of await ittAttachmentsFor(pack, projectName, context, templates, attendanceRows)) {
         built.push({
           content: file.content.toString('base64'),
           filename: file.filename,
@@ -1643,9 +1833,9 @@ export class TenderPrepDatabase {
   async draftIttEmail(actor: Actor, workflowId: string, packageName: string): Promise<IttDraft> {
     await this.assertWorkflowAccess(actor, workflowId);
 
-    const { emailPack, projectName, completeBundleUrl, attachments, attachmentsOmittedOversize, recipients } =
+    const { emailPack, projectName, completeBundleUrl, letterContext, attachments, attachmentsOmittedOversize, recipients } =
       await this.buildIttDraft(actor, workflowId, packageName);
-    const rendered = renderIttEmail([emailPack], { name: null, email: '' }, { projectName, completeBundleUrl });
+    const rendered = renderIttEmail([emailPack], { name: null, email: '', address: null }, { projectName, completeBundleUrl, letterContext });
 
     return {
       packageName: emailPack.packageName,
@@ -1672,6 +1862,7 @@ export class TenderPrepDatabase {
     emailPack: IttEmailPack;
     projectName: string;
     completeBundleUrl: string | null;
+    letterContext: IttEmailLetterContext;
     attachments: IttAttachment[];
     attachmentsOmittedOversize: boolean;
     recipients: IttDraftRecipient[];
@@ -1679,11 +1870,19 @@ export class TenderPrepDatabase {
     const bundles = await this.bundlesForWorkflow(workflowId);
     const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
     const assembled = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles);
+    const letterContext = await this.letterContextFor(actor, workflowId);
+    // The compose box addresses whoever the sender types in, not one named firm, so
+    // there is no single recipient to personalise the letter/forms to yet.
+    const draftRecipient = { name: null as string | null, email: '', address: null as string | null };
 
     // The same budget a real send applies, measured the same way (on the encoded length, which
     // is what actually travels) — so a package that would send without its attachments previews
     // without them too, rather than promising files the send would drop.
-    const files = await ittAttachmentsFor(assembled.emailPack, assembled.projectName);
+    const { templates } = await this.resolvedTemplatesFor(actor, assembled.emailPack.attachmentCodes);
+    const context = await this.buildRenderContext(actor, assembled.emailPack, assembled.projectName, letterContext, draftRecipient);
+    const packageRow = await this.db.query<Row>(`SELECT id FROM package_config WHERE organization_id = $1 AND name = $2 LIMIT 1`, [actor.organizationId, packageName]);
+    const attendanceRows = packageRow[0] ? await this.attendanceRowsFor(actor, packageRow[0]) : [];
+    const files = await ittAttachmentsFor(assembled.emailPack, assembled.projectName, context, templates, attendanceRows);
     const encodedBytes = files.reduce((sum, f) => sum + Math.ceil(f.content.length / 3) * 4, 0);
     const attachmentsOmittedOversize = encodedBytes > MAX_ATTACHMENT_BYTES;
 
@@ -1709,6 +1908,7 @@ export class TenderPrepDatabase {
       emailPack: assembled.emailPack,
       projectName: assembled.projectName,
       completeBundleUrl,
+      letterContext,
       attachments: attachmentsOmittedOversize ? [] : files,
       attachmentsOmittedOversize,
       recipients
@@ -1739,9 +1939,9 @@ export class TenderPrepDatabase {
       throw conflict('Email is not configured in this environment, so this ITT cannot be sent from here.');
     }
 
-    const { emailPack, projectName, completeBundleUrl, attachments, recipients } =
+    const { emailPack, projectName, completeBundleUrl, letterContext, attachments, recipients } =
       await this.buildIttDraft(actor, workflowId, packageName);
-    const rendered = renderIttEmail([emailPack], { name: null, email: '' }, { projectName, completeBundleUrl });
+    const rendered = renderIttEmail([emailPack], { name: null, email: '', address: null }, { projectName, completeBundleUrl, letterContext });
 
     const normalise = (address: string) => address.trim().toLowerCase();
     const to = [...new Set(input.to.map((a) => a.trim()).filter(Boolean))];
@@ -1865,6 +2065,7 @@ export class TenderPrepDatabase {
 
     const bundles = await this.bundlesForWorkflow(workflowId);
     const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
+    const letterContext = await this.letterContextFor(actor, workflowId);
 
     // One assembly per package, shared across every firm invited to it. getPackageItt is the
     // expensive call in this flow and most packages have several recipients.
@@ -1940,18 +2141,19 @@ export class TenderPrepDatabase {
       }
 
       const packs = packageNamesForFirm.map((name) => assembled.get(name)!.emailPack);
-      const rendered = renderIttEmail(
-        packs,
-        { name: contact?.contact_name ? String(contact.contact_name) : null, email },
-        { projectName, completeBundleUrl }
-      );
+      const recipient = {
+        name: contact?.contact_name ? String(contact.contact_name) : null,
+        email,
+        address: contact?.contact_address ? String(contact.contact_address) : null
+      };
+      const rendered = renderIttEmail(packs, recipient, { projectName, completeBundleUrl, letterContext });
       const subject = this.testEmailOverride
         ? `[TEST → ${contact?.contact_name ? String(contact.contact_name) : 'unknown'} <${realEmail ?? 'no email on file'}>] ${rendered.subject}`
         : rendered.subject;
 
       try {
         if (!this.emailService) throw new Error('EmailService not configured in this environment');
-        const attachments = await this.attachmentsFor(packs, projectName);
+        const attachments = await this.attachmentsFor(actor, packs, projectName, letterContext, recipient);
         const result = await this.emailService.send({
           from, to: email, subject, html: rendered.html, text: rendered.text, attachments
         });
@@ -2012,7 +2214,7 @@ export class TenderPrepDatabase {
     const assembled = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles);
     const { emailPack, projectName } = assembled;
     const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
-    const attachments = await this.attachmentsFor([emailPack], projectName);
+    const letterContext = await this.letterContextFor(actor, workflowId);
 
     const recipients = assembled.recipients;
     const subcontractorIds = recipients.map((r) => String(r.subcontractor_id));
@@ -2048,17 +2250,22 @@ export class TenderPrepDatabase {
         continue;
       }
 
-      const rendered = renderIttEmail(
-        [emailPack],
-        { name: contact?.contact_name ? String(contact.contact_name) : null, email },
-        { projectName, completeBundleUrl }
-      );
+      const recipientInfo = {
+        name: contact?.contact_name ? String(contact.contact_name) : null,
+        email,
+        address: contact?.contact_address ? String(contact.contact_address) : null
+      };
+      const rendered = renderIttEmail([emailPack], recipientInfo, { projectName, completeBundleUrl, letterContext });
       // Keeps test-inbox messages distinguishable across packages/recipients when every
       // send lands in the same TEST_TO_EMAIL_ACCOUNT.
       const subject = this.testEmailOverride
         ? `[TEST → ${contact?.contact_name ? String(contact.contact_name) : 'unknown'} <${realEmail ?? 'no email on file'}>] ${rendered.subject}`
         : rendered.subject;
       const { html, text } = rendered;
+      // The cover letter and forms carry this recipient's own name/address, so —
+      // unlike the old scope/BoQ-only pair — attachments are rebuilt per recipient,
+      // not hoisted above the loop.
+      const attachments = await this.attachmentsFor(actor, [emailPack], projectName, letterContext, recipientInfo);
 
       try {
         if (this.emailService) {

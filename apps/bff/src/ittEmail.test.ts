@@ -27,7 +27,8 @@ const pack: IttEmailPack = {
   ],
   bundle: null,
   attendanceSummary: { subcontractor: 5, mainContractor: 3, joint: 1 },
-  valueEngineeringRequired: true
+  valueEngineeringRequired: true,
+  attachmentCodes: ['form_1a', 'form_1b', 'form_1c', 'scope_of_works', 'schedule_of_attendances', 'boq_pricing_workbook']
 };
 
 const secondPack: IttEmailPack = {
@@ -39,8 +40,13 @@ const secondPack: IttEmailPack = {
   billLines: []
 };
 
-const opts = { projectName: 'Riverside House', completeBundleUrl: null };
-const jo = { name: 'Jo Bloggs', email: 'jo@example.com' };
+const letterContext = {
+  siteAddress: '1 Riverside Way, Riverside, RV1 2AB', tenderReturnDeadline: '01/01/2027',
+  clarificationsCloseDate: '20/12/2026', siteVisitPermitted: true,
+  estimatorName: 'Alex Estimator', estimatorEmail: 'estimator@example.com', organizationName: 'Novamerx Ltd'
+};
+const opts = { projectName: 'Riverside House', completeBundleUrl: null, letterContext };
+const jo = { name: 'Jo Bloggs', email: 'jo@example.com', address: '2 Contractor Way, Buildchester, BC3 4CD' };
 
 describe('renderIttEmail', () => {
   it('includes subject with package and project name', () => {
@@ -64,7 +70,7 @@ describe('renderIttEmail', () => {
   });
 
   it('falls back to a generic greeting when the recipient has no name', () => {
-    const { html } = renderIttEmail([pack], { name: null, email: 'jo@example.com' }, opts);
+    const { html } = renderIttEmail([pack], { name: null, email: 'jo@example.com', address: null }, opts);
     expect(html).toContain('Dear Sir/Madam,');
   });
 
@@ -162,7 +168,7 @@ describe('renderIttEmail', () => {
 
     it('points at the complete set when a package has no pack of its own', () => {
       // Says the pack is missing rather than staying silent, and names where to go instead.
-      const withComplete = { projectName: 'Riverside House', completeBundleUrl: 'https://buildflow.example/bundles/all' };
+      const withComplete = { projectName: 'Riverside House', completeBundleUrl: 'https://buildflow.example/bundles/all', letterContext };
       const { html, text } = renderIttEmail([pack], jo, withComplete);
       for (const bodyText of [html, text]) {
         expect(bodyText).toContain('No document pack has been produced for this package');
@@ -177,7 +183,7 @@ describe('renderIttEmail', () => {
     });
 
     it('offers the complete tender document set once, not once per package', () => {
-      const withComplete = { projectName: 'Riverside House', completeBundleUrl: 'https://buildflow.example/bundles/all' };
+      const withComplete = { projectName: 'Riverside House', completeBundleUrl: 'https://buildflow.example/bundles/all', letterContext };
       const { html, text } = renderIttEmail([pack, secondPack], jo, withComplete);
       expect(html.match(/bundles\/all/g)).toHaveLength(1);
       expect(html).toContain('Complete tender document set');
