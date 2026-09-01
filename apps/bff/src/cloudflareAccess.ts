@@ -125,7 +125,9 @@ export class CloudflareAccessAdmin {
   private async ensureApplication(otpIdpId: string): Promise<{ appId: string; aud: string }> {
     const cached = await this.currentConfig();
     if (cached?.cf_application_id && cached?.cf_aud) {
-      return { appId: String(cached.cf_application_id), aud: String(cached.cf_aud) };
+      const appId = String(cached.cf_application_id);
+      await this.reconcileApplication(appId, otpIdpId);
+      return { appId, aud: String(cached.cf_aud) };
     }
     // Look for one already created out-of-band (a prior deploy, a dashboard edit) before
     // creating a second — `exact: true` on `name` is the only reliable de-dupe key the
@@ -133,7 +135,16 @@ export class CloudflareAccessAdmin {
     for await (const existing of this.client.zeroTrust.access.applications.list({
       account_id: this.accountId, name: ACCESS_APP_NAME, exact: true
     })) {
-      if ('aud' in existing && existing.aud) return { appId: String(existing.id), aud: existing.aud };
+      if ('aud' in existing && existing.aud) {
+        const appId = String(existing.id);
+        // An out-of-band application (dashboard-created, or created by an older version of
+        // this code) may predate OTP being enabled on the account, may have never had it
+        // attached, or may have been created with a broader domain/destinations than this
+        // code intends (e.g. a wildcard that also catches /tps/assets/*) — reconcile
+        // unconditionally rather than trusting whatever this one happens to already have.
+        await this.reconcileApplication(appId, otpIdpId);
+        return { appId, aud: existing.aud };
+      }
     }
     const created = await this.client.zeroTrust.access.applications.create({
       account_id: this.accountId,
@@ -156,6 +167,28 @@ export class CloudflareAccessAdmin {
       throw new Error('Cloudflare did not return an aud/id for the created Access application');
     }
     return { appId: String(created.id), aud: created.aud };
+  }
+
+  /** Reconciles OTP and destinations on an application this code is reusing rather than
+   * creating — the create branch above already sets both up front, but a cached or
+   * out-of-band-matched application can predate OTP ever being resolved successfully, or can
+   * have been created (by hand, or by an older version of this code) with a broader
+   * domain/destinations than intended — e.g. a wildcard that also catches /tps/assets/*,
+   * which then gets Access-gated too and blanks the portal page since its JS/CSS bundle can
+   * never complete an interactive Access login. Nothing else in `ensureApplication` ever
+   * revisits an existing application, so this must force both fields back to the canonical
+   * value every time, not just on first creation. */
+  private async reconcileApplication(appId: string, otpIdpId: string): Promise<void> {
+    await this.client.zeroTrust.access.applications.update(appId, {
+      account_id: this.accountId,
+      // Must match the create call above — see its comment on why this has to be one of
+      // `destinations`' entries verbatim, wildcard included.
+      domain: this.destinations()[0].uri,
+      type: 'self_hosted',
+      destinations: this.destinations(),
+      allowed_idps: [otpIdpId],
+      auto_redirect_to_identity: true
+    });
   }
 
   private async syncPolicy(

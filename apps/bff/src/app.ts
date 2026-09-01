@@ -66,17 +66,21 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   // every recipient as blocked ('access_unconfigured') and the ITT sends exactly as it
   // did before this feature existed. See config.ts for what each variable gates.
   const portalDb = new PricingPortalDatabase(db);
+  // Falls back to WEB_ORIGIN so a portal link and the Cloudflare Access destination it must
+  // match (cloudflareAccess.ts's `portalHost`) can never drift apart from each other just
+  // because PORTAL_BASE_URL is unset — see tenderPrepDb.ts's use of this same value below.
+  const portalBaseUrl = config.PORTAL_BASE_URL ?? config.WEB_ORIGIN[0];
   const accessAdmin = config.CLOUDFLARE_API_TOKEN && config.CLOUDFLARE_ACCOUNT_ID
     ? new CloudflareAccessAdmin(
         db, config.CLOUDFLARE_ACCOUNT_ID, config.CLOUDFLARE_API_TOKEN,
-        new URL(config.PORTAL_BASE_URL ?? config.WEB_ORIGIN[0]).host
+        new URL(portalBaseUrl).host
       )
     : undefined;
   const verifyAccessIdentity = buildAccessVerifier(config, db);
 
   const tpDb = new TenderPrepDatabase(
     db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, documentBundles,
-    emailService, testEmailOverride, portalDb, accessAdmin, config.PORTAL_BASE_URL, config.PORTAL_LINK_TTL_DAYS
+    emailService, testEmailOverride, portalDb, accessAdmin, portalBaseUrl, config.PORTAL_LINK_TTL_DAYS
   );
 
   app.decorate('tps', { config, db, tpDb, scmsDb });
