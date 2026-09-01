@@ -94,7 +94,16 @@ export type IttSummary = {
   sent: number;
   failed: number;
   skipped_no_email: number;
+  /** A buyer's manual "will_tender" mark — see recordIttResponse. Not the same fact as
+   * responses_received below, which is a SUBMITTED priced bill. */
   responded: number;
+  /** Submitted returns via the online pricing portal — drives "response received" and
+   * the "Open responses" button. */
+  responses_received: number;
+  portal_links: number;
+  /** A viewer's Access identity did not match the link it was issued to, at least once —
+   * worth a warning on the row rather than sitting unseen in the database. */
+  portal_denials: number;
 };
 
 export type IttBoqLine = {
@@ -279,6 +288,8 @@ export type IttDraft = {
   recipients: IttDraftRecipient[];
   bundleUrl: string | null;
   completeBundleUrl: string | null;
+  /** TEMPORARY (testing the pricing-portal link) — null outside test mode. */
+  portalUrl: string | null;
   attachments: Array<{ filename: string; contentType: string; bytes: number }>;
   attachmentsOmittedOversize: boolean;
 };
@@ -320,6 +331,80 @@ export type IttDispatch = {
   trade_category?: string;
   rank?: number;
   subcontractor_id?: string;
+};
+
+// ── Subcontractor pricing portal ────────────────────────────────────────────
+
+export type PortalLineStatus = 'priced' | 'included' | 'excluded' | 'not_addressed';
+
+export type PortalLine = {
+  id: string;
+  seq: number;
+  ge_code: string | null;
+  element_code: string | null;
+  description: string;
+  quantity: string | null;
+  unit: string | null;
+  is_priceable: boolean;
+  rate: string | null;
+  total: string | null;
+  status: PortalLineStatus;
+  note: string | null;
+};
+
+/** One firm on the "Open responses" modal's list — the ITT Dispatch page's buyer view. */
+export type PortalResponseSummary = {
+  id: string;
+  shortlist_entry_id: string;
+  package_name: string;
+  subcontractor_id: string | null;
+  tenderer_name: string;
+  /** The firm's current SCMS name, falling back to what was on file when the link was
+   * minted — the two can differ if SCMS was corrected afterward. */
+  firm_name: string;
+  rank: number;
+  /** Null when no link was ever issued — see blocked_reason for why. */
+  token: string | null;
+  recipient_email: string;
+  recipient_domain: string;
+  expires_at: string | null;
+  is_test: boolean;
+  blocked_reason: 'public_email_domain' | 'access_unconfigured' | null;
+  submitted_at: string | null;
+  draft_saved_at: string | null;
+  denied_attempts: number;
+  last_denied_email: string | null;
+  reopened_at: string | null;
+};
+
+/** One firm's priced bill, read-only — what "Open response" opens. */
+export type PortalResponseDetail = PortalResponseSummary & {
+  programme_weeks: number | null;
+  qualifications: string | null;
+  exclusions: string | null;
+  tender_return_id: string | null;
+  lines: PortalLine[];
+};
+
+/** What the PUBLIC pricing page (no BuildFlow auth) reads and writes, via `portalApi`. */
+export type PortalPackage = {
+  id: string;
+  package_name: string;
+  tenderer_name: string;
+  recipient_email: string;
+  submitted_at: string | null;
+  programme_weeks: number | null;
+  qualifications: string | null;
+  exclusions: string | null;
+  tender_return_deadline: string | null;
+  lines: PortalLine[];
+};
+
+export type PortalDraftInput = {
+  programmeWeeks: number | null;
+  qualifications: string | null;
+  exclusions: string | null;
+  lines: Array<{ id: string; rate: number | null; status: PortalLineStatus; note: string | null }>;
 };
 
 export type TenderComparative = {
@@ -436,6 +521,14 @@ export const api = {
   saveIttLetterDetails: (workflowId: string, input: IttLetterDetailsInput) =>
     request<IttLetterDetails>(`/api/tender-prep/${workflowId}/itt-letter-details`, { method: 'PUT', body: JSON.stringify(input) }),
 
+  // Step 2: subcontractor pricing portal — the buyer-facing "Open responses" side
+  listPortalResponses: (workflowId: string, packageName: string) =>
+    request<PortalResponseSummary[]>(`/api/tender-prep/${workflowId}/portal-responses?packageName=${encodeURIComponent(packageName)}`),
+  getPortalResponse: (workflowId: string, linkId: string) =>
+    request<PortalResponseDetail>(`/api/tender-prep/${workflowId}/portal-responses/${linkId}`),
+  reopenPortalResponse: (workflowId: string, linkId: string) =>
+    request<PortalResponseDetail>(`/api/tender-prep/${workflowId}/portal-responses/${linkId}/reopen`, { method: 'POST' }),
+
   // Step 3: Comparative
   listComparative: (workflowId: string) => request<TenderComparative[]>(`/api/tender-prep/${workflowId}/comparative`),
   upsertComparative: (workflowId: string, input: Omit<TenderComparative, 'id' | 'workflow_id'>) =>
@@ -447,4 +540,42 @@ export const api = {
     request<TenderSubmission>(`/api/tender-prep/${workflowId}/submission`, { method: 'POST', body: JSON.stringify(input) }),
   boardApproveSubmission: (workflowId: string) =>
     request<TenderSubmission>(`/api/tender-prep/${workflowId}/submission/approve`, { method: 'POST' })
+};
+
+// ── portalApi: the PUBLIC pricing page, no BuildFlow authentication ─────────────────
+//
+// Deliberately NOT `request()` above. That helper always attaches an OIDC bearer or the
+// x-buildflow-dev-* headers (api.ts:352-358) — a subcontractor opening an emailed link is
+// not a BuildFlow user, and a dev header would provision a BuildFlow actor for them. What
+// gates these calls instead is Cloudflare Access at the edge plus the token/identity
+// binding the server checks on every request (see app.ts's public /portal/:token routes).
+//
+// The base URL is resolved at RUNTIME, not from VITE_API_URL, because the deployed page is
+// served at dev.novamerx.ai/tps/respond/:token and its fetches must stay same-origin
+// (dev.novamerx.ai/tps-api/...) for the host-scoped CF_Authorization cookie to ride along —
+// a cross-origin fetch to a separate API host would not carry it. Locally (no /tps prefix,
+// no Cloudflare Access in front of anything) it falls back to VITE_API_URL exactly as the
+// authenticated api object does.
+function portalBaseUrl(): string {
+  if (window.location.pathname.startsWith('/tps')) return '/tps-api';
+  return import.meta.env.VITE_API_URL ?? 'http://localhost:3200';
+}
+
+async function portalRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers);
+  if (init.body !== undefined && init.body !== null) headers.set('content-type', 'application/json');
+  const response = await fetch(`${portalBaseUrl()}${path}`, { ...init, headers });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({})) as { message?: string };
+    throw new Error(detail.message ?? `Request failed (${response.status})`);
+  }
+  if (response.status === 204) return undefined as T;
+  return response.json() as Promise<T>;
+}
+
+export const portalApi = {
+  get: (token: string) => portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}`),
+  saveDraft: (token: string, input: PortalDraftInput) =>
+    portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}/draft`, { method: 'PUT', body: JSON.stringify(input) }),
+  submit: (token: string) => portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}/submit`, { method: 'POST' })
 };

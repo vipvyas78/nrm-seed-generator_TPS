@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Fragment, FormEvent, useEffect, useState } from 'react';
 import { Link, Outlet, useNavigate, useParams } from 'react-router-dom';
-import { api, type ConfirmIttResult, type IttDispatch, type IttLetterDetailsInput, type IttLineSection, type IttPack, type LaunchTableRow, type SendAllIttsResult, type SendIttDraftResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
+import { api, type ConfirmIttResult, type IttDispatch, type IttLetterDetailsInput, type IttLineSection, type IttPack, type LaunchTableRow, type PortalResponseSummary, type SendAllIttsResult, type SendIttDraftResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
 import { oidc, signIn } from './auth';
 
 function ErrorMessage({ error }: { error: unknown }) {
@@ -780,7 +780,8 @@ function IttComposeModal({ workflowId, packageName, onClose, onSent }: {
   // this on every render would undo the sender's edits as they typed.
   useEffect(() => {
     if (!draft.data || prefilled) return;
-    setTo(draft.data.recipients.map((r) => r.email).filter(Boolean).join(', '));
+    // TEMPORARY (testing the pricing-portal link) — revert to joining draft.data.recipients.
+    setTo('vipvyas@novamerx.ai');
     setSubject(draft.data.subject);
     setPrefilled(true);
   }, [draft.data, prefilled]);
@@ -862,6 +863,12 @@ function IttComposeModal({ workflowId, packageName, onClose, onSent }: {
                     Download the complete tender document set →
                   </a>
                 </p>}
+
+            {draft.data.portalUrl && <p style={{ margin: '0 0 10px' }}>
+              <a href={draft.data.portalUrl} target="_blank" rel="noreferrer" className="button-link">
+                Price and submit this package's bill online →
+              </a>
+            </p>}
 
             {/* Sandboxed: the ITT carries its own inline styles and must neither inherit the
                 app's nor leak into it. srcDoc keeps it entirely local — nothing is fetched. */}
@@ -962,6 +969,7 @@ function IttLetterDetailsPanel({ workflowId }: { workflowId: string }) {
 function Step2IttDispatch({ workflowId }: { workflowId: string }) {
   const [open, setOpen] = useState<string | null>(null);
   const [draftOpen, setDraftOpen] = useState<string | null>(null);
+  const [responsesOpen, setResponsesOpen] = useState<string | null>(null);
   const [lastResult, setLastResult] = useState<ConfirmIttResult | null>(null);
   const [sendAllResult, setSendAllResult] = useState<SendAllIttsResult | null>(null);
   const queryClient = useQueryClient();
@@ -1065,6 +1073,10 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
               {' '}{Number(r.skipped_no_email) > 0 && <span className="badge badge-amber">no email {r.skipped_no_email}</span>}
               {Number(r.sent) === 0 && Number(r.failed) === 0 && Number(r.skipped_no_email) === 0 &&
                 <span className="badge badge-grey">not sent</span>}
+              {' '}{Number(r.responses_received) > 0 && <span className="badge badge-blue">response received {r.responses_received}</span>}
+              {Number(r.portal_denials) > 0 && <div className="tiny" style={{ color: '#d97706', marginTop: 4 }}>
+                ⚠ a viewer's sign-in did not match the recipient on {r.portal_denials} link{Number(r.portal_denials) === 1 ? '' : 's'}
+              </div>}
             </td>
             <td style={{ whiteSpace: 'nowrap' }}>
               <button className="small secondary" onClick={() => setOpen(open === r.package_name ? null : r.package_name)}>
@@ -1074,6 +1086,12 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
               <button className="small secondary" onClick={() => setDraftOpen(r.package_name)}>
                 Open draft Email
               </button>
+              {Number(r.responses_received) > 0 && <>
+                {' '}
+                <button className="small secondary" onClick={() => setResponsesOpen(r.package_name)}>
+                  Open responses
+                </button>
+              </>}
             </td>
             <td>
               <button
@@ -1110,6 +1128,144 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
       onClose={() => setDraftOpen(null)}
       onSent={() => void queryClient.invalidateQueries({ queryKey: ['itts', workflowId] })}
     />}
+
+    {responsesOpen && <PortalResponsesModal
+      workflowId={workflowId}
+      packageName={responsesOpen}
+      onClose={() => setResponsesOpen(null)}
+    />}
+  </div>;
+}
+
+/**
+ * "Open responses" — every firm this package's ITT went to, their portal status, and a
+ * way into each one's priced bill. Structured the same way as IttComposeModal: a list
+ * view that, on picking a firm, swaps in a detail view within the same modal rather than
+ * stacking a second one.
+ */
+function PortalResponsesModal({ workflowId, packageName, onClose }: {
+  workflowId: string; packageName: string; onClose: () => void;
+}) {
+  const [openLinkId, setOpenLinkId] = useState<string | null>(null);
+  const queryClient = useQueryClient();
+  const responses = useQuery({
+    queryKey: ['portal-responses', workflowId, packageName],
+    queryFn: () => api.listPortalResponses(workflowId, packageName)
+  });
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const blockedLabel = (reason: PortalResponseSummary['blocked_reason']) => {
+    if (reason === 'public_email_domain') return "no link — recipient's email domain is a public/free provider";
+    if (reason === 'access_unconfigured') return 'no link — online pricing is not configured on this deployment';
+    return null;
+  };
+
+  return <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal-header">
+        <h3>{openLinkId ? 'Response' : 'Responses'} — {packageName}</h3>
+        <button className="modal-close" onClick={onClose} aria-label="Close">×</button>
+      </div>
+      <div className="modal-body">
+        {openLinkId
+          ? <PortalResponseDetailView
+              workflowId={workflowId} linkId={openLinkId}
+              onBack={() => setOpenLinkId(null)}
+              onReopened={() => {
+                void queryClient.invalidateQueries({ queryKey: ['portal-responses', workflowId, packageName] });
+                void queryClient.invalidateQueries({ queryKey: ['itts', workflowId] });
+              }}
+            />
+          : responses.isLoading ? <Busy />
+          : responses.error ? <ErrorMessage error={responses.error} />
+          : <table className="data-table">
+              <thead><tr><th>Firm</th><th>Status</th><th></th></tr></thead>
+              <tbody>
+                {(responses.data ?? []).map((r) => <tr key={r.id}>
+                  <td>{r.firm_name}</td>
+                  <td>
+                    {r.submitted_at
+                      ? <span className="badge badge-green">submitted {new Date(r.submitted_at).toLocaleDateString()}</span>
+                      : r.draft_saved_at
+                        ? <span className="badge badge-amber">draft in progress</span>
+                        : r.token
+                          ? <span className="badge badge-grey">link sent, not opened</span>
+                          : <span className="badge badge-grey">{blockedLabel(r.blocked_reason)}</span>}
+                    {r.denied_attempts > 0 && <div className="tiny" style={{ color: '#d97706' }}>
+                      ⚠ {r.denied_attempts} sign-in attempt{r.denied_attempts === 1 ? '' : 's'} from a non-matching address
+                    </div>}
+                  </td>
+                  <td>
+                    {(r.submitted_at || r.draft_saved_at) &&
+                      <button className="small secondary" onClick={() => setOpenLinkId(r.id)}>Open response</button>}
+                  </td>
+                </tr>)}
+              </tbody>
+            </table>}
+      </div>
+    </div>
+  </div>;
+}
+
+function PortalResponseDetailView({ workflowId, linkId, onBack, onReopened }: {
+  workflowId: string; linkId: string; onBack: () => void; onReopened: () => void;
+}) {
+  const detail = useQuery({
+    queryKey: ['portal-response', workflowId, linkId],
+    queryFn: () => api.getPortalResponse(workflowId, linkId)
+  });
+  const reopen = useMutation({
+    mutationFn: () => api.reopenPortalResponse(workflowId, linkId),
+    onSuccess: onReopened
+  });
+
+  if (detail.isLoading) return <Busy />;
+  if (detail.error) return <ErrorMessage error={detail.error} />;
+  if (!detail.data) return null;
+  const r = detail.data;
+
+  const total = r.lines.reduce((sum, line) => {
+    if (line.status !== 'priced' || line.total == null) return sum;
+    return sum + Number(line.total);
+  }, 0);
+
+  return <div>
+    <button className="small secondary" onClick={onBack} style={{ marginBottom: 12 }}>← Back to responses</button>
+    <div className="info-row" style={{ marginBottom: 12 }}>
+      <div className="info-item"><span className="info-label">Firm</span>{r.firm_name}</div>
+      <div className="info-item"><span className="info-label">Programme</span>{r.programme_weeks ?? '—'} weeks</div>
+      <div className="info-item"><span className="info-label">Total (priced)</span>
+        {total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+    </div>
+    {r.qualifications && <p className="tiny" style={{ marginBottom: 8 }}><strong>Qualifications:</strong> {r.qualifications}</p>}
+    {r.exclusions && <p className="tiny" style={{ marginBottom: 8 }}><strong>Exclusions:</strong> {r.exclusions}</p>}
+    <div className="table-scroll">
+      <table className="data-table">
+        <thead><tr><th>Description</th><th>Qty</th><th>Unit</th><th>Rate</th><th>Total</th><th>Status</th><th>Note</th></tr></thead>
+        <tbody>
+          {r.lines.map((line) => <tr key={line.id}>
+            <td>{line.description}</td>
+            <td>{line.quantity ?? '—'}</td>
+            <td>{line.unit ?? '—'}</td>
+            <td>{line.rate ?? '—'}</td>
+            <td>{line.total ?? '—'}</td>
+            <td className="tiny">{line.status.replace(/_/g, ' ')}</td>
+            <td className="tiny">{line.note ?? ''}</td>
+          </tr>)}
+        </tbody>
+      </table>
+    </div>
+    {r.submitted_at && <div className="button-row" style={{ marginTop: 12 }}>
+      <button className="secondary" disabled={reopen.isPending} onClick={() => reopen.mutate()}>
+        {reopen.isPending ? 'Reopening…' : 'Reopen for editing'}
+      </button>
+    </div>}
+    {reopen.error && <ErrorMessage error={reopen.error} />}
   </div>;
 }
 

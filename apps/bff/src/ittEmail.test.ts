@@ -201,4 +201,50 @@ describe('renderIttEmail', () => {
     expect(html.toLowerCase()).not.toMatch(/unit_rate|total_cost|£\d/);
     expect(text.toLowerCase()).not.toMatch(/unit_rate|total_cost|£\d/);
   });
+
+  describe('online pricing portal', () => {
+    it('omits the section entirely when no portal status is supplied', () => {
+      // Every caller that predates this feature — previews, and every other test in this
+      // file — must render exactly as it did before the section existed.
+      const { html, text } = renderIttEmail([pack], jo, opts);
+      expect(html).not.toContain('Price this package online');
+      expect(text).not.toContain('PRICE THIS PACKAGE ONLINE');
+    });
+
+    it('links the portal when a URL is issued', () => {
+      const withPortal = {
+        ...opts,
+        portalStatusByPackage: { [pack.packageName]: { url: 'https://tps.example/respond/abc123', unavailableReason: null } }
+      };
+      const { html, text } = renderIttEmail([pack], jo, withPortal);
+      expect(html).toContain('href="https://tps.example/respond/abc123"');
+      expect(text).toContain('https://tps.example/respond/abc123');
+    });
+
+    it('states the reason, not the raw absence, when no link was issued for this recipient', () => {
+      const blocked = {
+        ...opts,
+        portalStatusByPackage: {
+          [pack.packageName]: { url: null, unavailableReason: "this recipient's email domain is a public/free provider" }
+        }
+      };
+      const { html, text } = renderIttEmail([pack], jo, blocked);
+      expect(html).toContain("this recipient's email domain is a public/free provider");
+      expect(text).toContain("this recipient's email domain is a public/free provider");
+      expect(html).not.toMatch(/href="[^"]*respond/);
+    });
+
+    it('gives each package on a multi-package send its own link, never sharing one', () => {
+      const withPortal = {
+        ...opts,
+        portalStatusByPackage: {
+          [pack.packageName]: { url: 'https://tps.example/respond/first', unavailableReason: null },
+          [secondPack.packageName]: { url: 'https://tps.example/respond/second', unavailableReason: null }
+        }
+      };
+      const { html } = renderIttEmail([pack, secondPack], jo, withPortal);
+      expect(html).toContain('href="https://tps.example/respond/first"');
+      expect(html).toContain('href="https://tps.example/respond/second"');
+    });
+  });
 });

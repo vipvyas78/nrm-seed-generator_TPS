@@ -2,13 +2,15 @@ import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
 import type { BuildflowBundle, BuildflowDocumentBundlesClient } from './buildflowDocumentBundlesClient.js';
 import type { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
 import type { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
+import { domainOf, isPublicEmailDomain, type CloudflareAccessAdmin } from './cloudflareAccess.js';
 import type { Database, Row } from './db.js';
 import type { DocumentLinkProvider } from './documentLinkProvider.js';
 import type { EmailAttachment, EmailService } from './emailService.js';
-import { conflict, notFound } from './errors.js';
+import { conflict, forbidden, notFound } from './errors.js';
 import { ittAttachmentsFor, type AttendanceRow, type IttAttachment, type ResolvedAttachmentTemplate } from './ittAttachments.js';
-import { renderIttEmail, requiredReturnsList, sectionIndex, type IttEmailLetterContext, type IttEmailPack } from './ittEmail.js';
+import { renderIttEmail, requiredReturnsList, sectionIndex, type IttEmailLetterContext, type IttEmailPack, type IttEmailPortalStatus } from './ittEmail.js';
 import type { Block, RenderContext } from './blockPdfRenderer.js';
+import type { PortalLineDraftInput, PortalLineInput, PricingPortalDatabase } from './pricingPortalDb.js';
 import type { ScmsReadDatabase } from './scmsReadDb.js';
 import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js';
 import type { Actor } from './types.js';
@@ -127,6 +129,29 @@ function attributionFor(pkg: Row): Attribution {
   };
 }
 
+/**
+ * The lines a pricing-portal link snapshots at mint time, off an already-assembled
+ * `IttEmailPack` — never re-read from `public.takeoff_items` afterwards, so a take-off
+ * re-run mid-tender cannot alter a bill a subcontractor has already started pricing (see
+ * migration 019's header comment).
+ *
+ * Authored bill lines have no NRM ge/element code of their own, and `tender_return_lines`
+ * (008) has no ref/section columns to promote them into either — the closest analog
+ * available is the line's own `ref`, carried in `elementCode` so it survives promotion.
+ */
+function linesFromEmailPack(pack: IttEmailPack): PortalLineInput[] {
+  const boq: PortalLineInput[] = pack.boqLines.map((l) => ({
+    sourceItemId: null, geCode: l.geCode, elementCode: l.elementCode,
+    description: l.description, quantity: l.quantity, unit: l.unit, isPriceable: l.isPriceable
+  }));
+  const bill: PortalLineInput[] = pack.billLines.map((l) => ({
+    sourceItemId: null, geCode: null, elementCode: l.ref,
+    description: l.description, quantity: l.quantity, unit: l.unit,
+    isPriceable: l.quantity != null && l.quantity > 0
+  }));
+  return [...boq, ...bill];
+}
+
 /** One firm shortlisted for the package, as the compose box offers it. */
 export interface IttDraftRecipient {
   shortlistEntryId: string;
@@ -153,6 +178,8 @@ export interface IttDraft {
   recipients: IttDraftRecipient[];
   bundleUrl: string | null;
   completeBundleUrl: string | null;
+  /** TEMPORARY (testing the pricing-portal link) — see draftPortalStatus. Null outside test mode. */
+  portalUrl: string | null;
   attachments: Array<{ filename: string; contentType: string; bytes: number }>;
   /** The files were dropped for exceeding what a send would carry — see MAX_ATTACHMENT_BYTES. */
   attachmentsOmittedOversize: boolean;
@@ -178,7 +205,16 @@ export class TenderPrepDatabase {
     // When set, every ITT email is redirected to `to` (from `from`) instead of the
     // recipient's real SCMS contact address — lets "Confirm ITT" be exercised against real
     // packages without emailing real subcontractors.
-    private readonly testEmailOverride?: { from: string; to: string } | null
+    private readonly testEmailOverride?: { from: string; to: string } | null,
+    // Optional: without one configured, no pricing-portal link is ever minted or read —
+    // the ITT sends exactly as it did before this feature existed.
+    private readonly portalDb?: PricingPortalDatabase,
+    // Optional: without one configured, no portal link is ever issued (see
+    // mintPortalLinksFor) — a link with nothing gating it at the edge is a worse outcome
+    // than a send with no online-pricing section.
+    private readonly accessAdmin?: CloudflareAccessAdmin,
+    private readonly portalBaseUrl?: string,
+    private readonly portalLinkTtlDays: number = 90
   ) {}
 
   /**
@@ -1646,10 +1682,18 @@ export class TenderPrepDatabase {
               count(d.id) FILTER (WHERE d.email_status = 'sent') AS sent,
               count(d.id) FILTER (WHERE d.email_status = 'failed') AS failed,
               count(d.id) FILTER (WHERE d.email_status = 'skipped_no_email') AS skipped_no_email,
-              count(*) FILTER (WHERE se.selected AND d.response IS NOT NULL) AS responded
+              count(*) FILTER (WHERE se.selected AND d.response IS NOT NULL) AS responded,
+              -- A SUBMITTED priced bill, not a buyer's manual "will_tender" mark — a
+              -- different fact with different provenance, so it is not folded into
+              -- the responded column above. Drives the "response received" status and
+              -- the "Open responses" button on the dispatch page.
+              count(ppl.id) FILTER (WHERE ppl.submitted_at IS NOT NULL) AS responses_received,
+              count(ppl.id) FILTER (WHERE ppl.token IS NOT NULL) AS portal_links,
+              count(ppl.id) FILTER (WHERE ppl.denied_attempts > 0) AS portal_denials
          FROM shortlists sl
          LEFT JOIN shortlist_entries se ON se.shortlist_id = sl.id
          LEFT JOIN itt_dispatch d ON d.shortlist_entry_id = se.id
+         LEFT JOIN pricing_portal_links ppl ON ppl.shortlist_entry_id = se.id
         WHERE sl.workflow_id = $1
         GROUP BY sl.package_name, sl.package_seq, sl.route_of_procurement, sl.confirmed_at
         HAVING count(*) FILTER (WHERE se.selected) > 0
@@ -1777,6 +1821,103 @@ export class TenderPrepDatabase {
   }
 
   /**
+   * Mints (or refreshes) a subcontractor pricing-portal link for every recipient about to
+   * be emailed, snapshots a NEW link's bill from the already-assembled `emailPack`, then
+   * reconciles the ONE Cloudflare Access application/policy against the resulting live
+   * recipient set — ALL of it BEFORE the caller sends a single email.
+   *
+   * Unconfigured (no `portalDb`) — every request is skipped with no reason recorded and
+   * the send proceeds exactly as it did before this feature existed; there is nowhere to
+   * record a reason without a portal table to write to.
+   *
+   * Configured, but this recipient's domain is public/free, or `accessAdmin` itself is
+   * unconfigured — no link is issued, but a row IS written (`recordBlocked`) so the
+   * dispatch page can say why rather than the recipient simply having nothing.
+   *
+   * Configured, and the Cloudflare API call fails — THROWS, and the caller MUST refuse
+   * the whole send. Every other BuildFlow integration in this file degrades silently
+   * (`bundlesForWorkflow` returns `[]`, a broken document link becomes `url: null`)
+   * because its absence only makes an email less useful. A missing Access policy
+   * converts a gated portal into an open one with nobody positioned to notice, which is
+   * why this is the one integration that is not best-effort.
+   */
+  private async mintPortalLinksFor(requests: Array<{
+    shortlistEntryId: string; workflowId: string; packageName: string;
+    subcontractorId: string | null; tendererName: string; recipientEmail: string | null;
+    emailPack: IttEmailPack;
+  }>): Promise<Map<string, IttEmailPortalStatus>> {
+    const statuses = new Map<string, IttEmailPortalStatus>();
+    const key = (shortlistEntryId: string, packageName: string) => `${shortlistEntryId}::${packageName}`;
+    if (!this.portalDb) return statuses;
+
+    for (const r of requests) {
+      if (!r.recipientEmail) continue;
+      const domain = domainOf(r.recipientEmail);
+      if (isPublicEmailDomain(domain)) {
+        await this.portalDb.recordBlocked({
+          shortlistEntryId: r.shortlistEntryId, workflowId: r.workflowId, packageName: r.packageName,
+          subcontractorId: r.subcontractorId, tendererName: r.tendererName, recipientEmail: r.recipientEmail,
+          reason: 'public_email_domain'
+        });
+        statuses.set(key(r.shortlistEntryId, r.packageName), {
+          url: null, unavailableReason: "this recipient's email domain is a public/free provider"
+        });
+        continue;
+      }
+      if (!this.accessAdmin) {
+        await this.portalDb.recordBlocked({
+          shortlistEntryId: r.shortlistEntryId, workflowId: r.workflowId, packageName: r.packageName,
+          subcontractorId: r.subcontractorId, tendererName: r.tendererName, recipientEmail: r.recipientEmail,
+          reason: 'access_unconfigured'
+        });
+        // No inline reason printed to the email here — an unconfigured deployment is a
+        // fact for us to fix, not something a real subcontractor needs to read.
+        continue;
+      }
+      const { id, token, isNewLink } = await this.portalDb.mintOrRefreshLink({
+        shortlistEntryId: r.shortlistEntryId, workflowId: r.workflowId, packageName: r.packageName,
+        subcontractorId: r.subcontractorId, tendererName: r.tendererName, recipientEmail: r.recipientEmail,
+        isTest: Boolean(this.testEmailOverride), ttlDays: this.portalLinkTtlDays
+      });
+      if (isNewLink) await this.portalDb.snapshotLines(id, linesFromEmailPack(r.emailPack));
+      statuses.set(key(r.shortlistEntryId, r.packageName), {
+        url: `${(this.portalBaseUrl ?? '').replace(/\/$/, '')}/respond/${token}`, unavailableReason: null
+      });
+    }
+
+    if (this.accessAdmin) {
+      // Recomputed from the FULL live set already in the database, not just this send's
+      // requests — see CloudflareAccessAdmin.syncFor's doc comment for why that matters.
+      await this.accessAdmin.syncFor(await this.portalDb.liveRecipients());
+    }
+
+    return statuses;
+  }
+
+  /**
+   * TEMPORARY (testing the pricing-portal link through the compose box) — revert once
+   * verified. A real per-recipient link is otherwise only ever rendered from
+   * confirmAndSendItt / sendIttsForWorkflow — see sendIttDraft's comment on why a shared
+   * compose-box message never carries one. This narrows that to the one case safe to test:
+   * the first real shortlisted recipient, minted against the TEST override address so no
+   * real subcontractor's inbox is ever the one bound to the link. Only runs at all when
+   * TEST_EMAIL_FLAG is on, so it is inert (and safe to leave in place) once that's unset.
+   */
+  private async draftPortalStatus(
+    workflowId: string, packageName: string, emailPack: IttEmailPack, recipients: IttDraftRecipient[]
+  ): Promise<IttEmailPortalStatus | null> {
+    if (!this.testEmailOverride) return null;
+    const recipient = recipients[0];
+    if (!recipient) return null;
+    const statuses = await this.mintPortalLinksFor([{
+      shortlistEntryId: recipient.shortlistEntryId, workflowId, packageName,
+      subcontractorId: recipient.subcontractorId, tendererName: recipient.name ?? 'Unknown firm',
+      recipientEmail: this.testEmailOverride.to, emailPack
+    }]);
+    return statuses.get(`${recipient.shortlistEntryId}::${packageName}`) ?? null;
+  }
+
+  /**
    * The configured attachment set (cover letter, forms, scope PDF, pricing workbook,
    * schedule of attendances — see itt_attachment_trades) for each package on the
    * message, addressed to one recipient — the cover letter and forms carry that
@@ -1835,7 +1976,11 @@ export class TenderPrepDatabase {
 
     const { emailPack, projectName, completeBundleUrl, letterContext, attachments, attachmentsOmittedOversize, recipients } =
       await this.buildIttDraft(actor, workflowId, packageName);
-    const rendered = renderIttEmail([emailPack], { name: null, email: '', address: null }, { projectName, completeBundleUrl, letterContext });
+    const portalStatus = await this.draftPortalStatus(workflowId, packageName, emailPack, recipients);
+    const rendered = renderIttEmail([emailPack], { name: null, email: '', address: null }, {
+      projectName, completeBundleUrl, letterContext,
+      portalStatusByPackage: portalStatus ? { [packageName]: portalStatus } : undefined
+    });
 
     return {
       packageName: emailPack.packageName,
@@ -1845,6 +1990,7 @@ export class TenderPrepDatabase {
       recipients,
       bundleUrl: emailPack.bundle?.url ?? null,
       completeBundleUrl,
+      portalUrl: portalStatus?.url ?? null,
       attachments: attachments.map((f) => ({
         filename: f.filename, contentType: f.contentType, bytes: f.content.length
       })),
@@ -1941,7 +2087,11 @@ export class TenderPrepDatabase {
 
     const { emailPack, projectName, completeBundleUrl, letterContext, attachments, recipients } =
       await this.buildIttDraft(actor, workflowId, packageName);
-    const rendered = renderIttEmail([emailPack], { name: null, email: '', address: null }, { projectName, completeBundleUrl, letterContext });
+    const portalStatus = await this.draftPortalStatus(workflowId, packageName, emailPack, recipients);
+    const rendered = renderIttEmail([emailPack], { name: null, email: '', address: null }, {
+      projectName, completeBundleUrl, letterContext,
+      portalStatusByPackage: portalStatus ? { [packageName]: portalStatus } : undefined
+    });
 
     const normalise = (address: string) => address.trim().toLowerCase();
     const to = [...new Set(input.to.map((a) => a.trim()).filter(Boolean))];
@@ -1952,6 +2102,20 @@ export class TenderPrepDatabase {
     const addressed = new Set([...to, ...cc].map(normalise));
     const matched = recipients.filter((r) => r.email && addressed.has(normalise(r.email)));
     const notRecorded = addressed.size - new Set(matched.map((r) => normalise(r.email!))).size;
+
+    // Recorded for the audit trail (so the dispatch page has something to show for these
+    // firms), but deliberately NEVER rendered into this email: ONE MESSAGE goes to every
+    // matched address at once here, and a portal URL embedded in a shared message would
+    // hand firm A's pricing capability to every other addressee on it. Online pricing
+    // links are only ever rendered from confirmAndSendItt / sendIttsForWorkflow, which
+    // address one firm per message.
+    if (matched.length > 0) {
+      await this.mintPortalLinksFor(matched.map((r) => ({
+        shortlistEntryId: r.shortlistEntryId, workflowId, packageName,
+        subcontractorId: r.subcontractorId, tendererName: r.name ?? 'Unknown firm',
+        recipientEmail: r.email, emailPack
+      })));
+    }
 
     // Test mode redirects the whole message to one inbox and drops the cc list, so exercising
     // this against a real package cannot reach a real subcontractor. The subject names who it
@@ -2108,6 +2272,22 @@ export class TenderPrepDatabase {
         .map((c) => [String(c.subcontractor_id), c])
     );
 
+    // Every link across every firm x package on this send, minted and Access-synced
+    // BEFORE any email leaves — see mintPortalLinksFor's doc comment.
+    const portalRequests: Array<Parameters<typeof this.mintPortalLinksFor>[0][number]> = [];
+    for (const [subcontractorId, packages] of byFirm) {
+      const contact = contacts.get(subcontractorId);
+      const email = this.testEmailOverride?.to ?? (contact?.contact_email ? String(contact.contact_email) : null);
+      for (const [packageName, shortlistEntryId] of packages) {
+        portalRequests.push({
+          shortlistEntryId, workflowId, packageName, subcontractorId,
+          tendererName: contact?.name ? String(contact.name) : 'Unknown firm',
+          recipientEmail: email, emailPack: assembled.get(packageName)!.emailPack
+        });
+      }
+    }
+    const portalStatuses = await this.mintPortalLinksFor(portalRequests);
+
     let sent = 0, failed = 0, skippedNoEmail = 0;
     const detail: Array<{ subcontractorId: string; packages: string[]; status: string; error?: string }> = [];
     const from = this.testEmailOverride?.from ?? ITT_FROM_ADDRESS;
@@ -2146,7 +2326,12 @@ export class TenderPrepDatabase {
         email,
         address: contact?.contact_address ? String(contact.contact_address) : null
       };
-      const rendered = renderIttEmail(packs, recipient, { projectName, completeBundleUrl, letterContext });
+      const portalStatusByPackage: Record<string, IttEmailPortalStatus> = {};
+      for (const [packageName, shortlistEntryId] of packages) {
+        const status = portalStatuses.get(`${shortlistEntryId}::${packageName}`);
+        if (status) portalStatusByPackage[packageName] = status;
+      }
+      const rendered = renderIttEmail(packs, recipient, { projectName, completeBundleUrl, letterContext, portalStatusByPackage });
       const subject = this.testEmailOverride
         ? `[TEST → ${contact?.contact_name ? String(contact.contact_name) : 'unknown'} <${realEmail ?? 'no email on file'}>] ${rendered.subject}`
         : rendered.subject;
@@ -2223,6 +2408,20 @@ export class TenderPrepDatabase {
         .map((c) => [String(c.subcontractor_id), c])
     );
 
+    // Every link for this send, minted and Access-synced BEFORE any email leaves — see
+    // mintPortalLinksFor's doc comment for why this is not best-effort like everything
+    // else in this method.
+    const portalStatuses = await this.mintPortalLinksFor(recipients.map((recipient) => {
+      const contact = contacts.get(String(recipient.subcontractor_id));
+      const email = this.testEmailOverride?.to ?? (contact?.contact_email ? String(contact.contact_email) : null);
+      return {
+        shortlistEntryId: String(recipient.shortlist_entry_id), workflowId, packageName,
+        subcontractorId: String(recipient.subcontractor_id),
+        tendererName: contact?.name ? String(contact.name) : 'Unknown firm',
+        recipientEmail: email, emailPack
+      };
+    }));
+
     let sent = 0, failed = 0, skippedNoEmail = 0;
     const detail: Array<{ subcontractorId: string; status: string; error?: string }> = [];
 
@@ -2255,7 +2454,11 @@ export class TenderPrepDatabase {
         email,
         address: contact?.contact_address ? String(contact.contact_address) : null
       };
-      const rendered = renderIttEmail([emailPack], recipientInfo, { projectName, completeBundleUrl, letterContext });
+      const portalStatus = portalStatuses.get(`${shortlistEntryId}::${packageName}`);
+      const rendered = renderIttEmail([emailPack], recipientInfo, {
+        projectName, completeBundleUrl, letterContext,
+        portalStatusByPackage: portalStatus ? { [packageName]: portalStatus } : undefined
+      });
       // Keeps test-inbox messages distinguishable across packages/recipients when every
       // send lands in the same TEST_TO_EMAIL_ACCOUNT.
       const subject = this.testEmailOverride
@@ -2339,6 +2542,113 @@ export class TenderPrepDatabase {
        WHERE sl.workflow_id = $1 ORDER BY sl.package_name, se.rank`,
       [workflowId]
     );
+  }
+
+  // ── Subcontractor pricing portal — the buyer-facing side (an Actor, a workflow) ─────
+
+  /** Every firm this package's ITT went to, with their portal status — the "Open
+   * responses" modal's list. */
+  async listPortalResponses(actor: Actor, workflowId: string, packageName: string): Promise<Row[]> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.portalDb) return [];
+    const links = await this.portalDb.listForPackage(workflowId, packageName);
+    const subcontractorIds = [...new Set(links.map((l) => String(l.subcontractor_id)).filter(Boolean))];
+    const contacts = new Map(
+      (await this.scms.getContactsForSubcontractors(subcontractorIds))
+        .map((c) => [String(c.subcontractor_id), c])
+    );
+    return links.map((l) => ({ ...l, firm_name: contacts.get(String(l.subcontractor_id))?.name ?? l.tenderer_name }));
+  }
+
+  /** One firm's priced bill, read-only — what "Open response" in that modal opens. */
+  async getPortalResponse(actor: Actor, workflowId: string, linkId: string): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.portalDb) throw notFound('The subcontractor pricing portal is not configured in this environment.');
+    const link = await this.portalDb.getById(linkId);
+    if (!link || String(link.workflow_id) !== workflowId) throw notFound('Pricing portal link not found');
+    const lines = await this.portalDb.getLines(linkId);
+    return { ...link, lines };
+  }
+
+  /**
+   * A buyer reopens a submitted return for the tenderer to revise — a decision, so it is
+   * recorded (`reopened_at`/`reopened_by`) rather than silently clearing `submitted_at`.
+   * The prior submission's `tender_returns` row is left as-is; a fresh submit overwrites
+   * it via the same ON CONFLICT `PricingPortalDatabase.submit` already uses.
+   */
+  async reopenPortalResponse(actor: Actor, workflowId: string, linkId: string): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.portalDb) throw notFound('The subcontractor pricing portal is not configured in this environment.');
+    const link = await this.portalDb.getById(linkId);
+    if (!link || String(link.workflow_id) !== workflowId) throw notFound('Pricing portal link not found');
+    if (!link.submitted_at) throw conflict('This return has not been submitted, so there is nothing to reopen.');
+    await this.portalDb.reopen(linkId, actor.userId);
+    return this.getPortalResponse(actor, workflowId, linkId);
+  }
+
+  // ── Subcontractor pricing portal — the public-facing side (a token, no Actor) ───────
+
+  /**
+   * Resolves a portal token to its link row, binding the caller's VERIFIED Cloudflare
+   * Access identity to the recipient the link was issued to. THE TOKEN says WHICH
+   * dispatch; THIS BINDING says WHO is allowed to see it — neither alone is enough, and
+   * this is what stops one invited firm opening another's rates once both satisfy the
+   * same Access policy.
+   *
+   * `accessEmail` is null only when PORTAL_ACCESS_REQUIRED=false (local development with
+   * no Cloudflare Access in front of anything, forbidden in production by `loadConfig`)
+   * — the binding check is skipped and the token is trusted alone, matching the warning
+   * `accessJwt.ts` already logs for that case.
+   *
+   * A same-domain match is accepted alongside an exact address match — a colleague at the
+   * same firm picking up the tender from the named estimator is an ordinary event, not a
+   * breach — but public/free domains never qualify for it: two people at gmail.com are
+   * unrelated strangers. In the approved design no link is ever minted for a public-domain
+   * recipient in the first place (see mintPortalLinksFor), so this is belt-and-braces
+   * against a link somehow existing for one anyway.
+   */
+  private async resolvePortalToken(token: string, accessEmail: string | null): Promise<Row> {
+    if (!this.portalDb) throw notFound('Online pricing is not available.');
+    const link = await this.portalDb.getByToken(token);
+    if (!link) throw notFound('This link has expired or is no longer valid.');
+    if (accessEmail) {
+      const linkEmail = String(link.recipient_email).toLowerCase();
+      const linkDomain = String(link.recipient_domain).toLowerCase();
+      const matches = accessEmail === linkEmail
+        || (!isPublicEmailDomain(linkDomain) && domainOf(accessEmail) === linkDomain);
+      if (!matches) {
+        await this.portalDb.recordDenial(String(link.id), accessEmail);
+        throw forbidden('This link was not issued to your address. If you believe this is a mistake, ask whoever sent it to resend it to you directly.');
+      }
+    }
+    await this.portalDb.recordOpen(String(link.id), accessEmail);
+    return link;
+  }
+
+  async getPortalPackage(token: string, accessEmail: string | null): Promise<Row> {
+    const link = await this.resolvePortalToken(token, accessEmail);
+    const lines = await this.portalDb!.getLines(String(link.id));
+    const [letterDetails] = await this.db.query<Row>(
+      `SELECT tender_return_deadline FROM itt_letter_details WHERE workflow_id = $1`, [link.workflow_id]
+    );
+    return { ...link, lines, tender_return_deadline: letterDetails?.tender_return_deadline ?? null };
+  }
+
+  async savePortalDraft(token: string, accessEmail: string | null, input: {
+    header: { programmeWeeks: number | null; qualifications: string | null; exclusions: string | null };
+    lines: PortalLineDraftInput[];
+  }): Promise<Row> {
+    const link = await this.resolvePortalToken(token, accessEmail);
+    if (link.submitted_at) throw conflict('This return has already been submitted and can no longer be edited.');
+    await this.portalDb!.saveDraft(String(link.id), input);
+    return this.getPortalPackage(token, accessEmail);
+  }
+
+  async submitPortalResponse(token: string, accessEmail: string | null): Promise<Row> {
+    const link = await this.resolvePortalToken(token, accessEmail);
+    if (link.submitted_at) throw conflict('This return has already been submitted.');
+    await this.portalDb!.submit(String(link.id));
+    return this.getPortalPackage(token, accessEmail);
   }
 
   // ── Step 3: Comparative ───────────────────────────────────────────────────

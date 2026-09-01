@@ -118,11 +118,27 @@ export interface IttEmailPack {
   attachmentCodes: string[];
 }
 
+/** Whether, and why, a subcontractor pricing portal link exists for one package on THIS
+ * send. Keyed by package name on `IttEmailOptions`, not stored on `IttEmailPack` itself —
+ * `sendIttsForWorkflow` assembles one `IttEmailPack` per package and shares that same
+ * object across every firm invited to it, so a per-recipient URL living on the pack would
+ * leak firm A's token into firm B's rendered email the moment both share a package. */
+export interface IttEmailPortalStatus {
+  url: string | null;
+  /** Why no link exists, e.g. "this recipient's email domain is a public/free provider".
+   * Null when `url` is set. */
+  unavailableReason: string | null;
+}
+
 export interface IttEmailOptions {
   projectName: string;
   /** Everything the tender pack contains, as one zip. The safety net beside each package pack. */
   completeBundleUrl: string | null;
   letterContext: IttEmailLetterContext;
+  /** THIS RECIPIENT's portal status per package name. Absent entirely (undefined) omits
+   * the online-pricing section altogether, which is also what every existing caller and
+   * test that predates this feature gets automatically. */
+  portalStatusByPackage?: Record<string, IttEmailPortalStatus>;
 }
 
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -241,6 +257,20 @@ const documentsSentence = (pack: IttEmailPack, completeBundleUrl: string | null)
     : 'The tender documents for this package will be issued separately.';
 };
 
+/**
+ * One line about the online pricing portal, or nothing at all — never a heading with
+ * nothing under it. `status` is undefined for every caller that predates this feature
+ * (previews, and any test not passing `portalStatusByPackage`), which must render
+ * exactly as it did before this section existed.
+ */
+const portalSentence = (status: IttEmailPortalStatus | undefined): string | null => {
+  if (!status) return null;
+  if (status.url) return `Price and submit this package's bill online: ${status.url}`;
+  return status.unavailableReason
+    ? `Online pricing is not available for this recipient (${status.unavailableReason}) — please price using the attached workbook instead.`
+    : null;
+};
+
 const ATTACHMENT_LABELS: Record<string, string> = {
   cover_letter: 'Cover Letter',
   form_1a: '1A Instructions to Tenderers',
@@ -297,12 +327,13 @@ const dateOrTbc = (s: string | null): string => s ?? 'to be confirmed';
 
 const RULE = '='.repeat(78);
 
-const packageTextBlock = (pack: IttEmailPack, completeBundleUrl: string | null): string => {
+const packageTextBlock = (pack: IttEmailPack, completeBundleUrl: string | null, portalStatus: IttEmailPortalStatus | undefined): string => {
   const boqRows = boqRowsFor(pack);
   const billRows = billRowsFor(pack);
   const specRows = specRowsFor(pack);
   const requiredForms = pack.returnForms.filter((f) => f.isRequired);
   const optionalForms = pack.returnForms.filter((f) => !f.isRequired);
+  const portalLine = portalSentence(portalStatus);
 
   return `${RULE}
 WORK PACKAGE: ${pack.packageName} (ref ${pack.displayRef})
@@ -333,10 +364,11 @@ ${boqIntro(pack)}
 ${boqRows.length > 0 ? textTable(BOQ_HEADERS, boqRows) : 'No measured lines are attributed to this package.'}
 ${billRows.length > 0 ? `\nBILL OF QUANTITIES — AUTHORED ITEMS\n${textTable(BILL_HEADERS, billRows)}\n` : ''}
 ${specRows.length > 0 ? `\nSPECIFICATION CLAUSES\n${textTable(SPEC_HEADERS, specRows)}\n` : ''}
-${pack.valueEngineeringRequired ? `\nVALUE ENGINEERING\n${VALUE_ENGINEERING_SENTENCE}\n` : ''}`;
+${pack.valueEngineeringRequired ? `\nVALUE ENGINEERING\n${VALUE_ENGINEERING_SENTENCE}\n` : ''}
+${portalLine ? `\nSECTION 6 — PRICE THIS PACKAGE ONLINE\n${portalLine}\n` : ''}`;
 };
 
-const packageHtmlBlock = (pack: IttEmailPack, completeBundleUrl: string | null): string => {
+const packageHtmlBlock = (pack: IttEmailPack, completeBundleUrl: string | null, portalStatus: IttEmailPortalStatus | undefined): string => {
   const boqHtmlRows = boqRowsFor(pack).map((r) => r.map(esc));
   const billHtmlRows = billRowsFor(pack).map((r) => r.map(esc));
   const specHtmlRows = specRowsFor(pack).map((r) => r.map(esc));
@@ -386,6 +418,12 @@ const packageHtmlBlock = (pack: IttEmailPack, completeBundleUrl: string | null):
   ${pack.valueEngineeringRequired ? `
   <h3 style="font-size: 15px;">Value Engineering</h3>
   <p><strong>Mandatory.</strong> ${esc(VALUE_ENGINEERING_SENTENCE)}</p>` : ''}
+
+  ${portalSentence(portalStatus) ? `
+  <h3 style="font-size: 15px;">Section 6 — Price this package online</h3>
+  ${portalStatus?.url
+    ? `<p><a href="${esc(portalStatus.url)}"><strong>Price and submit this package's bill online</strong></a></p>`
+    : `<p>${esc(portalSentence(portalStatus) ?? '')}</p>`}` : ''}
   </div>`;
 };
 
@@ -455,7 +493,7 @@ The below information forms the basis of the ITT and are our Employer's Contract
 
 ${sections}
 
-${packages.map((p) => packageTextBlock(p, completeBundleUrl)).join('\n')}
+${packages.map((p) => packageTextBlock(p, completeBundleUrl, options.portalStatusByPackage?.[p.packageName])).join('\n')}
 ${completeTextBlock}
 Please raise all technical and commercial queries in writing before the return date.
 
@@ -492,7 +530,7 @@ On behalf of ${letterContext.organizationName}
   </table>
   <pre style="font-family: inherit; white-space: pre-wrap; font-size: 13px; color: #333;">${esc(sections)}</pre>
 
-  ${packages.map((p) => packageHtmlBlock(p, completeBundleUrl)).join('')}
+  ${packages.map((p) => packageHtmlBlock(p, completeBundleUrl, options.portalStatusByPackage?.[p.packageName])).join('')}
 
   ${completeBundleUrl ? `
   <div style="border-top: 3px solid #1a1a1a; margin-top: 28px; padding-top: 8px;">
