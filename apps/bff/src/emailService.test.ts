@@ -47,6 +47,40 @@ describe('EmailService', () => {
     expect(client.emailSending.send).toHaveBeenCalledWith(expect.objectContaining({ attachments }));
   });
 
+  it('carries several recipients, a cc list and a reply-to on one message', async () => {
+    // What the in-app compose box sends: the person chose to put these people on one email.
+    const service = new EmailService({ cloudflareApiToken: 'token', cloudflareAccountId: 'account-1' });
+    const client = (service as unknown as { client: { emailSending: { send: ReturnType<typeof vi.fn> } } }).client;
+
+    await service.send({
+      from: 'tenders@novamerx.ai',
+      to: ['a@example.com', 'b@example.com'],
+      cc: ['qs@novamerx.ai'],
+      replyTo: 'jo@novamerx.ai',
+      subject: 'ITT', html: '<p>ITT</p>', text: 'ITT'
+    });
+
+    expect(client.emailSending.send).toHaveBeenCalledWith(expect.objectContaining({
+      to: ['a@example.com', 'b@example.com'],
+      cc: ['qs@novamerx.ai'],
+      reply_to: 'jo@novamerx.ai'
+    }));
+  });
+
+  it('omits cc and reply_to rather than sending them empty', async () => {
+    const service = new EmailService({ cloudflareApiToken: 'token', cloudflareAccountId: 'account-1' });
+    const client = (service as unknown as { client: { emailSending: { send: ReturnType<typeof vi.fn> } } }).client;
+
+    await service.send({
+      from: 'tenders@novamerx.ai', to: 'a@example.com', cc: [], replyTo: undefined,
+      subject: 'ITT', html: '<p>ITT</p>', text: 'ITT'
+    });
+
+    const sent = client.emailSending.send.mock.calls[0][0];
+    expect(sent).not.toHaveProperty('cc');
+    expect(sent).not.toHaveProperty('reply_to');
+  });
+
   it('omits the attachments field entirely when the list is empty', async () => {
     const service = new EmailService({ cloudflareApiToken: 'token', cloudflareAccountId: 'account-1' });
     const client = (service as unknown as { client: { emailSending: { send: ReturnType<typeof vi.fn> } } }).client;

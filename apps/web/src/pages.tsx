@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Fragment, FormEvent, useState } from 'react';
-import { Outlet, useNavigate, useParams } from 'react-router-dom';
-import { api, type ConfirmIttResult, type IttDispatch, type IttLineSection, type IttPack, type LaunchTableRow, type SendAllIttsResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
+import { Fragment, FormEvent, useEffect, useState } from 'react';
+import { Link, Outlet, useNavigate, useParams } from 'react-router-dom';
+import { api, type ConfirmIttResult, type IttDispatch, type IttLetterDetailsInput, type IttLineSection, type IttPack, type LaunchTableRow, type PortalResponseSummary, type SendAllIttsResult, type SendIttDraftResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
 import { oidc, signIn } from './auth';
 
 function ErrorMessage({ error }: { error: unknown }) {
@@ -60,7 +60,7 @@ export function PackagesListPage() {
             <td>{takeoff?.packageName ?? wf.package_id}</td>
             <td>Step {wf.current_step}: {STEP_TITLES[wf.current_step - 1]}</td>
             <td>{new Date(wf.updated_at).toLocaleString()}</td>
-            <td><a className="button-link" href={`/packages/${wf.package_id}/tender-prep`}>Open →</a></td>
+            <td><Link className="button-link" to={`/packages/${wf.package_id}/tender-prep`}>Open →</Link></td>
           </tr>;
         })}
       </tbody>
@@ -722,149 +722,254 @@ function IttPackView({ pack, workflowId, packageName }: { pack: IttPack; workflo
 }
 
 /**
- * "Open draft Email" — one package's ITT handed to the user to send themselves.
+ * "Open draft Email" — one package's ITT, composed and sent from inside the app.
  *
- * A browser cannot put a message into a mail app's Drafts folder. The desktop option therefore
- * downloads a `.eml`, which Outlook opens as an editable unsent message; Gmail and Outlook Web
- * are reached by a compose link, which carries a plain-text body in a URL and CANNOT carry
- * files. That difference is real and is stated in the options rather than glossed over — a
- * tenderer who never receives the pricing schedule cannot price the job.
+ * An earlier version handed the message off to Outlook. It could not: a web page cannot launch
+ * a desktop application, and the one thing that opens a mail client (`mailto:`) carries neither
+ * HTML nor attachments. So the message never leaves the app — the modal shows exactly what will
+ * be sent, takes the addresses, and the server sends it.
+ *
+ * THE BODY IS READ-ONLY. To, Cc and Subject are all that cross the wire on Send; the server
+ * rebuilds the scope, bill, links and attachments from its own assembly. A tenderer's
+ * obligations are not editable in a browser on their way out.
  */
-type DraftApp = 'desktop' | 'gmail' | 'outlook-web';
+function AddressField({ label, hint, value, onChange }: {
+  label: string;
+  hint?: string;
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  return <div className="compose-field">
+    <label htmlFor={`compose-${label}`}>{label}</label>
+    <div style={{ flex: 1 }}>
+      <input
+        id={`compose-${label}`}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="name@example.com, another@example.com"
+      />
+      {hint && <div className="tiny muted" style={{ marginTop: 3 }}>{hint}</div>}
+    </div>
+  </div>;
+}
 
-const DRAFT_APP_KEY = 'tps.ittDraftApp';
+/** Split a typed address line. Commas and semicolons both, since people paste both. */
+const splitAddresses = (value: string): string[] =>
+  value.split(/[,;]/).map((a) => a.trim()).filter(Boolean);
 
-const DRAFT_APPS: Array<{ id: DraftApp; label: string; note: string }> = [
-  {
-    id: 'desktop',
-    label: 'Outlook / desktop mail app',
-    note: 'Downloads the draft as a .eml file carrying the whole email — HTML body, scope of works PDF and pricing schedule. Open the file and your mail app shows an unsent message you can address, edit and send.'
-  },
-  {
-    id: 'gmail',
-    label: 'Gmail',
-    note: 'Opens a compose tab. A compose link cannot carry files, so the scope PDF and pricing schedule are NOT attached — the body carries the document pack links instead.'
-  },
-  {
-    id: 'outlook-web',
-    label: 'Outlook Web (Microsoft 365)',
-    note: 'Opens a compose tab. Same limitation as Gmail: links only, no attachments.'
-  }
-];
+const looksLikeEmail = (address: string): boolean => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address);
 
-function IttDraftPanel({ workflowId, packageName }: { workflowId: string; packageName: string }) {
-  // Preselects the last answer but still asks, as specified. localStorage throws outright in
-  // some privacy modes, so every access is guarded.
-  const [app, setApp] = useState<DraftApp>(() => {
-    try {
-      const saved = localStorage.getItem(DRAFT_APP_KEY);
-      return saved === 'gmail' || saved === 'outlook-web' ? saved : 'desktop';
-    } catch { return 'desktop'; }
-  });
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<unknown>(null);
-  const [done, setDone] = useState<string | null>(null);
+function IttComposeModal({ workflowId, packageName, onClose, onSent }: {
+  workflowId: string;
+  packageName: string;
+  onClose: () => void;
+  onSent: () => void;
+}) {
+  const [to, setTo] = useState('');
+  const [cc, setCc] = useState('');
+  const [subject, setSubject] = useState('');
+  const [prefilled, setPrefilled] = useState(false);
+  const [result, setResult] = useState<SendIttDraftResult | null>(null);
 
-  // Fetched when the panel OPENS, not when "Open draft" is clicked: window.open() called after
-  // an await has lost its user gesture and is blocked by Safari and Firefox. With the draft
-  // already in hand, the compose branch below is synchronous.
   const draft = useQuery({
     queryKey: ['itt-draft', workflowId, packageName],
     queryFn: () => api.getIttDraft(workflowId, packageName)
   });
 
-  const openDraft = () => {
-    const data = draft.data;
-    if (!data) return;
-    setError(null);
-    setDone(null);
-    try { localStorage.setItem(DRAFT_APP_KEY, app); } catch { /* private browsing — the choice just is not remembered */ }
+  // Pre-filled once, from the firms the tender launch meeting selected. Only once: re-running
+  // this on every render would undo the sender's edits as they typed.
+  useEffect(() => {
+    if (!draft.data || prefilled) return;
+    // TEMPORARY (testing the pricing-portal link) — revert to joining draft.data.recipients.
+    setTo('vipvyas@novamerx.ai');
+    setSubject(draft.data.subject);
+    setPrefilled(true);
+  }, [draft.data, prefilled]);
 
-    if (app === 'desktop') {
-      setBusy(true);
-      api.getIttDraftEml(workflowId, packageName)
-        .then((blob) => {
-          const url = URL.createObjectURL(blob);
-          const link = document.createElement('a');
-          link.href = url;
-          // The server sends no Content-Disposition (it would need a CORS change to read back),
-          // so the filename is composed here. Same characters stripped as the attachments.
-          link.download = `ITT - ${packageName.replace(/[\\/:*?"<>|]+/g, ' ').trim()}.eml`;
-          document.body.appendChild(link);
-          link.click();
-          link.remove();
-          // Revoked on the next tick: revoking synchronously cancels the download in Safari.
-          setTimeout(() => URL.revokeObjectURL(url), 1000);
-          setDone('Draft downloaded. Open the file and your mail app will show it as an unsent message.');
-        })
-        .catch((e: unknown) => setError(e))
-        .finally(() => setBusy(false));
-      return;
-    }
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
 
-    const subject = encodeURIComponent(data.subject);
-    const body = encodeURIComponent(data.composeBody);
-    window.open(
-      app === 'gmail'
-        ? `https://mail.google.com/mail/?view=cm&fs=1&to=&su=${subject}&body=${body}`
-        : `https://outlook.office.com/mail/deeplink/compose?subject=${subject}&body=${body}`,
-      '_blank',
-      'noopener'
-    );
-    setDone('Compose tab opened. Add the subcontractor’s address before sending.');
-  };
+  const send = useMutation({
+    mutationFn: () => api.sendIttDraft(workflowId, packageName, {
+      to: splitAddresses(to), cc: splitAddresses(cc), subject: subject.trim()
+    }),
+    onSuccess: (sent) => { setResult(sent); onSent(); }
+  });
 
-  return <div className="alert alert-grey" style={{ marginBottom: 0 }}>
-    <strong>Open a draft of this ITT in your own mail app</strong>
-    <p className="tiny" style={{ margin: '4px 0 10px' }}>
-      The same email Confirm ITT would send, <strong>addressed to nobody</strong> — you add the
-      subcontractor yourself, so no firm ever sees a competitor on the message. Nothing is
-      recorded against this ITT until you send it from your own mail app.
-    </p>
-    {draft.isLoading ? <Busy>Building the draft…</Busy>
-      : draft.error ? <ErrorMessage error={draft.error} />
-      : draft.data ? <>
-        <div style={{ display: 'grid', gap: 8, marginBottom: 10 }}>
-          {DRAFT_APPS.map((choice) => <label key={choice.id} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', cursor: 'pointer' }}>
-            <input
-              type="radio"
-              name={`draft-app-${packageName}`}
-              checked={app === choice.id}
-              onChange={() => setApp(choice.id)}
-              style={{ marginTop: 3, width: 'auto' }}
+  const toAddresses = splitAddresses(to);
+  const ccAddresses = splitAddresses(cc);
+  const invalid = [...toAddresses, ...ccAddresses].filter((a) => !looksLikeEmail(a));
+  const canSend = toAddresses.length > 0 && invalid.length === 0 && subject.trim().length > 0;
+  const unreachable = (draft.data?.recipients ?? []).filter((r) => !r.email);
+
+  return <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal-header">
+        <h3>Send the {packageName} ITT</h3>
+        <button className="modal-close" onClick={onClose} aria-label="Close">×</button>
+      </div>
+
+      <div className="modal-body">
+        {draft.isLoading ? <Busy>Building the email…</Busy>
+          : draft.error ? <ErrorMessage error={draft.error} />
+          : draft.data ? <>
+            {result ? <div className="alert alert-green">
+              Sent to {result.recipients} address{result.recipients === 1 ? '' : 'es'} with {result.attachments} attachment
+              {result.attachments === 1 ? '' : 's'}. Recorded against {result.recorded} shortlisted firm
+              {result.recorded === 1 ? '' : 's'}
+              {result.not_recorded > 0 && `; ${result.not_recorded} address${result.not_recorded === 1 ? '' : 'es'} matched no shortlisted firm and left no dispatch record`}.
+            </div> : <>
+              <AddressField label="To" value={to} onChange={setTo} hint={
+                unreachable.length > 0
+                  ? `No contact email on file for ${unreachable.map((r) => r.name ?? 'an unnamed firm').join(', ')} — add an address by hand or they will not be invited.`
+                  : undefined
+              } />
+              <AddressField label="Cc" value={cc} onChange={setCc} />
+              <div className="compose-field">
+                <label htmlFor="compose-subject">Subject</label>
+                <input id="compose-subject" value={subject} onChange={(e) => setSubject(e.target.value)} />
+              </div>
+              {invalid.length > 0 && <p className="error">Not a valid address: {invalid.join(', ')}</p>}
+            </>}
+
+            <div className="tiny muted" style={{ margin: '12px 0 6px' }}>
+              Attachments: {draft.data.attachments.length > 0
+                ? draft.data.attachments.map((a) => `${a.filename} (${Math.max(1, Math.round(a.bytes / 1024))} KB)`).join(', ')
+                : draft.data.attachmentsOmittedOversize
+                  ? 'none — the generated files exceed what one email can carry'
+                  : 'none were generated for this package'}
+            </div>
+
+            {!draft.data.bundleUrl && <div className="alert alert-amber" style={{ marginBottom: 10 }}>
+              <strong>No document pack for this package.</strong>{' '}
+              {draft.data.completeBundleUrl
+                ? 'The email points the tenderer at the complete tender document set instead. Re-release the take-off to produce per-package packs.'
+                : 'The email says the documents will be issued separately, because neither a package pack nor a complete set has been built. Re-release the take-off first if the tenderer should receive documents with this invitation.'}
+            </div>}
+
+            {/* The preview below is sandboxed (no allow-downloads), so its embedded "Download…"
+                link cannot be clicked from inside the frame. Offer a working one here instead. */}
+            {draft.data.bundleUrl
+              ? <p style={{ margin: '0 0 10px' }}>
+                  <a href={draft.data.bundleUrl} target="_blank" rel="noreferrer" className="button-link">
+                    Download the {packageName} document pack →
+                  </a>
+                </p>
+              : draft.data.completeBundleUrl && <p style={{ margin: '0 0 10px' }}>
+                  <a href={draft.data.completeBundleUrl} target="_blank" rel="noreferrer" className="button-link">
+                    Download the complete tender document set →
+                  </a>
+                </p>}
+
+            {draft.data.portalUrl && <p style={{ margin: '0 0 10px' }}>
+              <a href={draft.data.portalUrl} target="_blank" rel="noreferrer" className="button-link">
+                Price and submit this package's bill online →
+              </a>
+            </p>}
+
+            {/* Sandboxed: the ITT carries its own inline styles and must neither inherit the
+                app's nor leak into it. srcDoc keeps it entirely local — nothing is fetched. */}
+            <iframe
+              className="compose-preview"
+              title={`${packageName} ITT preview`}
+              sandbox=""
+              srcDoc={draft.data.html}
             />
-            <span>
-              <strong>{choice.label}</strong>
-              <span className="tiny muted" style={{ display: 'block' }}>{choice.note}</span>
-            </span>
-          </label>)}
-        </div>
+            <p className="tiny muted" style={{ marginTop: 6, marginBottom: 0 }}>
+              This is exactly what will be sent. The body is not editable — it is rebuilt on the
+              server when you send, so the scope and return requirements cannot be altered here.
+            </p>
+          </> : null}
+        <ErrorMessage error={send.error} />
+      </div>
 
-        <div className="tiny muted" style={{ marginBottom: 10 }}>
-          <div>Subject: {draft.data.subject}</div>
-          <div>
-            {draft.data.attachments.length > 0
-              ? `Carried by the .eml: ${draft.data.attachments.map((a) => `${a.filename} (${Math.max(1, Math.round(a.bytes / 1024))} KB)`).join(', ')}`
-              : draft.data.attachmentsOmittedOversize
-                ? 'No attachments — the generated files exceed what one email can carry, so a real send would drop them too.'
-                : 'No attachments were generated for this package.'}
-          </div>
-          {!draft.data.bundleUrl && <div>
-            No document pack has been built for this package yet, so the draft carries no
-            package-specific document link.
-          </div>}
-        </div>
-
-        <button className="small" disabled={busy} onClick={openDraft}>{busy ? 'Building…' : 'Open draft'}</button>
-        {done && <p className="tiny" style={{ marginTop: 8, marginBottom: 0 }}>{done}</p>}
-        <ErrorMessage error={error} />
-      </> : null}
+      <div className="modal-footer">
+        <button className="small secondary" onClick={onClose}>{result ? 'Close' : 'Cancel'}</button>
+        {!result && <button
+          className="small"
+          disabled={!canSend || send.isPending || !draft.data}
+          onClick={() => send.mutate()}
+        >
+          {send.isPending ? 'Sending…' : `Send${toAddresses.length > 0 ? ` to ${toAddresses.length}` : ''}`}
+        </button>}
+      </div>
+    </div>
   </div>;
+}
+
+/**
+ * Site address, deadlines, site-visit and the estimator's own details — the facts
+ * the cover letter and Form 1A need that nothing else in the workflow captures.
+ * Estimator name/email arrive pre-filled from the confirming user's own account
+ * (server-side default) and are editable here before the first ITT goes out.
+ */
+function IttLetterDetailsPanel({ workflowId }: { workflowId: string }) {
+  const queryClient = useQueryClient();
+  const details = useQuery({ queryKey: ['itt-letter-details', workflowId], queryFn: () => api.getIttLetterDetails(workflowId) });
+  const [draft, setDraft] = useState<IttLetterDetailsInput | null>(null);
+  const current: IttLetterDetailsInput = draft ?? {
+    siteAddress: details.data?.site_address ?? '',
+    tenderReturnDeadline: details.data?.tender_return_deadline ?? '',
+    clarificationsCloseDate: details.data?.clarifications_close_date ?? '',
+    siteVisitPermitted: details.data?.site_visit_permitted ?? null,
+    estimatorName: details.data?.estimator_name ?? '',
+    estimatorEmail: details.data?.estimator_email ?? ''
+  };
+  const save = useMutation({
+    mutationFn: () => api.saveIttLetterDetails(workflowId, current),
+    onSuccess: () => { setDraft(null); void queryClient.invalidateQueries({ queryKey: ['itt-letter-details', workflowId] }); }
+  });
+
+  if (details.isLoading) return null;
+
+  return <details className="panel" style={{ marginBottom: 12 }}>
+    <summary style={{ cursor: 'pointer', fontWeight: 600 }}>ITT letter details</summary>
+    <p className="muted tiny">Used on the cover letter and Form 1A — site address, return deadline and who to contact.</p>
+    <div className="stack" style={{ marginTop: 8 }}>
+      <label className="field"><span>Site address</span>
+        <input value={current.siteAddress ?? ''} onChange={(e) => setDraft({ ...current, siteAddress: e.target.value })} />
+      </label>
+      <div className="two-column">
+        <label className="field"><span>Tender return deadline</span>
+          <input type="date" value={current.tenderReturnDeadline ?? ''} onChange={(e) => setDraft({ ...current, tenderReturnDeadline: e.target.value })} />
+        </label>
+        <label className="field"><span>Clarifications close</span>
+          <input type="date" value={current.clarificationsCloseDate ?? ''} onChange={(e) => setDraft({ ...current, clarificationsCloseDate: e.target.value })} />
+        </label>
+      </div>
+      <label className="field"><span>Site visit permitted</span>
+        <select value={current.siteVisitPermitted === null || current.siteVisitPermitted === undefined ? '' : String(current.siteVisitPermitted)}
+          onChange={(e) => setDraft({ ...current, siteVisitPermitted: e.target.value === '' ? null : e.target.value === 'true' })}>
+          <option value="">Not stated</option>
+          <option value="true">Yes</option>
+          <option value="false">No</option>
+        </select>
+      </label>
+      <div className="two-column">
+        <label className="field"><span>Estimator name</span>
+          <input value={current.estimatorName ?? ''} onChange={(e) => setDraft({ ...current, estimatorName: e.target.value })} />
+        </label>
+        <label className="field"><span>Estimator email</span>
+          <input value={current.estimatorEmail ?? ''} onChange={(e) => setDraft({ ...current, estimatorEmail: e.target.value })} />
+        </label>
+      </div>
+      <div>
+        <button type="button" disabled={save.isPending} onClick={() => save.mutate()}>
+          {save.isPending ? 'Saving…' : 'Save'}
+        </button>
+        {save.isError && <span className="tiny" style={{ color: '#c0392b', marginLeft: 8 }}>{(save.error as Error).message}</span>}
+      </div>
+    </div>
+  </details>;
 }
 
 function Step2IttDispatch({ workflowId }: { workflowId: string }) {
   const [open, setOpen] = useState<string | null>(null);
   const [draftOpen, setDraftOpen] = useState<string | null>(null);
+  const [responsesOpen, setResponsesOpen] = useState<string | null>(null);
   const [lastResult, setLastResult] = useState<ConfirmIttResult | null>(null);
   const [sendAllResult, setSendAllResult] = useState<SendAllIttsResult | null>(null);
   const queryClient = useQueryClient();
@@ -907,6 +1012,7 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
   }
 
   return <div className="panel">
+    <IttLetterDetailsPanel workflowId={workflowId} />
     <div className="shortlist-header">
       <h3>Invitations to Tender</h3>
       <span className="muted">{rows.length} package{rows.length === 1 ? '' : 's'} · {rows.reduce((n, r) => n + Number(r.recipients), 0)} recipients</span>
@@ -914,8 +1020,10 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
     <p className="muted" style={{ marginBottom: 12 }}>
       Built from the live take-off, package configuration and document set. Review below —
       untick anything that should not go out under "Ignore for ITT" — then confirm to email
-      the selected subcontractors. Each email carries the scope of works as a PDF, a blank
-      pricing schedule, and a link to that firm's document pack.
+      the selected subcontractors. Each email is a cover letter addressed to that firm, with the
+      configured attachments for its trade — forms, scope of works, schedule of attendances and
+      a blank pricing schedule — plus a link to that firm's document pack. Which attachments a
+      trade receives, and their wording, is set in Configuration → ITT attachment templates.
     </p>
 
     <div className="alert" style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
@@ -965,15 +1073,25 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
               {' '}{Number(r.skipped_no_email) > 0 && <span className="badge badge-amber">no email {r.skipped_no_email}</span>}
               {Number(r.sent) === 0 && Number(r.failed) === 0 && Number(r.skipped_no_email) === 0 &&
                 <span className="badge badge-grey">not sent</span>}
+              {' '}{Number(r.responses_received) > 0 && <span className="badge badge-blue">response received {r.responses_received}</span>}
+              {Number(r.portal_denials) > 0 && <div className="tiny" style={{ color: '#d97706', marginTop: 4 }}>
+                ⚠ a viewer's sign-in did not match the recipient on {r.portal_denials} link{Number(r.portal_denials) === 1 ? '' : 's'}
+              </div>}
             </td>
             <td style={{ whiteSpace: 'nowrap' }}>
               <button className="small secondary" onClick={() => setOpen(open === r.package_name ? null : r.package_name)}>
                 {open === r.package_name ? 'Close' : 'View ITT'}
               </button>
               {' '}
-              <button className="small secondary" onClick={() => setDraftOpen(draftOpen === r.package_name ? null : r.package_name)}>
-                {draftOpen === r.package_name ? 'Close draft' : 'Open draft Email'}
+              <button className="small secondary" onClick={() => setDraftOpen(r.package_name)}>
+                Open draft Email
               </button>
+              {Number(r.responses_received) > 0 && <>
+                {' '}
+                <button className="small secondary" onClick={() => setResponsesOpen(r.package_name)}>
+                  Open responses
+                </button>
+              </>}
             </td>
             <td>
               <button
@@ -994,11 +1112,6 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
               </div>
             </td>
           </tr>}
-          {draftOpen === r.package_name && <tr key={`${r.package_name}-draft`}>
-            <td colSpan={7} className="itt-cell">
-              <IttDraftPanel workflowId={workflowId} packageName={r.package_name} />
-            </td>
-          </tr>}
           {open === r.package_name && <tr key={`${r.package_name}-pack`}>
             <td colSpan={7} className="itt-cell">
               {pack.isLoading ? <Busy /> : pack.error ? <ErrorMessage error={pack.error} />
@@ -1008,6 +1121,151 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
         </>)}</tbody>
       </table>
     </div>
+
+    {draftOpen && <IttComposeModal
+      workflowId={workflowId}
+      packageName={draftOpen}
+      onClose={() => setDraftOpen(null)}
+      onSent={() => void queryClient.invalidateQueries({ queryKey: ['itts', workflowId] })}
+    />}
+
+    {responsesOpen && <PortalResponsesModal
+      workflowId={workflowId}
+      packageName={responsesOpen}
+      onClose={() => setResponsesOpen(null)}
+    />}
+  </div>;
+}
+
+/**
+ * "Open responses" — every firm this package's ITT went to, their portal status, and a
+ * way into each one's priced bill. Structured the same way as IttComposeModal: a list
+ * view that, on picking a firm, swaps in a detail view within the same modal rather than
+ * stacking a second one.
+ */
+function PortalResponsesModal({ workflowId, packageName, onClose }: {
+  workflowId: string; packageName: string; onClose: () => void;
+}) {
+  const [openLinkId, setOpenLinkId] = useState<string | null>(null);
+  const queryClient = useQueryClient();
+  const responses = useQuery({
+    queryKey: ['portal-responses', workflowId, packageName],
+    queryFn: () => api.listPortalResponses(workflowId, packageName)
+  });
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const blockedLabel = (reason: PortalResponseSummary['blocked_reason']) => {
+    if (reason === 'public_email_domain') return "no link — recipient's email domain is a public/free provider";
+    if (reason === 'access_unconfigured') return 'no link — online pricing is not configured on this deployment';
+    return null;
+  };
+
+  return <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal-header">
+        <h3>{openLinkId ? 'Response' : 'Responses'} — {packageName}</h3>
+        <button className="modal-close" onClick={onClose} aria-label="Close">×</button>
+      </div>
+      <div className="modal-body">
+        {openLinkId
+          ? <PortalResponseDetailView
+              workflowId={workflowId} linkId={openLinkId}
+              onBack={() => setOpenLinkId(null)}
+              onReopened={() => {
+                void queryClient.invalidateQueries({ queryKey: ['portal-responses', workflowId, packageName] });
+                void queryClient.invalidateQueries({ queryKey: ['itts', workflowId] });
+              }}
+            />
+          : responses.isLoading ? <Busy />
+          : responses.error ? <ErrorMessage error={responses.error} />
+          : <table className="data-table">
+              <thead><tr><th>Firm</th><th>Status</th><th></th></tr></thead>
+              <tbody>
+                {(responses.data ?? []).map((r) => <tr key={r.id}>
+                  <td>{r.firm_name}</td>
+                  <td>
+                    {r.submitted_at
+                      ? <span className="badge badge-green">submitted {new Date(r.submitted_at).toLocaleDateString()}</span>
+                      : r.draft_saved_at
+                        ? <span className="badge badge-amber">draft in progress</span>
+                        : r.token
+                          ? <span className="badge badge-grey">link sent, not opened</span>
+                          : <span className="badge badge-grey">{blockedLabel(r.blocked_reason)}</span>}
+                    {r.denied_attempts > 0 && <div className="tiny" style={{ color: '#d97706' }}>
+                      ⚠ {r.denied_attempts} sign-in attempt{r.denied_attempts === 1 ? '' : 's'} from a non-matching address
+                    </div>}
+                  </td>
+                  <td>
+                    {(r.submitted_at || r.draft_saved_at) &&
+                      <button className="small secondary" onClick={() => setOpenLinkId(r.id)}>Open response</button>}
+                  </td>
+                </tr>)}
+              </tbody>
+            </table>}
+      </div>
+    </div>
+  </div>;
+}
+
+function PortalResponseDetailView({ workflowId, linkId, onBack, onReopened }: {
+  workflowId: string; linkId: string; onBack: () => void; onReopened: () => void;
+}) {
+  const detail = useQuery({
+    queryKey: ['portal-response', workflowId, linkId],
+    queryFn: () => api.getPortalResponse(workflowId, linkId)
+  });
+  const reopen = useMutation({
+    mutationFn: () => api.reopenPortalResponse(workflowId, linkId),
+    onSuccess: onReopened
+  });
+
+  if (detail.isLoading) return <Busy />;
+  if (detail.error) return <ErrorMessage error={detail.error} />;
+  if (!detail.data) return null;
+  const r = detail.data;
+
+  const total = r.lines.reduce((sum, line) => {
+    if (line.status !== 'priced' || line.total == null) return sum;
+    return sum + Number(line.total);
+  }, 0);
+
+  return <div>
+    <button className="small secondary" onClick={onBack} style={{ marginBottom: 12 }}>← Back to responses</button>
+    <div className="info-row" style={{ marginBottom: 12 }}>
+      <div className="info-item"><span className="info-label">Firm</span>{r.firm_name}</div>
+      <div className="info-item"><span className="info-label">Programme</span>{r.programme_weeks ?? '—'} weeks</div>
+      <div className="info-item"><span className="info-label">Total (priced)</span>
+        {total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+    </div>
+    {r.qualifications && <p className="tiny" style={{ marginBottom: 8 }}><strong>Qualifications:</strong> {r.qualifications}</p>}
+    {r.exclusions && <p className="tiny" style={{ marginBottom: 8 }}><strong>Exclusions:</strong> {r.exclusions}</p>}
+    <div className="table-scroll">
+      <table className="data-table">
+        <thead><tr><th>Description</th><th>Qty</th><th>Unit</th><th>Rate</th><th>Total</th><th>Status</th><th>Note</th></tr></thead>
+        <tbody>
+          {r.lines.map((line) => <tr key={line.id}>
+            <td>{line.description}</td>
+            <td>{line.quantity ?? '—'}</td>
+            <td>{line.unit ?? '—'}</td>
+            <td>{line.rate ?? '—'}</td>
+            <td>{line.total ?? '—'}</td>
+            <td className="tiny">{line.status.replace(/_/g, ' ')}</td>
+            <td className="tiny">{line.note ?? ''}</td>
+          </tr>)}
+        </tbody>
+      </table>
+    </div>
+    {r.submitted_at && <div className="button-row" style={{ marginTop: 12 }}>
+      <button className="secondary" disabled={reopen.isPending} onClick={() => reopen.mutate()}>
+        {reopen.isPending ? 'Reopening…' : 'Reopen for editing'}
+      </button>
+    </div>}
+    {reopen.error && <ErrorMessage error={reopen.error} />}
   </div>;
 }
 

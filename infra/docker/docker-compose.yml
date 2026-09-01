@@ -97,6 +97,10 @@ services:
         VITE_DEV_EMAIL: ${VITE_DEV_EMAIL:-dev@example.com}
     ports:
       - "5175:8080"
+    # nginx resolves the /tps-api/ proxy_pass hostname at startup, so bff-tps should
+    # already exist on the network by then.
+    depends_on:
+      - bff-tps
     networks:
       - parent
 

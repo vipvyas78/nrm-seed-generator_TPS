@@ -1,8 +1,10 @@
 import cors from '@fastify/cors';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import { ZodError, z } from 'zod';
+import { buildAccessVerifier } from './accessJwt.js';
 import { buildAuthenticator, requireActor } from './auth.js';
 import type { Config } from './config.js';
+import { CloudflareAccessAdmin } from './cloudflareAccess.js';
 import { Database } from './db.js';
 import { AppError } from './errors.js';
 import { BoqReadDatabase } from './boqReadDb.js';
@@ -11,6 +13,7 @@ import { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js'
 import { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
 import { DropboxDocumentLinkProvider } from './documentLinkProvider.js';
 import { EmailService } from './emailService.js';
+import { PricingPortalDatabase } from './pricingPortalDb.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
 import { TenderPrepDatabase } from './tenderPrepDb.js';
 
@@ -57,7 +60,24 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const testEmailOverride = config.TEST_EMAIL_FLAG
     ? { from: config.TEST_FROM_EMAIL_ACCOUNT!, to: config.TEST_TO_EMAIL_ACCOUNT! }
     : null;
-  const tpDb = new TenderPrepDatabase(db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, documentBundles, emailService, testEmailOverride);
+
+  // The subcontractor pricing portal. portalDb needs only the database; accessAdmin
+  // additionally needs a Cloudflare API token — without one, mintPortalLinksFor records
+  // every recipient as blocked ('access_unconfigured') and the ITT sends exactly as it
+  // did before this feature existed. See config.ts for what each variable gates.
+  const portalDb = new PricingPortalDatabase(db);
+  const accessAdmin = config.CLOUDFLARE_API_TOKEN && config.CLOUDFLARE_ACCOUNT_ID
+    ? new CloudflareAccessAdmin(
+        db, config.CLOUDFLARE_ACCOUNT_ID, config.CLOUDFLARE_API_TOKEN,
+        new URL(config.PORTAL_BASE_URL ?? config.WEB_ORIGIN[0]).host
+      )
+    : undefined;
+  const verifyAccessIdentity = buildAccessVerifier(config, db);
+
+  const tpDb = new TenderPrepDatabase(
+    db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, documentBundles,
+    emailService, testEmailOverride, portalDb, accessAdmin, config.PORTAL_BASE_URL, config.PORTAL_LINK_TTL_DAYS
+  );
 
   app.decorate('tps', { config, db, tpDb, scmsDb });
   await app.register(cors, { origin: config.WEB_ORIGIN, credentials: false });
@@ -75,6 +95,58 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
 
   app.addHook('onClose', async () => { await db.close(); });
   app.get('/health', async () => ({ status: 'ok', service: 'tps-bff' }));
+
+  // ── Subcontractor pricing portal: PUBLIC routes, no BuildFlow authentication ────────
+  //
+  // Declared here, BEFORE the protectedApi.addHook('preHandler', buildAuthenticator(...))
+  // block below — the same placement BuildFlow's own /links/:token and /bundles/:token
+  // use, for the same reason: a subcontractor is not a BuildFlow user and carries no
+  // OIDC bearer token or dev header. What stands in front of these instead is Cloudflare
+  // Access at the edge (a policy naming the invited tenders' domains, see
+  // cloudflareAccess.ts) PLUS the identity binding verified on every call below — the
+  // URL token says WHICH dispatch, the verified Access email says WHO is asking, and
+  // `tpDb.resolvePortalToken` (private, exercised only through these routes) requires
+  // both to agree. Never trust `Cf-Access-Jwt-Assertion` at face value: nginx forwards
+  // /tps-api/ to this process unauthenticated by itself, so the edge policy protects a
+  // PATH, and this process is what actually proves who signed the header.
+  const portalTokenParams = z.object({ token: z.string().min(1) });
+  const portalLineInput = z.object({
+    id: z.string().uuid(),
+    rate: z.number().min(0).nullable(),
+    status: z.enum(['priced', 'included', 'excluded', 'not_addressed']),
+    note: z.string().trim().max(2000).nullable()
+  });
+
+  app.get('/portal/:token', async (request) => {
+    const { token } = params(request, portalTokenParams);
+    const identity = await verifyAccessIdentity(request);
+    return tpDb.getPortalPackage(token, identity?.email ?? null);
+  });
+
+  app.put('/portal/:token/draft', async (request) => {
+    const { token } = params(request, portalTokenParams);
+    const identity = await verifyAccessIdentity(request);
+    const input = body(request, z.object({
+      programmeWeeks: z.number().int().min(0).nullable().optional(),
+      qualifications: z.string().trim().max(4000).nullable().optional(),
+      exclusions: z.string().trim().max(4000).nullable().optional(),
+      lines: z.array(portalLineInput).max(5000)
+    }));
+    return tpDb.savePortalDraft(token, identity?.email ?? null, {
+      header: {
+        programmeWeeks: input.programmeWeeks ?? null,
+        qualifications: input.qualifications ?? null,
+        exclusions: input.exclusions ?? null
+      },
+      lines: input.lines
+    });
+  });
+
+  app.post('/portal/:token/submit', async (request) => {
+    const { token } = params(request, portalTokenParams);
+    const identity = await verifyAccessIdentity(request);
+    return tpDb.submitPortalResponse(token, identity?.email ?? null);
+  });
 
   await app.register(async (protectedApi) => {
     protectedApi.addHook('preHandler', buildAuthenticator(config, db));
@@ -213,6 +285,34 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       return tpDb.replaceReturnForms(requireActor(request), forms);
     });
 
+    // Per-tender cover-letter facts nothing else models: site address, deadlines,
+    // the estimator. GET pre-fills estimator name/email from the confirming actor's
+    // own account when no row has been saved yet.
+    protectedApi.get('/api/tender-prep/:workflowId/itt-letter-details', async (request) => {
+      const actor = requireActor(request);
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const saved = await tpDb.getIttLetterDetails(actor, workflowId);
+      return saved ?? {
+        workflow_id: workflowId, site_address: null, tender_return_deadline: null,
+        clarifications_close_date: null, site_visit_permitted: null,
+        estimator_name: actor.displayName ?? null, estimator_email: actor.email ?? null
+      };
+    });
+
+    protectedApi.put('/api/tender-prep/:workflowId/itt-letter-details', async (request) => {
+      const actor = requireActor(request);
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const input = body(request, z.object({
+        siteAddress: z.string().trim().max(500).nullish(),
+        tenderReturnDeadline: z.string().trim().max(20).nullish(),
+        clarificationsCloseDate: z.string().trim().max(20).nullish(),
+        siteVisitPermitted: z.boolean().nullish(),
+        estimatorName: z.string().trim().max(200).nullish(),
+        estimatorEmail: z.string().trim().max(320).nullish()
+      }));
+      return tpDb.saveIttLetterDetails(actor, workflowId, input);
+    });
+
     protectedApi.get('/api/tender-prep/config/scope-coverage', async (request) =>
       tpDb.scopeTradeCoverage(requireActor(request)));
 
@@ -340,25 +440,25 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       return tpDb.setIttLineIgnored(requireActor(request), workflowId, { packageName, section, itemId, ignored });
     });
 
-    // "Open draft Email": the same ITT Confirm ITT would send, handed to the user to send from
-    // their own mail app instead. This route serves what the chooser needs — the subject, the
-    // short body a Gmail/Outlook Web compose link can carry, and what the .eml below holds.
+    // "Open draft Email": the exact ITT Confirm ITT would send, previewed in a compose modal so
+    // it can be addressed by hand and sent from inside the app. Serves the rendered body, the
+    // shortlisted firms' addresses and what the attachments will be.
     protectedApi.get('/api/tender-prep/:workflowId/itts/:packageName/draft', async (request) => {
       const { workflowId, packageName } = params(request, z.object({ workflowId: uuid, packageName: z.string().trim().min(1).max(200) }));
-      const { metadata } = await tpDb.draftIttEmail(requireActor(request), workflowId, packageName);
-      return metadata;
+      return tpDb.draftIttEmail(requireActor(request), workflowId, packageName);
     });
 
-    // The draft itself, as a mail-app file. Its `X-Unsent: 1` header is what makes Outlook open
-    // it as an editable unsent message rather than as received mail.
-    //
-    // No Content-Disposition: reading a filename back off the response would need
-    // `exposedHeaders` adding to the CORS registration above, and the web client already knows
-    // the package name it asked about.
-    protectedApi.get('/api/tender-prep/:workflowId/itts/:packageName/draft.eml', async (request, reply) => {
+    // Sends what that modal is showing. Only the addresses and the subject are accepted — the
+    // body and attachments are rebuilt server-side from the same assembly the preview came
+    // from, so no scope or return requirement can be edited on its way to a tenderer.
+    protectedApi.post('/api/tender-prep/:workflowId/itts/:packageName/draft/send', async (request) => {
       const { workflowId, packageName } = params(request, z.object({ workflowId: uuid, packageName: z.string().trim().min(1).max(200) }));
-      const { eml } = await tpDb.draftIttEmail(requireActor(request), workflowId, packageName);
-      return reply.type('message/rfc822').send(eml);
+      const input = body(request, z.object({
+        to: z.array(z.string().trim().email('Every recipient must be a valid email address')).min(1).max(50),
+        cc: z.array(z.string().trim().email('Every cc must be a valid email address')).max(50).default([]),
+        subject: z.string().trim().min(1).max(500)
+      }));
+      return tpDb.sendIttDraft(requireActor(request), workflowId, packageName, input);
     });
 
     // Sends the ITT to every subcontractor selected for this package at the tender launch
@@ -381,6 +481,25 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       const { dispatchId } = params(request, z.object({ dispatchId: uuid }));
       const { response } = body(request, z.object({ response: z.enum(['will_tender', 'decline', 'considering', 'no_response']) }));
       return tpDb.recordIttResponse(requireActor(request), dispatchId, response);
+    });
+
+    // The "Open responses" modal on the ITT Dispatch page — every firm this package's ITT
+    // went to, their portal status, and (below) one firm's priced bill read-only.
+    protectedApi.get('/api/tender-prep/:workflowId/portal-responses', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const { packageName } = query(request, z.object({ packageName: z.string().trim().min(1).max(200) }));
+      return tpDb.listPortalResponses(requireActor(request), workflowId, packageName);
+    });
+
+    protectedApi.get('/api/tender-prep/:workflowId/portal-responses/:linkId', async (request) => {
+      const { workflowId, linkId } = params(request, z.object({ workflowId: uuid, linkId: uuid }));
+      return tpDb.getPortalResponse(requireActor(request), workflowId, linkId);
+    });
+
+    // A buyer's decision, recorded — see reopenPortalResponse's doc comment.
+    protectedApi.post('/api/tender-prep/:workflowId/portal-responses/:linkId/reopen', async (request) => {
+      const { workflowId, linkId } = params(request, z.object({ workflowId: uuid, linkId: uuid }));
+      return tpDb.reopenPortalResponse(requireActor(request), workflowId, linkId);
     });
 
     // ── Step 3: Comparative ─────────────────────────────────────────────────

@@ -23,10 +23,10 @@ const pack: IttEmailPack = {
     { section: 'The Works', description: 'Fire protection to steelwork', procurementStage: 'Profit Plan' }
   ],
   specClauses: [],
-  documentLinks: [],
   bundle: null,
   attendanceSummary: { subcontractor: 5, mainContractor: 3, joint: 1 },
-  valueEngineeringRequired: true
+  valueEngineeringRequired: true,
+  attachmentCodes: ['scope_of_works', 'boq_pricing_workbook']
 };
 
 const readBack = async (buffer: Buffer): Promise<ExcelJS.Workbook> => {

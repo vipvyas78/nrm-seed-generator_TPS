@@ -2,13 +2,15 @@ import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
 import type { BuildflowBundle, BuildflowDocumentBundlesClient } from './buildflowDocumentBundlesClient.js';
 import type { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
 import type { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
+import { domainOf, isPublicEmailDomain, type CloudflareAccessAdmin } from './cloudflareAccess.js';
 import type { Database, Row } from './db.js';
 import type { DocumentLinkProvider } from './documentLinkProvider.js';
 import type { EmailAttachment, EmailService } from './emailService.js';
-import { conflict, notFound } from './errors.js';
-import { buildEml } from './emlMessage.js';
-import { ittAttachmentsFor, type IttAttachment } from './ittAttachments.js';
-import { renderIttComposeText, renderIttEmail, type IttEmailDocumentLink, type IttEmailPack } from './ittEmail.js';
+import { conflict, forbidden, notFound } from './errors.js';
+import { ittAttachmentsFor, type AttendanceRow, type IttAttachment, type ResolvedAttachmentTemplate } from './ittAttachments.js';
+import { renderIttEmail, requiredReturnsList, sectionIndex, type IttEmailLetterContext, type IttEmailPack, type IttEmailPortalStatus } from './ittEmail.js';
+import type { Block, RenderContext } from './blockPdfRenderer.js';
+import type { PortalLineDraftInput, PortalLineInput, PricingPortalDatabase } from './pricingPortalDb.js';
 import type { ScmsReadDatabase } from './scmsReadDb.js';
 import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js';
 import type { Actor } from './types.js';
@@ -128,19 +130,56 @@ function attributionFor(pkg: Row): Attribution {
 }
 
 /**
- * Everything about a draft ITT except the draft itself.
+ * The lines a pricing-portal link snapshots at mint time, off an already-assembled
+ * `IttEmailPack` — never re-read from `public.takeoff_items` afterwards, so a take-off
+ * re-run mid-tender cannot alter a bill a subcontractor has already started pricing (see
+ * migration 019's header comment).
  *
- * Separated from the `.eml` bytes so the route serving JSON cannot accidentally serialise a
- * multi-megabyte message file into it. See `draftIttEmail`.
+ * Authored bill lines have no NRM ge/element code of their own, and `tender_return_lines`
+ * (008) has no ref/section columns to promote them into either — the closest analog
+ * available is the line's own `ref`, carried in `elementCode` so it survives promotion.
  */
-export interface IttDraftMetadata {
+function linesFromEmailPack(pack: IttEmailPack): PortalLineInput[] {
+  const boq: PortalLineInput[] = pack.boqLines.map((l) => ({
+    sourceItemId: null, geCode: l.geCode, elementCode: l.elementCode,
+    description: l.description, quantity: l.quantity, unit: l.unit, isPriceable: l.isPriceable
+  }));
+  const bill: PortalLineInput[] = pack.billLines.map((l) => ({
+    sourceItemId: null, geCode: null, elementCode: l.ref,
+    description: l.description, quantity: l.quantity, unit: l.unit,
+    isPriceable: l.quantity != null && l.quantity > 0
+  }));
+  return [...boq, ...bill];
+}
+
+/** One firm shortlisted for the package, as the compose box offers it. */
+export interface IttDraftRecipient {
+  shortlistEntryId: string;
+  subcontractorId: string;
+  /** The firm. Null only if SCMS no longer holds the subcontractor at all. */
+  name: string | null;
+  /** The individual the address belongs to, for showing beside it. */
+  contactName: string | null;
+  /** Null when SCMS holds no contact email — shown as unreachable, never silently dropped. */
+  email: string | null;
+}
+
+/**
+ * One package's ITT as the compose modal shows it, before anything is sent.
+ *
+ * `html` and `text` are a PREVIEW: the modal displays them read-only and never sends them back.
+ * `sendIttDraft` rebuilds both from the same assembly, so the body cannot be edited in transit.
+ */
+export interface IttDraft {
   packageName: string;
   subject: string;
-  /** The short covering note the Gmail / Outlook Web compose links carry. */
-  composeBody: string;
+  html: string;
+  text: string;
+  recipients: IttDraftRecipient[];
   bundleUrl: string | null;
   completeBundleUrl: string | null;
-  /** What the .eml carries. Empty for a web-mail compose link, which cannot carry files. */
+  /** TEMPORARY (testing the pricing-portal link) — see draftPortalStatus. Null outside test mode. */
+  portalUrl: string | null;
   attachments: Array<{ filename: string; contentType: string; bytes: number }>;
   /** The files were dropped for exceeding what a send would carry — see MAX_ATTACHMENT_BYTES. */
   attachmentsOmittedOversize: boolean;
@@ -166,7 +205,16 @@ export class TenderPrepDatabase {
     // When set, every ITT email is redirected to `to` (from `from`) instead of the
     // recipient's real SCMS contact address — lets "Confirm ITT" be exercised against real
     // packages without emailing real subcontractors.
-    private readonly testEmailOverride?: { from: string; to: string } | null
+    private readonly testEmailOverride?: { from: string; to: string } | null,
+    // Optional: without one configured, no pricing-portal link is ever minted or read —
+    // the ITT sends exactly as it did before this feature existed.
+    private readonly portalDb?: PricingPortalDatabase,
+    // Optional: without one configured, no portal link is ever issued (see
+    // mintPortalLinksFor) — a link with nothing gating it at the edge is a worse outcome
+    // than a send with no online-pricing section.
+    private readonly accessAdmin?: CloudflareAccessAdmin,
+    private readonly portalBaseUrl?: string,
+    private readonly portalLinkTtlDays: number = 90
   ) {}
 
   /**
@@ -257,25 +305,37 @@ export class TenderPrepDatabase {
       // show what would actually be sent, and this needs no workflow, only the session the
       // take-off's BoQ belongs to.
       specDocuments: previewSpecDocuments,
-      // A preview has no workflow, so it has no take-off release to read bundles from and no
-      // packageVersionId to resolve links against. The documents section renders its
-      // "nothing to link" branch rather than inventing a link that would not be sent.
-      documentLinks: [],
+      // A preview has no workflow, so it has no take-off release to read bundles from. The
+      // documents section states that they will be issued separately rather than inventing a
+      // link that would not be sent.
       bundle: null,
       attendanceSummary: {
         subcontractor: attendances.filter((a) => a.owner === 'SC').length,
         mainContractor: attendances.filter((a) => a.owner === 'H').length,
         joint: attendances.filter((a) => a.owner === 'J').length
       },
-      valueEngineeringRequired: true
+      valueEngineeringRequired: true,
+      attachmentCodes: await this.attachmentCodesFor({ name: input.packageName, wp_code: pkg.wp_code })
     };
 
     const projectName = 'the project';
+    // No workflow exists yet for a preview, so there is no itt_letter_details row to
+    // read — the letter context falls back to the confirming actor's own identity only.
+    const letterContext: IttEmailLetterContext = {
+      siteAddress: null, tenderReturnDeadline: null, clarificationsCloseDate: null, siteVisitPermitted: null,
+      estimatorName: actor.displayName ?? null, estimatorEmail: actor.email ?? null,
+      organizationName: await this.organizationName(actor)
+    };
+    const recipient = { name: null as string | null, email: '', address: null as string | null };
+    const { renderKinds, templates } = await this.resolvedTemplatesFor(actor, emailPack.attachmentCodes);
+    void renderKinds;
+    const context = await this.buildRenderContext(actor, emailPack, projectName, letterContext, recipient);
+    const attendanceRows = await this.attendanceRowsFor(actor, pkg);
     return {
-      ...renderIttEmail([emailPack], { name: null, email: '' }, { projectName, completeBundleUrl: null }),
+      ...renderIttEmail([emailPack], recipient, { projectName, completeBundleUrl: null, letterContext }),
       // The real attachments, byte for byte — so a preview can be opened and checked without
       // anything being sent. Returned unencoded; only the send path base64s them.
-      attachments: await ittAttachmentsFor(emailPack, projectName)
+      attachments: await ittAttachmentsFor(emailPack, projectName, context, templates, attendanceRows)
     };
   }
 
@@ -502,11 +562,15 @@ export class TenderPrepDatabase {
           `Cited but not in the tender pack: ${unresolvedSpecFiles.join(', ')}.`,
         Boolean(pkg.wp_code) && boqLines.length > 0 && citingLines === 0 &&
           'No line in this package cites a specification, so the ITT names none. These lines were measured without a clause reference.',
-        // An unconfigured integration and an empty one are different facts, and both clients
-        // return [] either way. Without this the ITT emails with no document links at all and
+        // An unconfigured integration and an empty one are different facts, and the client
+        // returns [] either way. Without this the ITT emails with no document link at all and
         // reads exactly as though the project had none.
-        !this.buildflowLinks &&
-          'Document links unavailable: BUILDFLOW_BASE_URL and BUILDFLOW_DOCUMENT_LINKS_TOKEN are not configured, so this ITT would be emailed with no document links.',
+        //
+        // Tests the BUNDLES client, not the per-document one: the email links a work package's
+        // zip and nothing else, so that is the integration whose absence would leave a tenderer
+        // with no documents.
+        !this.bundles &&
+          'Document packs unavailable: BUILDFLOW_BASE_URL and BUILDFLOW_DOCUMENT_LINKS_TOKEN are not configured, so this ITT would be emailed with no link to its documents.',
         // Scope and attendances are what make the pricing document coordinate: they define
         // everything the subcontractor carries around the measured bill. Missing either and
         // every tenderer guesses differently, so neither the price nor the comparison holds.
@@ -633,6 +697,171 @@ export class TenderPrepDatabase {
         ORDER BY s.sort_order, i.seq`,
       [wpCode, pkg.name]
     );
+  }
+
+  /**
+   * Which ITT attachment codes this package's trade should receive, in the order
+   * they should appear — same trade resolution as listScopeItems (wp_code first,
+   * label fallback), reading the parent repo's public-schema itt_attachment_trades
+   * / itt_attachment_types (migration 083) cross-schema, exactly as tender_scope_*
+   * already is. A trade with no rows here gets no attachments at all — the same
+   * "never a silent full-set fallback" rule as the scope-of-works library.
+   */
+  async attachmentCodesFor(pkg: { name: string; wp_code?: unknown }): Promise<string[]> {
+    const wpCode = typeof pkg.wp_code === 'string' && pkg.wp_code ? pkg.wp_code : null;
+    const rows = await this.db.query<Row>(
+      `WITH by_wp AS (
+         SELECT trade_code FROM tender_scope_trades
+          WHERE is_active AND $1::TEXT IS NOT NULL AND wp_code = $1
+       ),
+       by_label AS (
+         SELECT trade_code FROM tender_scope_trades
+          WHERE is_active AND lower(btrim(label)) = lower(btrim($2))
+            AND NOT EXISTS (SELECT 1 FROM by_wp)
+       ),
+       trade AS (SELECT trade_code FROM by_wp UNION ALL SELECT trade_code FROM by_label)
+       SELECT DISTINCT at.attachment_code, t.sort_order
+         FROM itt_attachment_trades at
+         JOIN trade tr ON tr.trade_code = at.trade_code
+         JOIN itt_attachment_types t ON t.attachment_code = at.attachment_code
+        WHERE t.is_active
+        ORDER BY t.sort_order`,
+      [wpCode, pkg.name]
+    );
+    return rows.map((r) => String(r.attachment_code));
+  }
+
+  /**
+   * The resolved (org override if present, else global default) template for each
+   * of `codes`, plus each code's render_kind — everything ittAttachmentsFor needs
+   * to dispatch, pre-fetched here so that file stays a pure function of its inputs.
+   */
+  private async resolvedTemplatesFor(
+    actor: Actor, codes: string[]
+  ): Promise<{ renderKinds: Map<string, string>; templates: Map<string, ResolvedAttachmentTemplate> }> {
+    const renderKinds = new Map<string, string>();
+    if (codes.length > 0) {
+      const types = await this.db.query<Row>(
+        `SELECT attachment_code, render_kind FROM itt_attachment_types WHERE attachment_code = ANY($1)`,
+        [codes]
+      );
+      for (const t of types) renderKinds.set(String(t.attachment_code), String(t.render_kind));
+    }
+    const templates = new Map<string, ResolvedAttachmentTemplate>();
+    if (codes.length > 0) {
+      const rows = await this.db.query<Row>(
+        `SELECT DISTINCT ON (attachment_code) attachment_code, title, filename_pattern, blocks
+           FROM itt_attachment_templates
+          WHERE attachment_code = ANY($1) AND (organization_id = $2 OR organization_id IS NULL)
+          ORDER BY attachment_code, organization_id NULLS LAST`,
+        [codes, actor.organizationId]
+      );
+      for (const r of rows) {
+        templates.set(String(r.attachment_code), {
+          attachmentCode: String(r.attachment_code),
+          filenamePattern: String(r.filename_pattern),
+          blocks: r.blocks as Block[]
+        });
+      }
+    }
+    return { renderKinds, templates };
+  }
+
+  /** scms.attendance_items rows for one package, shaped for scheduleOfAttendancesPdf. */
+  private async attendanceRowsFor(actor: Actor, pkg: Row): Promise<AttendanceRow[]> {
+    const rows = await this.listAttendances(actor, String(pkg.id));
+    return rows.map((r) => ({
+      groupName: String(r.group_name), description: String(r.description),
+      owner: r.owner as AttendanceRow['owner'], notes: (r.notes as string | null) ?? null
+    }));
+  }
+
+  /** bf_organizations.name for the letter's "On behalf of {org}" sign-off — read
+   * cross-schema from the parent repo's public schema, same as everything else here. */
+  private async organizationName(actor: Actor): Promise<string> {
+    const [row] = await this.db.query<Row>(`SELECT name FROM bf_organizations WHERE id = $1`, [actor.organizationId]);
+    return row ? String(row.name) : 'the Contractor';
+  }
+
+  async getIttLetterDetails(actor: Actor, workflowId: string): Promise<Row | null> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    const [row] = await this.db.query<Row>(`SELECT * FROM itt_letter_details WHERE workflow_id = $1`, [workflowId]);
+    return row ?? null;
+  }
+
+  async saveIttLetterDetails(actor: Actor, workflowId: string, input: {
+    siteAddress?: string | null; tenderReturnDeadline?: string | null; clarificationsCloseDate?: string | null;
+    siteVisitPermitted?: boolean | null; estimatorName?: string | null; estimatorEmail?: string | null;
+  }): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    const [row] = await this.db.query<Row>(
+      `INSERT INTO itt_letter_details
+         (workflow_id, site_address, tender_return_deadline, clarifications_close_date, site_visit_permitted, estimator_name, estimator_email)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (workflow_id) DO UPDATE SET
+         site_address = EXCLUDED.site_address, tender_return_deadline = EXCLUDED.tender_return_deadline,
+         clarifications_close_date = EXCLUDED.clarifications_close_date, site_visit_permitted = EXCLUDED.site_visit_permitted,
+         estimator_name = EXCLUDED.estimator_name, estimator_email = EXCLUDED.estimator_email, updated_at = NOW()
+       RETURNING *`,
+      [workflowId, input.siteAddress ?? null, input.tenderReturnDeadline ?? null, input.clarificationsCloseDate ?? null,
+        input.siteVisitPermitted ?? null, input.estimatorName ?? null, input.estimatorEmail ?? null]
+    );
+    return row;
+  }
+
+  private formatDate = (d: unknown): string | null => {
+    if (!d) return null;
+    const date = d instanceof Date ? d : new Date(String(d));
+    return Number.isNaN(date.getTime()) ? null : date.toLocaleDateString('en-GB');
+  };
+
+  /** Builds an IttEmailLetterContext for a workflow, pre-filling estimator name/email
+   * from the confirming actor's own account when no itt_letter_details row (or no
+   * value in it) has been saved yet — see GET /api/tender-prep/:workflowId/itt-letter-details. */
+  async letterContextFor(actor: Actor, workflowId: string): Promise<IttEmailLetterContext> {
+    const details = await this.getIttLetterDetails(actor, workflowId);
+    const orgName = await this.organizationName(actor);
+    return {
+      siteAddress: (details?.site_address as string | null) ?? null,
+      tenderReturnDeadline: this.formatDate(details?.tender_return_deadline),
+      clarificationsCloseDate: this.formatDate(details?.clarifications_close_date),
+      siteVisitPermitted: (details?.site_visit_permitted as boolean | null) ?? null,
+      estimatorName: (details?.estimator_name as string | null) ?? actor.displayName ?? null,
+      estimatorEmail: (details?.estimator_email as string | null) ?? actor.email ?? null,
+      organizationName: orgName
+    };
+  }
+
+  /** The {{token}} -> value map every template (email body and PDF alike) resolves
+   * against — system fields from send-time data, plus this org's custom variables
+   * (itt_template_variables, also read cross-schema from the parent's public schema). */
+  private async buildRenderContext(
+    actor: Actor, pack: IttEmailPack, projectName: string, letterContext: IttEmailLetterContext, recipient: { name: string | null; email: string; address: string | null }
+  ): Promise<RenderContext> {
+    const customRows = await this.db.query<Row>(
+      `SELECT DISTINCT ON (key) key, default_value FROM itt_template_variables
+        WHERE organization_id = $1 OR organization_id IS NULL
+        ORDER BY key, organization_id NULLS LAST`,
+      [actor.organizationId]
+    );
+    const context: RenderContext = {
+      projectName,
+      tradeName: pack.packageName,
+      siteAddress: letterContext.siteAddress ?? '',
+      recipientName: recipient.name ?? '',
+      recipientAddress: recipient.address ?? '',
+      todayDate: new Date().toLocaleDateString('en-GB'),
+      tenderReturnDeadline: letterContext.tenderReturnDeadline ?? 'to be confirmed',
+      clarificationsCloseDate: letterContext.clarificationsCloseDate ?? 'to be confirmed',
+      siteVisitPermitted: letterContext.siteVisitPermitted === null ? 'To be confirmed' : letterContext.siteVisitPermitted ? 'Yes' : 'No',
+      estimatorName: letterContext.estimatorName ?? '',
+      estimatorEmail: letterContext.estimatorEmail ?? '',
+      organizationName: letterContext.organizationName,
+      sectionIndex: sectionIndex(pack.attachmentCodes),
+      requiredReturnsList: requiredReturnsList(pack.attachmentCodes, pack.valueEngineeringRequired)
+    };
+    for (const r of customRows) context[String(r.key)] = String(r.default_value);
+    return context;
   }
 
   /**
@@ -1453,10 +1682,18 @@ export class TenderPrepDatabase {
               count(d.id) FILTER (WHERE d.email_status = 'sent') AS sent,
               count(d.id) FILTER (WHERE d.email_status = 'failed') AS failed,
               count(d.id) FILTER (WHERE d.email_status = 'skipped_no_email') AS skipped_no_email,
-              count(*) FILTER (WHERE se.selected AND d.response IS NOT NULL) AS responded
+              count(*) FILTER (WHERE se.selected AND d.response IS NOT NULL) AS responded,
+              -- A SUBMITTED priced bill, not a buyer's manual "will_tender" mark — a
+              -- different fact with different provenance, so it is not folded into
+              -- the responded column above. Drives the "response received" status and
+              -- the "Open responses" button on the dispatch page.
+              count(ppl.id) FILTER (WHERE ppl.submitted_at IS NOT NULL) AS responses_received,
+              count(ppl.id) FILTER (WHERE ppl.token IS NOT NULL) AS portal_links,
+              count(ppl.id) FILTER (WHERE ppl.denied_attempts > 0) AS portal_denials
          FROM shortlists sl
          LEFT JOIN shortlist_entries se ON se.shortlist_id = sl.id
          LEFT JOIN itt_dispatch d ON d.shortlist_entry_id = se.id
+         LEFT JOIN pricing_portal_links ppl ON ppl.shortlist_entry_id = se.id
         WHERE sl.workflow_id = $1
         GROUP BY sl.package_name, sl.package_seq, sl.route_of_procurement, sl.confirmed_at
         HAVING count(*) FILTER (WHERE se.selected) > 0
@@ -1508,32 +1745,18 @@ export class TenderPrepDatabase {
     const boqLines = notIgnored(pack.boq_lines as Row[]);
     const billLines = notIgnored(pack.bill_lines as Row[]);
     const scopeItems = notIgnored(pack.scope_items as Row[]);
-    const documents = pack.documents as Row[];
-    const ignoredDocuments = documents.filter((d) => d.ignored === true);
-    const ignoredDocIds = new Set(ignoredDocuments.map((d) => String(d.id)));
-    const ignoredFilenames = new Set(ignoredDocuments.map((d) => String(d.filename)));
 
     const takeoff = pack.takeoff as Record<string, unknown>;
 
-    // The package's own document zip. Matched on the wp_code the package was derived from;
-    // a legacy hand-loaded package carries none and simply gets no bundle, falling back to
-    // the flat link list below.
+    // The package's own document zip, matched on the wp_code the package was derived from.
+    //
+    // THE ONLY DOCUMENT LINK THE EMAIL CARRIES. There was a fallback here that fetched
+    // BuildFlow's flat per-document list when no bundle existed, and on the first real send it
+    // printed all 140 documents in the project into the email — the drainage sheets to the
+    // flooring subcontractor, and the four drawings that mattered lost among them. A package
+    // with no bundle now says so and points at the complete set; see `documentsSentence`.
     const wpCode = typeof pack.wp_code === 'string' ? pack.wp_code : null;
     const packageBundle = wpCode ? bundles.find((b) => b.wpCode === wpCode) : undefined;
-
-    // BuildFlow's document-links contract is keyed by packageVersionId, carried verbatim on
-    // the workflow since the take-off completed. A workflow started by hand, or one where
-    // BuildFlow can't be reached, sends without links rather than blocking the ITT.
-    //
-    // Only fetched when there is no bundle: a bundle supersedes this list entirely, and
-    // fetching a list nothing will print is a wasted round trip per package.
-    const packageVersionId = typeof takeoff?.packageVersionId === 'string' ? takeoff.packageVersionId : null;
-    let documentLinks: IttEmailDocumentLink[] = [];
-    if (!packageBundle && packageVersionId && this.buildflowLinks) {
-      documentLinks = (await this.buildflowLinks.linksFor(packageVersionId))
-        .filter((l) => !ignoredDocIds.has(l.fileId) && !ignoredFilenames.has(l.displayName))
-        .map((l) => ({ displayName: l.displayName, url: l.url }));
-    }
 
     const priceable = boqLines.filter((l) => l.is_priceable).length;
 
@@ -1574,7 +1797,6 @@ export class TenderPrepDatabase {
       specDocuments: ((pack.spec_documents as Row[]) ?? [])
         .filter((d) => d.ignored !== true)
         .map((d) => String(d.filename)),
-      documentLinks,
       bundle: packageBundle
         ? {
             url: packageBundle.url,
@@ -1587,7 +1809,8 @@ export class TenderPrepDatabase {
         mainContractor: Number((pack.attendance_summary as Row).main_contractor ?? 0),
         joint: Number((pack.attendance_summary as Row).joint ?? 0)
       },
-      valueEngineeringRequired: Boolean(pack.value_engineering_required)
+      valueEngineeringRequired: Boolean(pack.value_engineering_required),
+      attachmentCodes: await this.attachmentCodesFor({ name: pack.package_name as string, wp_code: pack.wp_code })
     };
 
     return {
@@ -1598,19 +1821,126 @@ export class TenderPrepDatabase {
   }
 
   /**
-   * The scope-of-works PDF and BoQ pricing schedule for each package on the message.
+   * Mints (or refreshes) a subcontractor pricing-portal link for every recipient about to
+   * be emailed, snapshots a NEW link's bill from the already-assembled `emailPack`, then
+   * reconciles the ONE Cloudflare Access application/policy against the resulting live
+   * recipient set — ALL of it BEFORE the caller sends a single email.
    *
-   * Generated once per send, not once per recipient — the files are identical for every firm
-   * invited to the same package, and rebuilding them per recipient would be pure waste.
+   * Unconfigured (no `portalDb`) — every request is skipped with no reason recorded and
+   * the send proceeds exactly as it did before this feature existed; there is nowhere to
+   * record a reason without a portal table to write to.
+   *
+   * Configured, but this recipient's domain is public/free, or `accessAdmin` itself is
+   * unconfigured — no link is issued, but a row IS written (`recordBlocked`) so the
+   * dispatch page can say why rather than the recipient simply having nothing.
+   *
+   * Configured, and the Cloudflare API call fails — THROWS, and the caller MUST refuse
+   * the whole send. Every other BuildFlow integration in this file degrades silently
+   * (`bundlesForWorkflow` returns `[]`, a broken document link becomes `url: null`)
+   * because its absence only makes an email less useful. A missing Access policy
+   * converts a gated portal into an open one with nobody positioned to notice, which is
+   * why this is the one integration that is not best-effort.
+   */
+  private async mintPortalLinksFor(requests: Array<{
+    shortlistEntryId: string; workflowId: string; packageName: string;
+    subcontractorId: string | null; tendererName: string; recipientEmail: string | null;
+    emailPack: IttEmailPack;
+  }>): Promise<Map<string, IttEmailPortalStatus>> {
+    const statuses = new Map<string, IttEmailPortalStatus>();
+    const key = (shortlistEntryId: string, packageName: string) => `${shortlistEntryId}::${packageName}`;
+    if (!this.portalDb) return statuses;
+
+    for (const r of requests) {
+      if (!r.recipientEmail) continue;
+      const domain = domainOf(r.recipientEmail);
+      if (isPublicEmailDomain(domain)) {
+        await this.portalDb.recordBlocked({
+          shortlistEntryId: r.shortlistEntryId, workflowId: r.workflowId, packageName: r.packageName,
+          subcontractorId: r.subcontractorId, tendererName: r.tendererName, recipientEmail: r.recipientEmail,
+          reason: 'public_email_domain'
+        });
+        statuses.set(key(r.shortlistEntryId, r.packageName), {
+          url: null, unavailableReason: "this recipient's email domain is a public/free provider"
+        });
+        continue;
+      }
+      if (!this.accessAdmin) {
+        await this.portalDb.recordBlocked({
+          shortlistEntryId: r.shortlistEntryId, workflowId: r.workflowId, packageName: r.packageName,
+          subcontractorId: r.subcontractorId, tendererName: r.tendererName, recipientEmail: r.recipientEmail,
+          reason: 'access_unconfigured'
+        });
+        // No inline reason printed to the email here — an unconfigured deployment is a
+        // fact for us to fix, not something a real subcontractor needs to read.
+        continue;
+      }
+      const { id, token, isNewLink } = await this.portalDb.mintOrRefreshLink({
+        shortlistEntryId: r.shortlistEntryId, workflowId: r.workflowId, packageName: r.packageName,
+        subcontractorId: r.subcontractorId, tendererName: r.tendererName, recipientEmail: r.recipientEmail,
+        isTest: Boolean(this.testEmailOverride), ttlDays: this.portalLinkTtlDays
+      });
+      if (isNewLink) await this.portalDb.snapshotLines(id, linesFromEmailPack(r.emailPack));
+      statuses.set(key(r.shortlistEntryId, r.packageName), {
+        url: `${(this.portalBaseUrl ?? '').replace(/\/$/, '')}/respond/${token}`, unavailableReason: null
+      });
+    }
+
+    if (this.accessAdmin) {
+      // Recomputed from the FULL live set already in the database, not just this send's
+      // requests — see CloudflareAccessAdmin.syncFor's doc comment for why that matters.
+      await this.accessAdmin.syncFor(await this.portalDb.liveRecipients());
+    }
+
+    return statuses;
+  }
+
+  /**
+   * TEMPORARY (testing the pricing-portal link through the compose box) — revert once
+   * verified. A real per-recipient link is otherwise only ever rendered from
+   * confirmAndSendItt / sendIttsForWorkflow — see sendIttDraft's comment on why a shared
+   * compose-box message never carries one. This narrows that to the one case safe to test:
+   * the first real shortlisted recipient, minted against the TEST override address so no
+   * real subcontractor's inbox is ever the one bound to the link. Only runs at all when
+   * TEST_EMAIL_FLAG is on, so it is inert (and safe to leave in place) once that's unset.
+   */
+  private async draftPortalStatus(
+    workflowId: string, packageName: string, emailPack: IttEmailPack, recipients: IttDraftRecipient[]
+  ): Promise<IttEmailPortalStatus | null> {
+    if (!this.testEmailOverride) return null;
+    const recipient = recipients[0];
+    if (!recipient) return null;
+    const statuses = await this.mintPortalLinksFor([{
+      shortlistEntryId: recipient.shortlistEntryId, workflowId, packageName,
+      subcontractorId: recipient.subcontractorId, tendererName: recipient.name ?? 'Unknown firm',
+      recipientEmail: this.testEmailOverride.to, emailPack
+    }]);
+    return statuses.get(`${recipient.shortlistEntryId}::${packageName}`) ?? null;
+  }
+
+  /**
+   * The configured attachment set (cover letter, forms, scope PDF, pricing workbook,
+   * schedule of attendances — see itt_attachment_trades) for each package on the
+   * message, addressed to one recipient — the cover letter and forms carry that
+   * recipient's own name/address, so unlike the old scope/BoQ-only pair these are
+   * NOT identical for every firm invited to the same package and must be rebuilt per
+   * recipient (still once per package within that recipient's own send, not once
+   * per package across every recipient).
    *
    * Oversized sends drop their attachments rather than failing: the email still carries the
    * inline tables and the document-pack links, which is far better than a provider rejecting
    * the whole message and the subcontractor receiving nothing.
    */
-  private async attachmentsFor(packs: IttEmailPack[], projectName: string): Promise<EmailAttachment[]> {
+  private async attachmentsFor(
+    actor: Actor, packs: IttEmailPack[], projectName: string,
+    letterContext: IttEmailLetterContext, recipient: { name: string | null; email: string; address: string | null }
+  ): Promise<EmailAttachment[]> {
     const built: EmailAttachment[] = [];
     for (const pack of packs) {
-      for (const file of await ittAttachmentsFor(pack, projectName)) {
+      const { templates } = await this.resolvedTemplatesFor(actor, pack.attachmentCodes);
+      const context = await this.buildRenderContext(actor, pack, projectName, letterContext, recipient);
+      const packageRow = await this.db.query<Row>(`SELECT id FROM package_config WHERE organization_id = $1 AND name = $2 LIMIT 1`, [actor.organizationId, pack.packageName]);
+      const attendanceRows = packageRow[0] ? await this.attendanceRowsFor(actor, packageRow[0]) : [];
+      for (const file of await ittAttachmentsFor(pack, projectName, context, templates, attendanceRows)) {
         built.push({
           content: file.content.toString('base64'),
           filename: file.filename,
@@ -1624,63 +1954,231 @@ export class TenderPrepDatabase {
   }
 
   /**
-   * One package's ITT as a draft the user sends themselves, rather than one this service sends.
+   * Everything the in-app compose box needs to show one package's ITT before it is sent.
    *
    * Step 2 otherwise offers only "read it on screen" or "it has gone". This is the step in
-   * between: the same email Confirm ITT would send, handed over as a file a mail app opens in
-   * compose mode, so a covering sentence can be added, a colleague copied in, or the message
-   * sent from the sender's own mailbox.
+   * between: the exact email Confirm ITT would send, opened in a modal with To, Cc and Subject
+   * so it can be addressed by hand, copied to a colleague, and sent when the sender is ready.
    *
    * SAME CONTENT AS A REAL SEND. It goes through bundlesForWorkflow → assemblePackageForEmail →
-   * renderIttEmail → ittAttachmentsFor, exactly as confirmAndSendItt does. A draft that
-   * described the package differently from the send would be worse than no draft, and
-   * assemblePackageForEmail exists precisely so the paths cannot drift.
+   * renderIttEmail → ittAttachmentsFor, exactly as confirmAndSendItt does. The body is shown
+   * read-only and `sendIttDraft` rebuilds it from this same assembly rather than accepting it
+   * back from the browser, so what a tenderer is bound by has exactly one origin.
    *
-   * ADDRESSED TO NOBODY. The sender types the address. That is deliberate: an ITT goes to
-   * every firm shortlisted for the package and each must be sent separately, so a draft
-   * pre-filled with the whole list would put competitors on one message.
+   * The greeting stays "Dear Sir/Madam,": one message may be addressed to several firms, so it
+   * cannot open with any one recipient's name.
    *
-   * No confirmation is required — reviewing a draft BEFORE confirming the package is most of
-   * the point — and nothing is written to itt_dispatch, because nothing has been sent. Only
-   * the user's own mail app knows whether it ever was.
+   * No confirmation is required. Reviewing the email BEFORE confirming the package is most of
+   * the point, and getPackageItt imposes no such precondition either.
    */
-  async draftIttEmail(actor: Actor, workflowId: string, packageName: string): Promise<{
-    metadata: IttDraftMetadata; eml: Buffer;
-  }> {
+  async draftIttEmail(actor: Actor, workflowId: string, packageName: string): Promise<IttDraft> {
     await this.assertWorkflowAccess(actor, workflowId);
 
-    const bundles = await this.bundlesForWorkflow(workflowId);
-    const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
-    const { emailPack, projectName } = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles);
-
-    // No recipient name, so the body greets "Dear Sir/Madam,". The email address is never
-    // printed in the body — only the name reaches the greeting — so an empty one leaves no
-    // trace in what the tenderer reads.
-    const rendered = renderIttEmail([emailPack], { name: null, email: '' }, { projectName, completeBundleUrl });
-
-    // The same budget a real send applies, measured the same way (on the encoded length, which
-    // is what would travel) — so a package that would send without its attachments drafts
-    // without them too, rather than producing a draft that could not be sent.
-    const files = await ittAttachmentsFor(emailPack, projectName);
-    const encodedBytes = files.reduce((sum, f) => sum + Math.ceil(f.content.length / 3) * 4, 0);
-    const attachmentsOmittedOversize = encodedBytes > MAX_ATTACHMENT_BYTES;
-    const attachments = attachmentsOmittedOversize ? [] : files;
+    const { emailPack, projectName, completeBundleUrl, letterContext, attachments, attachmentsOmittedOversize, recipients } =
+      await this.buildIttDraft(actor, workflowId, packageName);
+    const portalStatus = await this.draftPortalStatus(workflowId, packageName, emailPack, recipients);
+    const rendered = renderIttEmail([emailPack], { name: null, email: '', address: null }, {
+      projectName, completeBundleUrl, letterContext,
+      portalStatusByPackage: portalStatus ? { [packageName]: portalStatus } : undefined
+    });
 
     return {
-      metadata: {
-        packageName: emailPack.packageName,
-        subject: rendered.subject,
-        composeBody: renderIttComposeText(emailPack, { projectName, completeBundleUrl }),
-        bundleUrl: emailPack.bundle?.url ?? null,
-        completeBundleUrl,
-        attachments: attachments.map((f) => ({
-          filename: f.filename, contentType: f.contentType, bytes: f.content.length
-        })),
-        attachmentsOmittedOversize
-      },
-      eml: buildEml({
-        subject: rendered.subject, html: rendered.html, text: rendered.text, attachments
-      })
+      packageName: emailPack.packageName,
+      subject: rendered.subject,
+      html: rendered.html,
+      text: rendered.text,
+      recipients,
+      bundleUrl: emailPack.bundle?.url ?? null,
+      completeBundleUrl,
+      portalUrl: portalStatus?.url ?? null,
+      attachments: attachments.map((f) => ({
+        filename: f.filename, contentType: f.contentType, bytes: f.content.length
+      })),
+      attachmentsOmittedOversize
+    };
+  }
+
+  /**
+   * The assembly `draftIttEmail` and `sendIttDraft` share.
+   *
+   * Both must see the same package, the same attachments and the same shortlist, or the modal
+   * would preview one email and send another.
+   */
+  private async buildIttDraft(actor: Actor, workflowId: string, packageName: string): Promise<{
+    emailPack: IttEmailPack;
+    projectName: string;
+    completeBundleUrl: string | null;
+    letterContext: IttEmailLetterContext;
+    attachments: IttAttachment[];
+    attachmentsOmittedOversize: boolean;
+    recipients: IttDraftRecipient[];
+  }> {
+    const bundles = await this.bundlesForWorkflow(workflowId);
+    const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
+    const assembled = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles);
+    const letterContext = await this.letterContextFor(actor, workflowId);
+    // The compose box addresses whoever the sender types in, not one named firm, so
+    // there is no single recipient to personalise the letter/forms to yet.
+    const draftRecipient = { name: null as string | null, email: '', address: null as string | null };
+
+    // The same budget a real send applies, measured the same way (on the encoded length, which
+    // is what actually travels) — so a package that would send without its attachments previews
+    // without them too, rather than promising files the send would drop.
+    const { templates } = await this.resolvedTemplatesFor(actor, assembled.emailPack.attachmentCodes);
+    const context = await this.buildRenderContext(actor, assembled.emailPack, assembled.projectName, letterContext, draftRecipient);
+    const packageRow = await this.db.query<Row>(`SELECT id FROM package_config WHERE organization_id = $1 AND name = $2 LIMIT 1`, [actor.organizationId, packageName]);
+    const attendanceRows = packageRow[0] ? await this.attendanceRowsFor(actor, packageRow[0]) : [];
+    const files = await ittAttachmentsFor(assembled.emailPack, assembled.projectName, context, templates, attendanceRows);
+    const encodedBytes = files.reduce((sum, f) => sum + Math.ceil(f.content.length / 3) * 4, 0);
+    const attachmentsOmittedOversize = encodedBytes > MAX_ATTACHMENT_BYTES;
+
+    // Every firm the tender launch meeting selected for this package, with whatever contact
+    // SCMS holds. A firm with no email on file is returned with email: null rather than dropped
+    // — "there is nobody to write to at this firm" is a fact the sender needs to see.
+    const contacts = new Map(
+      (await this.scms.getContactsForSubcontractors(assembled.recipients.map((r) => String(r.subcontractor_id))))
+        .map((c) => [String(c.subcontractor_id), c])
+    );
+    const recipients: IttDraftRecipient[] = assembled.recipients.map((r) => {
+      const contact = contacts.get(String(r.subcontractor_id));
+      return {
+        shortlistEntryId: String(r.shortlist_entry_id),
+        subcontractorId: String(r.subcontractor_id),
+        name: contact?.name ? String(contact.name) : null,
+        contactName: contact?.contact_name ? String(contact.contact_name) : null,
+        email: contact?.contact_email ? String(contact.contact_email) : null
+      };
+    });
+
+    return {
+      emailPack: assembled.emailPack,
+      projectName: assembled.projectName,
+      completeBundleUrl,
+      letterContext,
+      attachments: attachmentsOmittedOversize ? [] : files,
+      attachmentsOmittedOversize,
+      recipients
+    };
+  }
+
+  /**
+   * Send the ITT the compose modal is showing, to the addresses typed into it.
+   *
+   * THE BODY IS NOT ACCEPTED FROM THE CLIENT. Only To, Cc and Subject cross the wire; the
+   * scope, bill, document links and attachments are rebuilt here from the same assembly the
+   * preview was rendered from. A tenderer's obligations must not be editable in a browser on
+   * their way out, and re-deriving them is what guarantees that rather than trusting the UI.
+   *
+   * ONE MESSAGE, however many recipients — that is what a compose box means. It differs
+   * deliberately from confirmAndSendItt, which addresses each firm separately so that no firm
+   * ever sees a competitor's address; here the sender chose who shares the message.
+   *
+   * Recorded where it can be. An address matching a shortlisted firm's SCMS contact gets an
+   * itt_dispatch row so the Status column tells the truth about what has gone out; a hand-typed
+   * address matching nobody is still sent to, and the result says how many did not record.
+   */
+  async sendIttDraft(actor: Actor, workflowId: string, packageName: string, input: {
+    to: string[]; cc: string[]; subject: string;
+  }): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.emailService) {
+      throw conflict('Email is not configured in this environment, so this ITT cannot be sent from here.');
+    }
+
+    const { emailPack, projectName, completeBundleUrl, letterContext, attachments, recipients } =
+      await this.buildIttDraft(actor, workflowId, packageName);
+    const portalStatus = await this.draftPortalStatus(workflowId, packageName, emailPack, recipients);
+    const rendered = renderIttEmail([emailPack], { name: null, email: '', address: null }, {
+      projectName, completeBundleUrl, letterContext,
+      portalStatusByPackage: portalStatus ? { [packageName]: portalStatus } : undefined
+    });
+
+    const normalise = (address: string) => address.trim().toLowerCase();
+    const to = [...new Set(input.to.map((a) => a.trim()).filter(Boolean))];
+    const cc = [...new Set(input.cc.map((a) => a.trim()).filter(Boolean))]
+      .filter((address) => !to.some((t) => normalise(t) === normalise(address)));
+    if (to.length === 0) throw conflict('Add at least one recipient before sending.');
+
+    const addressed = new Set([...to, ...cc].map(normalise));
+    const matched = recipients.filter((r) => r.email && addressed.has(normalise(r.email)));
+    const notRecorded = addressed.size - new Set(matched.map((r) => normalise(r.email!))).size;
+
+    // Recorded for the audit trail (so the dispatch page has something to show for these
+    // firms), but deliberately NEVER rendered into this email: ONE MESSAGE goes to every
+    // matched address at once here, and a portal URL embedded in a shared message would
+    // hand firm A's pricing capability to every other addressee on it. Online pricing
+    // links are only ever rendered from confirmAndSendItt / sendIttsForWorkflow, which
+    // address one firm per message.
+    if (matched.length > 0) {
+      await this.mintPortalLinksFor(matched.map((r) => ({
+        shortlistEntryId: r.shortlistEntryId, workflowId, packageName,
+        subcontractorId: r.subcontractorId, tendererName: r.name ?? 'Unknown firm',
+        recipientEmail: r.email, emailPack
+      })));
+    }
+
+    // Test mode redirects the whole message to one inbox and drops the cc list, so exercising
+    // this against a real package cannot reach a real subcontractor. The subject names who it
+    // was meant for, since every test send lands in the same place.
+    const from = this.testEmailOverride?.from ?? ITT_FROM_ADDRESS;
+    const subject = this.testEmailOverride
+      ? `[TEST → ${[...to, ...cc].join(', ')}] ${input.subject}`
+      : input.subject;
+
+    const encoded: EmailAttachment[] = attachments.map((file) => ({
+      content: file.content.toString('base64'),
+      filename: file.filename,
+      type: file.contentType,
+      disposition: 'attachment'
+    }));
+
+    let messageId: string | null = null;
+    let failure: string | null = null;
+    try {
+      const result = await this.emailService.send({
+        from,
+        to: this.testEmailOverride ? this.testEmailOverride.to : to,
+        cc: this.testEmailOverride ? [] : cc,
+        // A subcontractor replying to a message a person composed should reach that person, not
+        // the shared service mailbox every automated ITT is sent from.
+        replyTo: actor.email,
+        subject,
+        html: rendered.html,
+        text: rendered.text,
+        attachments: encoded
+      });
+      messageId = (result as { message_id?: string } | null)?.message_id ?? null;
+    } catch (error) {
+      failure = error instanceof Error ? error.message : 'Unknown error sending email';
+    }
+
+    // A failure is recorded too. A firm that did not receive its ITT because the provider
+    // rejected the message must not keep showing as "not sent" with no explanation.
+    for (const recipient of matched) {
+      await this.db.query(
+        `INSERT INTO itt_dispatch (shortlist_entry_id, dispatched_at, email_status, email_error, email_sent_at, email_message_id)
+         VALUES ($1, NOW(), $2, $3, CASE WHEN $2 = 'sent' THEN NOW() ELSE NULL END, $4)
+         ON CONFLICT (shortlist_entry_id) DO UPDATE
+           SET dispatched_at = NOW(), email_status = $2, email_error = $3,
+               email_sent_at = CASE WHEN $2 = 'sent' THEN NOW() ELSE NULL END,
+               email_message_id = $4`,
+        [recipient.shortlistEntryId, failure ? 'failed' : 'sent', failure, messageId]
+      );
+    }
+
+    if (failure) throw conflict(`The email could not be sent: ${failure}`);
+
+    return {
+      package_name: emailPack.packageName,
+      to,
+      cc,
+      recipients: to.length + cc.length,
+      recorded: matched.length,
+      // Named rather than hidden: an address nobody on the shortlist owns is a perfectly good
+      // thing to send to, but it leaves no trace on this ITT's dispatch record.
+      not_recorded: notRecorded,
+      attachments: encoded.length,
+      email_message_id: messageId
     };
   }
 
@@ -1731,6 +2229,7 @@ export class TenderPrepDatabase {
 
     const bundles = await this.bundlesForWorkflow(workflowId);
     const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
+    const letterContext = await this.letterContextFor(actor, workflowId);
 
     // One assembly per package, shared across every firm invited to it. getPackageItt is the
     // expensive call in this flow and most packages have several recipients.
@@ -1773,6 +2272,22 @@ export class TenderPrepDatabase {
         .map((c) => [String(c.subcontractor_id), c])
     );
 
+    // Every link across every firm x package on this send, minted and Access-synced
+    // BEFORE any email leaves — see mintPortalLinksFor's doc comment.
+    const portalRequests: Array<Parameters<typeof this.mintPortalLinksFor>[0][number]> = [];
+    for (const [subcontractorId, packages] of byFirm) {
+      const contact = contacts.get(subcontractorId);
+      const email = this.testEmailOverride?.to ?? (contact?.contact_email ? String(contact.contact_email) : null);
+      for (const [packageName, shortlistEntryId] of packages) {
+        portalRequests.push({
+          shortlistEntryId, workflowId, packageName, subcontractorId,
+          tendererName: contact?.name ? String(contact.name) : 'Unknown firm',
+          recipientEmail: email, emailPack: assembled.get(packageName)!.emailPack
+        });
+      }
+    }
+    const portalStatuses = await this.mintPortalLinksFor(portalRequests);
+
     let sent = 0, failed = 0, skippedNoEmail = 0;
     const detail: Array<{ subcontractorId: string; packages: string[]; status: string; error?: string }> = [];
     const from = this.testEmailOverride?.from ?? ITT_FROM_ADDRESS;
@@ -1806,18 +2321,24 @@ export class TenderPrepDatabase {
       }
 
       const packs = packageNamesForFirm.map((name) => assembled.get(name)!.emailPack);
-      const rendered = renderIttEmail(
-        packs,
-        { name: contact?.contact_name ? String(contact.contact_name) : null, email },
-        { projectName, completeBundleUrl }
-      );
+      const recipient = {
+        name: contact?.contact_name ? String(contact.contact_name) : null,
+        email,
+        address: contact?.contact_address ? String(contact.contact_address) : null
+      };
+      const portalStatusByPackage: Record<string, IttEmailPortalStatus> = {};
+      for (const [packageName, shortlistEntryId] of packages) {
+        const status = portalStatuses.get(`${shortlistEntryId}::${packageName}`);
+        if (status) portalStatusByPackage[packageName] = status;
+      }
+      const rendered = renderIttEmail(packs, recipient, { projectName, completeBundleUrl, letterContext, portalStatusByPackage });
       const subject = this.testEmailOverride
         ? `[TEST → ${contact?.contact_name ? String(contact.contact_name) : 'unknown'} <${realEmail ?? 'no email on file'}>] ${rendered.subject}`
         : rendered.subject;
 
       try {
         if (!this.emailService) throw new Error('EmailService not configured in this environment');
-        const attachments = await this.attachmentsFor(packs, projectName);
+        const attachments = await this.attachmentsFor(actor, packs, projectName, letterContext, recipient);
         const result = await this.emailService.send({
           from, to: email, subject, html: rendered.html, text: rendered.text, attachments
         });
@@ -1878,7 +2399,7 @@ export class TenderPrepDatabase {
     const assembled = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles);
     const { emailPack, projectName } = assembled;
     const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
-    const attachments = await this.attachmentsFor([emailPack], projectName);
+    const letterContext = await this.letterContextFor(actor, workflowId);
 
     const recipients = assembled.recipients;
     const subcontractorIds = recipients.map((r) => String(r.subcontractor_id));
@@ -1886,6 +2407,20 @@ export class TenderPrepDatabase {
       (await this.scms.getContactsForSubcontractors(subcontractorIds))
         .map((c) => [String(c.subcontractor_id), c])
     );
+
+    // Every link for this send, minted and Access-synced BEFORE any email leaves — see
+    // mintPortalLinksFor's doc comment for why this is not best-effort like everything
+    // else in this method.
+    const portalStatuses = await this.mintPortalLinksFor(recipients.map((recipient) => {
+      const contact = contacts.get(String(recipient.subcontractor_id));
+      const email = this.testEmailOverride?.to ?? (contact?.contact_email ? String(contact.contact_email) : null);
+      return {
+        shortlistEntryId: String(recipient.shortlist_entry_id), workflowId, packageName,
+        subcontractorId: String(recipient.subcontractor_id),
+        tendererName: contact?.name ? String(contact.name) : 'Unknown firm',
+        recipientEmail: email, emailPack
+      };
+    }));
 
     let sent = 0, failed = 0, skippedNoEmail = 0;
     const detail: Array<{ subcontractorId: string; status: string; error?: string }> = [];
@@ -1914,17 +2449,26 @@ export class TenderPrepDatabase {
         continue;
       }
 
-      const rendered = renderIttEmail(
-        [emailPack],
-        { name: contact?.contact_name ? String(contact.contact_name) : null, email },
-        { projectName, completeBundleUrl }
-      );
+      const recipientInfo = {
+        name: contact?.contact_name ? String(contact.contact_name) : null,
+        email,
+        address: contact?.contact_address ? String(contact.contact_address) : null
+      };
+      const portalStatus = portalStatuses.get(`${shortlistEntryId}::${packageName}`);
+      const rendered = renderIttEmail([emailPack], recipientInfo, {
+        projectName, completeBundleUrl, letterContext,
+        portalStatusByPackage: portalStatus ? { [packageName]: portalStatus } : undefined
+      });
       // Keeps test-inbox messages distinguishable across packages/recipients when every
       // send lands in the same TEST_TO_EMAIL_ACCOUNT.
       const subject = this.testEmailOverride
         ? `[TEST → ${contact?.contact_name ? String(contact.contact_name) : 'unknown'} <${realEmail ?? 'no email on file'}>] ${rendered.subject}`
         : rendered.subject;
       const { html, text } = rendered;
+      // The cover letter and forms carry this recipient's own name/address, so —
+      // unlike the old scope/BoQ-only pair — attachments are rebuilt per recipient,
+      // not hoisted above the loop.
+      const attachments = await this.attachmentsFor(actor, [emailPack], projectName, letterContext, recipientInfo);
 
       try {
         if (this.emailService) {
@@ -1998,6 +2542,113 @@ export class TenderPrepDatabase {
        WHERE sl.workflow_id = $1 ORDER BY sl.package_name, se.rank`,
       [workflowId]
     );
+  }
+
+  // ── Subcontractor pricing portal — the buyer-facing side (an Actor, a workflow) ─────
+
+  /** Every firm this package's ITT went to, with their portal status — the "Open
+   * responses" modal's list. */
+  async listPortalResponses(actor: Actor, workflowId: string, packageName: string): Promise<Row[]> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.portalDb) return [];
+    const links = await this.portalDb.listForPackage(workflowId, packageName);
+    const subcontractorIds = [...new Set(links.map((l) => String(l.subcontractor_id)).filter(Boolean))];
+    const contacts = new Map(
+      (await this.scms.getContactsForSubcontractors(subcontractorIds))
+        .map((c) => [String(c.subcontractor_id), c])
+    );
+    return links.map((l) => ({ ...l, firm_name: contacts.get(String(l.subcontractor_id))?.name ?? l.tenderer_name }));
+  }
+
+  /** One firm's priced bill, read-only — what "Open response" in that modal opens. */
+  async getPortalResponse(actor: Actor, workflowId: string, linkId: string): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.portalDb) throw notFound('The subcontractor pricing portal is not configured in this environment.');
+    const link = await this.portalDb.getById(linkId);
+    if (!link || String(link.workflow_id) !== workflowId) throw notFound('Pricing portal link not found');
+    const lines = await this.portalDb.getLines(linkId);
+    return { ...link, lines };
+  }
+
+  /**
+   * A buyer reopens a submitted return for the tenderer to revise — a decision, so it is
+   * recorded (`reopened_at`/`reopened_by`) rather than silently clearing `submitted_at`.
+   * The prior submission's `tender_returns` row is left as-is; a fresh submit overwrites
+   * it via the same ON CONFLICT `PricingPortalDatabase.submit` already uses.
+   */
+  async reopenPortalResponse(actor: Actor, workflowId: string, linkId: string): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.portalDb) throw notFound('The subcontractor pricing portal is not configured in this environment.');
+    const link = await this.portalDb.getById(linkId);
+    if (!link || String(link.workflow_id) !== workflowId) throw notFound('Pricing portal link not found');
+    if (!link.submitted_at) throw conflict('This return has not been submitted, so there is nothing to reopen.');
+    await this.portalDb.reopen(linkId, actor.userId);
+    return this.getPortalResponse(actor, workflowId, linkId);
+  }
+
+  // ── Subcontractor pricing portal — the public-facing side (a token, no Actor) ───────
+
+  /**
+   * Resolves a portal token to its link row, binding the caller's VERIFIED Cloudflare
+   * Access identity to the recipient the link was issued to. THE TOKEN says WHICH
+   * dispatch; THIS BINDING says WHO is allowed to see it — neither alone is enough, and
+   * this is what stops one invited firm opening another's rates once both satisfy the
+   * same Access policy.
+   *
+   * `accessEmail` is null only when PORTAL_ACCESS_REQUIRED=false (local development with
+   * no Cloudflare Access in front of anything, forbidden in production by `loadConfig`)
+   * — the binding check is skipped and the token is trusted alone, matching the warning
+   * `accessJwt.ts` already logs for that case.
+   *
+   * A same-domain match is accepted alongside an exact address match — a colleague at the
+   * same firm picking up the tender from the named estimator is an ordinary event, not a
+   * breach — but public/free domains never qualify for it: two people at gmail.com are
+   * unrelated strangers. In the approved design no link is ever minted for a public-domain
+   * recipient in the first place (see mintPortalLinksFor), so this is belt-and-braces
+   * against a link somehow existing for one anyway.
+   */
+  private async resolvePortalToken(token: string, accessEmail: string | null): Promise<Row> {
+    if (!this.portalDb) throw notFound('Online pricing is not available.');
+    const link = await this.portalDb.getByToken(token);
+    if (!link) throw notFound('This link has expired or is no longer valid.');
+    if (accessEmail) {
+      const linkEmail = String(link.recipient_email).toLowerCase();
+      const linkDomain = String(link.recipient_domain).toLowerCase();
+      const matches = accessEmail === linkEmail
+        || (!isPublicEmailDomain(linkDomain) && domainOf(accessEmail) === linkDomain);
+      if (!matches) {
+        await this.portalDb.recordDenial(String(link.id), accessEmail);
+        throw forbidden('This link was not issued to your address. If you believe this is a mistake, ask whoever sent it to resend it to you directly.');
+      }
+    }
+    await this.portalDb.recordOpen(String(link.id), accessEmail);
+    return link;
+  }
+
+  async getPortalPackage(token: string, accessEmail: string | null): Promise<Row> {
+    const link = await this.resolvePortalToken(token, accessEmail);
+    const lines = await this.portalDb!.getLines(String(link.id));
+    const [letterDetails] = await this.db.query<Row>(
+      `SELECT tender_return_deadline FROM itt_letter_details WHERE workflow_id = $1`, [link.workflow_id]
+    );
+    return { ...link, lines, tender_return_deadline: letterDetails?.tender_return_deadline ?? null };
+  }
+
+  async savePortalDraft(token: string, accessEmail: string | null, input: {
+    header: { programmeWeeks: number | null; qualifications: string | null; exclusions: string | null };
+    lines: PortalLineDraftInput[];
+  }): Promise<Row> {
+    const link = await this.resolvePortalToken(token, accessEmail);
+    if (link.submitted_at) throw conflict('This return has already been submitted and can no longer be edited.');
+    await this.portalDb!.saveDraft(String(link.id), input);
+    return this.getPortalPackage(token, accessEmail);
+  }
+
+  async submitPortalResponse(token: string, accessEmail: string | null): Promise<Row> {
+    const link = await this.resolvePortalToken(token, accessEmail);
+    if (link.submitted_at) throw conflict('This return has already been submitted.');
+    await this.portalDb!.submit(String(link.id));
+    return this.getPortalPackage(token, accessEmail);
   }
 
   // ── Step 3: Comparative ───────────────────────────────────────────────────

@@ -183,7 +183,11 @@ export class ScmsReadDatabase {
       `SELECT s.id AS subcontractor_id,
               s.name,
               ct.full_name AS contact_name,
-              ct.email     AS contact_email
+              ct.email     AS contact_email,
+              -- The cover letter's address block. registered_address is preferred;
+              -- trading_address is the fallback since the register (003_subcontractor_
+              -- profile_fields.sql) only populates one or the other for 55-70% of rows.
+              COALESCE(s.registered_address, s.trading_address) AS contact_address
          FROM ${s}.subcontractors s
          LEFT JOIN LATERAL (
            SELECT c.full_name, c.email

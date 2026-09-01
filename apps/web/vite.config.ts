@@ -3,6 +3,9 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
+  // Also mounted at /tps/ on the shared dev.novamerx.ai tunnel (infra/docker/nginx-web.conf
+  // serves the same build under both / and /tps/), so asset URLs must be prefix-aware.
+  base: '/tps/',
   // Vite defaults envDir to this package, which holds no .env — the repo has a single
   // root .env, the same one the BFF reads via --env-file=../../.env. Without this the dev
   // server sees no VITE_DEV_* at all, so the web client sends no dev auth headers and

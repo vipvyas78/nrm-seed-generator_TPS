@@ -49,6 +49,31 @@ const schema = z.object({
   TEST_EMAIL_FLAG: z.enum(['Y', 'N']).default('N').transform((v) => v === 'Y'),
   TEST_FROM_EMAIL_ACCOUNT: z.string().email().optional(),
   TEST_TO_EMAIL_ACCOUNT: z.string().email().optional(),
+
+  // Cloudflare Zero Trust Access — gates the subcontractor pricing portal at the edge.
+  // Separate token from CLOUDFLARE_EMAIL_TOKEN: this one needs "Access: Apps and
+  // Policies — Edit" and nothing else, and the two must never be confused for one
+  // another's scope. Optional: without it, no portal link is ever issued (see
+  // cloudflareAccess.ts) and the ITT still sends with its workbook attachment, exactly
+  // as before this feature existed.
+  CLOUDFLARE_API_TOKEN: z.string().optional(),
+  // "<team>.cloudflareaccess.com" — derives both the Access login domain and the JWKS
+  // issuer the portal verifies every request's Cf-Access-Jwt-Assertion against. The
+  // audience ("aud") side of verification is deliberately NOT a config var: it is
+  // whichever Access application cloudflareAccess.ts created or found on this account,
+  // read from tps.cf_access_config at verify time — the same row that write it. A
+  // separately configured CF_ACCESS_AUD could drift from the application actually in use
+  // the moment either one changed without the other, and JWT verification would fail
+  // for every visitor with no obvious cause.
+  CF_ACCESS_TEAM_NAME: z.string().optional(),
+  // What the emailed link is built from, e.g. "https://dev.novamerx.ai/tps". Falls back
+  // to WEB_ORIGIN's first entry so a local run needs no extra configuration.
+  PORTAL_BASE_URL: optionalUrl,
+  // 'false' only for local development with no Cloudflare Access in front of anything —
+  // the portal then accepts the URL token alone and logs a warning on every open.
+  // loadConfig refuses this in production, below.
+  PORTAL_ACCESS_REQUIRED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+  PORTAL_LINK_TTL_DAYS: z.coerce.number().int().positive().default(90),
   // Optional here on purpose: migrate.ts calls loadConfig() and migrate-tps has no Redis.
   // The worker requires it through loadWorkerConfig below.
   REDIS_URL: z.string().min(1).optional(),
@@ -90,6 +115,9 @@ export function loadConfig(input: NodeJS.ProcessEnv = process.env): Config {
   }
   if (config.NODE_ENV === 'production' && config.AUTH_DISABLED) {
     throw new Error('AUTH_DISABLED must not be enabled in production');
+  }
+  if (config.NODE_ENV === 'production' && !config.PORTAL_ACCESS_REQUIRED) {
+    throw new Error('PORTAL_ACCESS_REQUIRED must not be disabled in production');
   }
   return config;
 }
