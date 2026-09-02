@@ -18,6 +18,7 @@ export type PortalLineStatus = 'priced' | 'included' | 'excluded' | 'not_address
 
 export interface PortalLineDraftInput {
   id: string;
+  quantity: number | null;
   rate: number | null;
   status: PortalLineStatus;
   note: string | null;
@@ -172,9 +173,11 @@ export class PricingPortalDatabase {
     );
   }
 
-  /** Header + line rates/status/notes. `total` is derived here, server-side, from
-   * quantity x rate — never accepted from the browser, so a tampered total can never
-   * reach `tender_return_lines` on submit. */
+  /** Header + line quantities/rates/status/notes. `total` is derived here, server-side,
+   * from quantity x rate — never accepted from the browser, so a tampered total can never
+   * reach `tender_return_lines` on submit. Quantity itself IS accepted from the browser
+   * (unlike total): the tenderer may enter their own figure on any line, snapshotted or
+   * added — see `addLine` for how a new line is created in the first place. */
   async saveDraft(linkId: string, input: {
     header: { programmeWeeks: number | null; qualifications: string | null; exclusions: string | null };
     lines: PortalLineDraftInput[];
@@ -188,12 +191,40 @@ export class PricingPortalDatabase {
     if (input.lines.length === 0) return;
     await this.db.query(
       `UPDATE tps.pricing_portal_lines AS l
-          SET rate = u.rate, status = u.status, note = u.note,
-              total = CASE WHEN u.rate IS NOT NULL AND l.quantity IS NOT NULL THEN l.quantity * u.rate ELSE NULL END
-         FROM unnest($2::uuid[], $3::numeric[], $4::text[], $5::text[]) AS u(id, rate, status, note)
+          SET quantity = u.quantity, rate = u.rate, status = u.status, note = u.note,
+              total = CASE WHEN u.rate IS NOT NULL AND u.quantity IS NOT NULL THEN u.quantity * u.rate ELSE NULL END
+         FROM unnest($2::uuid[], $3::numeric[], $4::numeric[], $5::text[], $6::text[]) AS u(id, quantity, rate, status, note)
         WHERE l.id = u.id AND l.link_id = $1`,
-      [linkId, input.lines.map((l) => l.id), input.lines.map((l) => l.rate),
+      [linkId, input.lines.map((l) => l.id), input.lines.map((l) => l.quantity), input.lines.map((l) => l.rate),
        input.lines.map((l) => l.status), input.lines.map((l) => l.note)]
+    );
+  }
+
+  /** Adds a wholly new line to a tenderer's response — one the ITT assembly never
+   * snapshotted, e.g. an item the buyer's BOQ omitted. `seq` continues the existing
+   * numbering so it sorts after the snapshot; `is_priceable` is always true since this is
+   * the tenderer's own line. `added_by_tenderer` is what lets the UI (and `deleteLine`)
+   * tell this apart from a snapshotted line later. */
+  async addLine(linkId: string, input: {
+    description: string; quantity: number | null; unit: string | null;
+  }): Promise<Row> {
+    const [row] = await this.db.query<Row>(
+      `INSERT INTO tps.pricing_portal_lines (link_id, seq, description, quantity, unit, is_priceable, added_by_tenderer)
+       VALUES ($1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM tps.pricing_portal_lines WHERE link_id = $1), $2, $3, $4, TRUE, TRUE)
+       RETURNING *`,
+      [linkId, input.description, input.quantity, input.unit]
+    );
+    return row;
+  }
+
+  /** Removes a line the tenderer added — never a snapshotted BOQ line, which stays
+   * immutable evidence of what the ITT actually asked for. Guarded in SQL (not just by the
+   * caller) with `added_by_tenderer = TRUE` so this can never delete a snapshotted line even
+   * if called incorrectly. */
+  async deleteLine(linkId: string, lineId: string): Promise<void> {
+    await this.db.query(
+      `DELETE FROM tps.pricing_portal_lines WHERE id = $1 AND link_id = $2 AND added_by_tenderer = TRUE`,
+      [lineId, linkId]
     );
   }
 

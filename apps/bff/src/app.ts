@@ -114,8 +114,10 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   // /tps-api/ to this process unauthenticated by itself, so the edge policy protects a
   // PATH, and this process is what actually proves who signed the header.
   const portalTokenParams = z.object({ token: z.string().min(1) });
+  const portalLineIdParams = portalTokenParams.extend({ lineId: z.string().uuid() });
   const portalLineInput = z.object({
     id: z.string().uuid(),
+    quantity: z.number().min(0).nullable(),
     rate: z.number().min(0).nullable(),
     status: z.enum(['priced', 'included', 'excluded', 'not_addressed']),
     note: z.string().trim().max(2000).nullable()
@@ -150,6 +152,25 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     const { token } = params(request, portalTokenParams);
     const identity = await verifyAccessIdentity(request);
     return tpDb.submitPortalResponse(token, identity?.email ?? null);
+  });
+
+  app.post('/portal/:token/lines', async (request) => {
+    const { token } = params(request, portalTokenParams);
+    const identity = await verifyAccessIdentity(request);
+    const input = body(request, z.object({
+      description: z.string().trim().min(1).max(500),
+      quantity: z.number().min(0).nullable().optional(),
+      unit: z.string().trim().max(50).nullable().optional()
+    }));
+    return tpDb.addPortalLine(token, identity?.email ?? null, {
+      description: input.description, quantity: input.quantity ?? null, unit: input.unit ?? null
+    });
+  });
+
+  app.delete('/portal/:token/lines/:lineId', async (request) => {
+    const { token, lineId } = params(request, portalLineIdParams);
+    const identity = await verifyAccessIdentity(request);
+    return tpDb.deletePortalLine(token, identity?.email ?? null, lineId);
   });
 
   await app.register(async (protectedApi) => {
