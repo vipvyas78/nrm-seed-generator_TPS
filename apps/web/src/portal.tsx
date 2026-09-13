@@ -3,6 +3,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { portalApi, type PortalLineStatus } from './api';
 
+type PortalLineEdit = { quantity: string; rate: string; status: PortalLineStatus; note: string };
+
 /**
  * The subcontractor pricing portal — the PUBLIC page an invited tenderer opens from their
  * ITT email. Rendered outside `<AppShell/>` (see main.tsx): no BuildFlow branding, no sign-in
@@ -21,20 +23,22 @@ export function PortalPage() {
   const queryClient = useQueryClient();
   const query = useQuery({ queryKey: ['portal', token], queryFn: () => portalApi.get(token), retry: false });
 
-  const [lines, setLines] = useState<Record<string, { rate: string; status: PortalLineStatus; note: string }>>({});
+  const [lines, setLines] = useState<Record<string, PortalLineEdit>>({});
   const [header, setHeader] = useState({ programmeWeeks: '', qualifications: '', exclusions: '' });
   const [hydrated, setHydrated] = useState(false);
   const [confirmingSubmit, setConfirmingSubmit] = useState(false);
+  const [newLine, setNewLine] = useState({ description: '', quantity: '', unit: '' });
 
   // Hydrated ONCE from the first successful load — re-running this on every refetch would
   // overwrite whatever the tenderer has typed since. A resend/reopen invalidates the
   // query explicitly (see the save/submit mutations below), which is the only time this
-  // should re-run.
+  // should re-run. A line added later (see `addLine` below) is merged in at that point
+  // instead, since by then this has already run once.
   useEffect(() => {
     if (!query.data || hydrated) return;
     const nextLines: typeof lines = {};
     for (const line of query.data.lines) {
-      nextLines[line.id] = { rate: line.rate ?? '', status: line.status, note: line.note ?? '' };
+      nextLines[line.id] = { quantity: line.quantity ?? '', rate: line.rate ?? '', status: line.status, note: line.note ?? '' };
     }
     setLines(nextLines);
     setHeader({
@@ -50,7 +54,8 @@ export function PortalPage() {
     qualifications: header.qualifications.trim() || null,
     exclusions: header.exclusions.trim() || null,
     lines: Object.entries(lines).map(([id, l]) => ({
-      id, rate: l.rate.trim() ? Number(l.rate) : null, status: l.status, note: l.note.trim() || null
+      id, quantity: l.quantity.trim() ? Number(l.quantity) : null,
+      rate: l.rate.trim() ? Number(l.rate) : null, status: l.status, note: l.note.trim() || null
     }))
   });
 
@@ -63,13 +68,45 @@ export function PortalPage() {
     onSuccess: (result) => { queryClient.setQueryData(['portal', token], result); setConfirmingSubmit(false); }
   });
 
+  // The hydrate effect above only ever runs once, so a line minted by this mutation (an id
+  // the browser has never seen) has to be merged into `lines` here too, or it would render
+  // fine (the per-row fallback below covers that) but never make it into a save/submit.
+  const addLine = useMutation({
+    mutationFn: () => portalApi.addLine(token, {
+      description: newLine.description.trim(),
+      quantity: newLine.quantity.trim() ? Number(newLine.quantity) : null,
+      unit: newLine.unit.trim() || null
+    }),
+    onSuccess: (result) => {
+      queryClient.setQueryData(['portal', token], result);
+      setLines((prev) => {
+        const next = { ...prev };
+        for (const line of result.lines) {
+          if (!next[line.id]) next[line.id] = { quantity: line.quantity ?? '', rate: line.rate ?? '', status: line.status, note: line.note ?? '' };
+        }
+        return next;
+      });
+      setNewLine({ description: '', quantity: '', unit: '' });
+    }
+  });
+  const deleteLine = useMutation({
+    mutationFn: (lineId: string) => portalApi.deleteLine(token, lineId),
+    onSuccess: (result, lineId) => {
+      queryClient.setQueryData(['portal', token], result);
+      setLines((prev) => {
+        const { [lineId]: _removed, ...rest } = prev;
+        return rest;
+      });
+    }
+  });
+
   const total = useMemo(() => {
     if (!query.data) return 0;
     return query.data.lines.reduce((sum, line) => {
       const edit = lines[line.id];
       if (!edit || edit.status !== 'priced') return sum;
       const rate = Number(edit.rate);
-      const quantity = line.quantity != null ? Number(line.quantity) : null;
+      const quantity = edit.quantity.trim() ? Number(edit.quantity) : null;
       if (!Number.isFinite(rate) || quantity == null || !Number.isFinite(quantity)) return sum;
       return sum + rate * quantity;
     }, 0);
@@ -98,24 +135,32 @@ export function PortalPage() {
     {save.isSuccess && !save.isPending && <div className="alert alert-grey">Draft saved.</div>}
     {save.error && <PortalError error={save.error} />}
     {submit.error && <PortalError error={submit.error} />}
+    {addLine.error && <PortalError error={addLine.error} />}
+    {deleteLine.error && <PortalError error={deleteLine.error} />}
 
     <div className="table-scroll">
       <table className="data-table portal-lines">
         <thead>
           <tr>
-            <th>Description</th><th>Qty</th><th>Unit</th><th>Rate</th><th>Total</th><th>Status</th><th>Note</th>
+            <th>Description</th><th>Qty</th><th>Unit</th><th>Rate</th><th>Total</th><th>Status</th><th>Note</th><th></th>
           </tr>
         </thead>
         <tbody>
           {pkg.lines.map((line) => {
-            const edit = lines[line.id] ?? { rate: '', status: line.status, note: '' };
+            const edit = lines[line.id] ?? { quantity: line.quantity ?? '', rate: '', status: line.status, note: '' };
             const rate = Number(edit.rate);
-            const quantity = line.quantity != null ? Number(line.quantity) : null;
+            const quantity = edit.quantity.trim() ? Number(edit.quantity) : null;
             const lineTotal = edit.status === 'priced' && Number.isFinite(rate) && quantity != null && Number.isFinite(quantity)
               ? rate * quantity : null;
             return <tr key={line.id}>
               <td>{line.description}{line.ge_code ? <span className="tiny muted"> ({line.ge_code})</span> : null}</td>
-              <td>{line.quantity ?? '—'}</td>
+              <td>
+                <input
+                  type="number" min={0} step="0.001" disabled={readOnly || !line.is_priceable}
+                  value={edit.quantity}
+                  onChange={(e) => setLines((prev) => ({ ...prev, [line.id]: { ...edit, quantity: e.target.value } }))}
+                />
+              </td>
               <td>{line.unit ?? '—'}</td>
               <td>
                 <input
@@ -144,12 +189,46 @@ export function PortalPage() {
                   placeholder={edit.status === 'excluded' ? 'Reason for exclusion' : ''}
                 />
               </td>
+              <td>
+                {line.added_by_tenderer && <button
+                  type="button" className="secondary tiny" disabled={readOnly || deleteLine.isPending}
+                  onClick={() => deleteLine.mutate(line.id)}
+                >Remove</button>}
+              </td>
             </tr>;
           })}
+          {!readOnly && <tr className="portal-add-line">
+            <td>
+              <input
+                type="text" placeholder="Description of added item" value={newLine.description}
+                onChange={(e) => setNewLine((prev) => ({ ...prev, description: e.target.value }))}
+              />
+            </td>
+            <td>
+              <input
+                type="number" min={0} step="0.001" placeholder="Qty" value={newLine.quantity}
+                onChange={(e) => setNewLine((prev) => ({ ...prev, quantity: e.target.value }))}
+              />
+            </td>
+            <td>
+              <input
+                type="text" placeholder="Unit" value={newLine.unit}
+                onChange={(e) => setNewLine((prev) => ({ ...prev, unit: e.target.value }))}
+              />
+            </td>
+            <td colSpan={4}></td>
+            <td>
+              <button
+                type="button" className="secondary tiny" disabled={!newLine.description.trim() || addLine.isPending}
+                onClick={() => addLine.mutate()}
+              >{addLine.isPending ? 'Adding…' : 'Add row'}</button>
+            </td>
+          </tr>}
         </tbody>
         <tfoot>
           <tr><td colSpan={4}><strong>Total (priced lines)</strong></td>
-            <td colSpan={3}><strong>{total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></td></tr>
+            <td colSpan={3}><strong>{total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong></td>
+            <td></td></tr>
         </tfoot>
       </table>
     </div>

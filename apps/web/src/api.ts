@@ -350,6 +350,7 @@ export type PortalLine = {
   total: string | null;
   status: PortalLineStatus;
   note: string | null;
+  added_by_tenderer: boolean;
 };
 
 /** One firm on the "Open responses" modal's list — the ITT Dispatch page's buyer view. */
@@ -404,8 +405,10 @@ export type PortalDraftInput = {
   programmeWeeks: number | null;
   qualifications: string | null;
   exclusions: string | null;
-  lines: Array<{ id: string; rate: number | null; status: PortalLineStatus; note: string | null }>;
+  lines: Array<{ id: string; quantity: number | null; rate: number | null; status: PortalLineStatus; note: string | null }>;
 };
+
+export type PortalNewLineInput = { description: string; quantity: number | null; unit: string | null };
 
 export type TenderComparative = {
   id: string;
@@ -577,5 +580,9 @@ export const portalApi = {
   get: (token: string) => portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}`),
   saveDraft: (token: string, input: PortalDraftInput) =>
     portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}/draft`, { method: 'PUT', body: JSON.stringify(input) }),
-  submit: (token: string) => portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}/submit`, { method: 'POST' })
+  submit: (token: string) => portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}/submit`, { method: 'POST' }),
+  addLine: (token: string, input: PortalNewLineInput) =>
+    portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}/lines`, { method: 'POST', body: JSON.stringify(input) }),
+  deleteLine: (token: string, lineId: string) =>
+    portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}/lines/${encodeURIComponent(lineId)}`, { method: 'DELETE' })
 };

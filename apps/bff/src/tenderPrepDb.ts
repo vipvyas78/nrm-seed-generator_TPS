@@ -2651,6 +2651,22 @@ export class TenderPrepDatabase {
     return this.getPortalPackage(token, accessEmail);
   }
 
+  async addPortalLine(token: string, accessEmail: string | null, input: {
+    description: string; quantity: number | null; unit: string | null;
+  }): Promise<Row> {
+    const link = await this.resolvePortalToken(token, accessEmail);
+    if (link.submitted_at) throw conflict('This return has already been submitted and can no longer be edited.');
+    await this.portalDb!.addLine(String(link.id), input);
+    return this.getPortalPackage(token, accessEmail);
+  }
+
+  async deletePortalLine(token: string, accessEmail: string | null, lineId: string): Promise<Row> {
+    const link = await this.resolvePortalToken(token, accessEmail);
+    if (link.submitted_at) throw conflict('This return has already been submitted and can no longer be edited.');
+    await this.portalDb!.deleteLine(String(link.id), lineId);
+    return this.getPortalPackage(token, accessEmail);
+  }
+
   // ── Step 3: Comparative ───────────────────────────────────────────────────
 
   async listComparative(actor: Actor, workflowId: string): Promise<Row[]> {
