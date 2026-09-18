@@ -129,8 +129,11 @@ function PackageDashboardRows({ row, onApprove }: { row: DashboardRow; onApprove
         <td rowSpan={span}><strong>{row.display_ref}</strong> {row.package_name}</td>
         <td rowSpan={span}>{row.is_heading ? <span className="muted">—</span> : row.route_of_procurement}</td>
         <td rowSpan={span}>
+          {/* A confirmed package with nobody invited must not read as plain green: it is signed
+              off and un-tenderable at once, and Step 2 lists it flagged for the same reason. */}
           {row.is_heading ? <span className="muted">Heading</span>
             : pending ? <span className="badge">Pending</span>
+            : firms.length === 0 ? <span className="badge badge-amber">Confirmed · nobody invited</span>
             : <span className="badge badge-green">Confirmed</span>}
         </td>
         <td rowSpan={span}>
@@ -175,9 +178,12 @@ function FirmCells({ firm, deadline }: { firm: DashboardCandidate; deadline: str
 function ApprovePackageModal({ workflowId, packageConfigId, packageName, onClose }: {
   workflowId: string; packageConfigId: string; packageName: string; onClose: () => void;
 }) {
+  // Keyed under, but distinct from, Step 1's own ['launch-table', workflowId] — this response
+  // holds ONE package, and writing it to that key would leave Step 1 showing a one-row table.
+  // PackageRow's invalidation matches by prefix, so a confirm here still refreshes both.
   const table = useQuery({
-    queryKey: ['launch-table', workflowId],
-    queryFn: () => api.getLaunchTable(workflowId)
+    queryKey: ['launch-table', workflowId, 'package', packageConfigId],
+    queryFn: () => api.getLaunchTable(workflowId, undefined, packageConfigId)
   });
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };

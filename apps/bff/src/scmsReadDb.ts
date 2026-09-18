@@ -167,6 +167,78 @@ export class ScmsReadDatabase {
   }
 
   /**
+   * Describe a fixed set of firms, by id — everything `getCandidatesForPackage` returns about a
+   * firm, minus the searching.
+   *
+   * The tender dashboard shows only the firms a meeting has ALREADY picked, so it knows their
+   * ids and has nothing to look for. Going through `getCandidatesForPackage` to describe them
+   * cost a `tps.trades_match` evaluation per (package x trade category) — about 10,000 calls and
+   * 17 seconds for one page — to answer a question that was never asked. This is an indexed
+   * lookup on the primary key instead.
+   *
+   * The shape deliberately matches `getCandidatesForPackage` so `describeUsp` works on both.
+   * `matched_trades` is empty here because nothing was matched: these firms were chosen.
+   *
+   * No eligibility filter, for the same reason `getContactsForSubcontractors` has none — a firm
+   * picked at the launch meeting is shown because it was picked, not re-screened on every read.
+   */
+  async getFirmsByIds(subcontractorIds: string[]): Promise<Row[]> {
+    if (subcontractorIds.length === 0) return [];
+    const s = this.schema;
+    return this.run(() => this.db.query(
+      `SELECT s.id AS subcontractor_id,
+              s.name,
+              s.trading_as,
+              s.status,
+              s.profile_completeness_pct,
+              ROUND(AVG(r.total_score), 2) AS performance_score,
+              COUNT(r.id)::int AS ratings_count,
+              ARRAY[]::text[] AS matched_trades,
+              s.regional_coverage,
+              s.value_bands,
+              s.website,
+              (SELECT count(*) FROM ${s}.trade_assignments ta3
+                WHERE ta3.subcontractor_id = s.id)::int AS trade_count,
+              ct.full_name AS contact_name,
+              ct.role      AS contact_role,
+              ct.email     AS contact_email,
+              ct.phone     AS contact_phone,
+              jsonb_build_object(
+                'pqq_status',               s.pqq_status::text,
+                'cis_status',               s.cis_status::text,
+                'at_risk',                  s.at_risk,
+                'profile_completeness_pct', s.profile_completeness_pct,
+                'pl_expiry',                pl.expiry_date,
+                'pl_active',                (pl.expiry_date IS NOT NULL AND pl.expiry_date > NOW()),
+                'el_expiry',                el.expiry_date,
+                'el_active',                (el.expiry_date IS NOT NULL AND el.expiry_date > NOW()),
+                'accreditations',           to_jsonb(ARRAY(
+                  SELECT a.scheme FROM ${s}.accreditations a
+                   WHERE a.subcontractor_id = s.id ORDER BY a.scheme))
+              ) AS compliance_flags
+         FROM ${s}.subcontractors s
+         LEFT JOIN ${s}.performance_ratings r ON r.subcontractor_id = s.id
+         LEFT JOIN ${s}.insurance_policies pl
+           ON pl.subcontractor_id = s.id AND pl.insurance_type = 'pl'
+         LEFT JOIN ${s}.insurance_policies el
+           ON el.subcontractor_id = s.id AND el.insurance_type = 'el'
+         LEFT JOIN LATERAL (
+           SELECT c.full_name, c.role, c.email, c.phone
+             FROM ${s}.contacts c
+            WHERE c.subcontractor_id = s.id
+            ORDER BY CASE c.role WHEN 'estimator' THEN 1 WHEN 'pre_con' THEN 2
+                                 WHEN 'md' THEN 3 WHEN 'office' THEN 4 ELSE 5 END,
+                     (c.email IS NULL), (c.phone IS NULL), c.full_name
+            LIMIT 1
+         ) ct ON TRUE
+        WHERE s.id = ANY($1)
+        GROUP BY s.id, pl.expiry_date, el.expiry_date,
+                 ct.full_name, ct.role, ct.email, ct.phone`,
+      [subcontractorIds]
+    ));
+  }
+
+  /**
    * The one contact to email for each of a fixed set of firms — the recipient lookup an ITT
    * send needs. Same ranked contact as `getCandidatesForPackage` (estimator > pre_con > md >
    * office, contactable beats senior); the only difference is the WHERE clause, which is

@@ -432,10 +432,14 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
 
     protectedApi.get('/api/tender-prep/:workflowId/launch-table', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));
-      const { perPackage } = query(request, z.object({
-        perPackage: z.coerce.number().int().min(1).max(50).default(10)
+      // `packageConfigId` narrows the table to one package. Each package costs an SCMS
+      // candidate search, so the dashboard's approval modal — which edits exactly one —
+      // should not pay for the whole list to open.
+      const { perPackage, packageConfigId } = query(request, z.object({
+        perPackage: z.coerce.number().int().min(1).max(50).default(10),
+        packageConfigId: uuid.optional()
       }));
-      return tpDb.getTenderLaunchTable(requireActor(request), workflowId, perPackage);
+      return tpDb.getTenderLaunchTable(requireActor(request), workflowId, perPackage, packageConfigId);
     });
 
     /**
@@ -446,10 +450,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
      */
     protectedApi.get('/api/tender-prep/:workflowId/dashboard', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));
-      const { perPackage } = query(request, z.object({
-        perPackage: z.coerce.number().int().min(1).max(50).default(10)
-      }));
-      return tpDb.dashboardRows(requireActor(request), workflowId, perPackage);
+      return tpDb.dashboardRows(requireActor(request), workflowId);
     });
 
     protectedApi.post('/api/tender-prep/:workflowId/packages/selection', async (request) => {

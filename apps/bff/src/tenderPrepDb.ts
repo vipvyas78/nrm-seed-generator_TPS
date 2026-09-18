@@ -1637,13 +1637,19 @@ export class TenderPrepDatabase {
    * record changed) is still returned, flagged `off_register`, rather than vanishing from
    * a decision the meeting already took.
    */
-  async getTenderLaunchTable(actor: Actor, workflowId: string, perPackage: number): Promise<Row[]> {
+  async getTenderLaunchTable(
+    actor: Actor, workflowId: string, perPackage: number, packageConfigId?: string
+  ): Promise<Row[]> {
     await this.assertWorkflowAccess(actor, workflowId);
     const workflow = await this.db.one<{ step_data: { takeoff?: { projectId?: string | null } } }>(
       `SELECT step_data FROM workflows WHERE id = $1`, [workflowId]
     );
     const projectId = workflow.step_data?.takeoff?.projectId ?? null;
-    const packages = await this.listPackageConfig(actor, projectId);
+    const all = await this.listPackageConfig(actor, projectId);
+    // Narrowed BEFORE the loop below, which is the whole point: each package costs an SCMS
+    // candidate search, so asking for one package costs one search rather than thirty-five.
+    // The dashboard's approval modal edits a single package and needs nothing else.
+    const packages = packageConfigId ? all.filter((pkg) => String(pkg.id) === packageConfigId) : all;
 
     const shortlists = await this.db.query<{
       id: string; package_name: string; confirmed_at: string | null; board_override_notes: string | null;
@@ -1763,22 +1769,59 @@ export class TenderPrepDatabase {
    * The tender dashboard: one row per trade package, carrying the firms it went to and what
    * came back from them.
    *
-   * Built ON `getTenderLaunchTable` rather than beside it, so the package, its route, its
-   * confirmation, its return period and each firm's USP, contact and reasoning are the very
-   * facts Step 1 shows. A dashboard that disagreed with the page you confirm on would be
-   * worse than no dashboard. Only the two things a launch table has no reason to carry are
-   * added here: what each firm answered, and what they priced.
+   * It used to be built on `getTenderLaunchTable`, and that was the wrong shape. The launch
+   * table SEARCHES the register for candidates — a `tps.trades_match` evaluation per (package x
+   * trade category), about 10,000 of them, 17 seconds for one page — and this dashboard then
+   * discarded every candidate except the ones a meeting had already picked. It was paying to
+   * answer a question it never asks. The firms it shows are in `shortlist_entries` (11 rows,
+   * 2 ms on the pack that took 17 s), and their details come from an indexed lookup by id.
    *
-   * Deliberately scoped to one workflow. The launch table runs an SCMS candidate search per
-   * package, which is fine for one project's list and would not stay cheap across every
-   * workflow in an organisation.
+   * Every read below is keyed or indexed. Nothing here matches trades.
+   *
+   * The figures still come from the same rows Step 1 shows, so the two pages cannot disagree
+   * about a package: its confirmation, route and return period are the shortlist's own, and
+   * `suggestion_reason` is the wording the meeting was shown, persisted at the time.
    */
-  async dashboardRows(actor: Actor, workflowId: string, perPackage: number): Promise<Row[]> {
-    const packages = await this.getTenderLaunchTable(actor, workflowId, perPackage);
+  async dashboardRows(actor: Actor, workflowId: string): Promise<Row[]> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    const workflow = await this.db.one<{ step_data: { takeoff?: { projectId?: string | null } } }>(
+      `SELECT step_data FROM workflows WHERE id = $1`, [workflowId]
+    );
+    const packages = await this.listPackageConfig(actor, workflow.step_data?.takeoff?.projectId ?? null);
 
-    // Both reads are one statement each, keyed and zipped in memory rather than joined into
-    // the loop above: a query per package per firm is how a 40-package dashboard becomes
-    // hundreds of round trips.
+    const shortlists = await this.db.query<{
+      package_name: string; confirmed_at: string | null; board_override_notes: string | null;
+      route_of_procurement: string | null; tender_return_period_value: number | null;
+      tender_return_period_unit: string | null; tender_return_deadline: string | null;
+    }>(
+      // The issued date is formatted in SQL for the reason getTenderLaunchTable states: the BFF
+      // installs no pg type parser, so a DATE returns at LOCAL midnight and serialises to the
+      // previous day under a positive UTC offset.
+      `SELECT package_name, confirmed_at, board_override_notes, route_of_procurement,
+              tender_return_period_value, tender_return_period_unit,
+              to_char(tender_return_deadline, 'DD/MM/YYYY') AS tender_return_deadline
+         FROM shortlists WHERE workflow_id = $1`,
+      [workflowId]
+    );
+
+    // Only what a meeting picked, and never the placeholder — it is an affordance meaning
+    // "no firm in the register carries this trade", not a firm anybody chose.
+    const chosen = await this.db.query<{
+      package_name: string; subcontractor_id: string; rank: number; suggestion_reason: string | null;
+    }>(
+      `SELECT sl.package_name, se.subcontractor_id::text AS subcontractor_id, se.rank,
+              se.suggestion_reason
+         FROM shortlists sl
+         JOIN shortlist_entries se ON se.shortlist_id = sl.id
+        WHERE sl.workflow_id = $1 AND se.selected AND se.subcontractor_id <> $2::uuid
+        ORDER BY sl.package_name, se.rank`,
+      [workflowId, PLACEHOLDER_SUBCONTRACTOR_ID]
+    );
+
+    const firms = new Map((await this.scms.getFirmsByIds(
+      [...new Set(chosen.map((row) => String(row.subcontractor_id)))]
+    )).map((firm) => [String(firm.subcontractor_id), firm]));
+
     const dispatches = await this.db.query<{
       package_name: string; subcontractor_id: string; response: string | null; dispatched_at: string | null;
     }>(
@@ -1802,32 +1845,62 @@ export class TenderPrepDatabase {
     // separator picked here is one a client could put in a package name.
     const key = (packageName: unknown, subcontractorId: unknown) =>
       JSON.stringify([String(packageName), String(subcontractorId)]);
+    const shortlistBy = new Map(shortlists.map((row) => [String(row.package_name), row]));
     const dispatchBy = new Map(dispatches.map((row) => [key(row.package_name, row.subcontractor_id), row]));
     const returnBy = new Map(returns.map((row) => [key(row.package_name, row.subcontractor_id), row]));
 
     return packages.map((pkg) => {
-      // Only the firms the meeting actually picked. Before a package is confirmed that list
-      // is empty, which is exactly what the pending state on this dashboard means.
-      const chosen = ((pkg.subcontractors as Row[] | undefined) ?? []).filter((firm) => firm.selected);
+      const shortlist = shortlistBy.get(String(pkg.name));
       return {
-        ...pkg,
-        subcontractors: chosen.map((firm) => {
-          const dispatch = dispatchBy.get(key(pkg.package_name, firm.subcontractor_id));
-          const tenderReturn = returnBy.get(key(pkg.package_name, firm.subcontractor_id));
-          return {
-            ...firm,
-            dispatched_at: dispatch?.dispatched_at ?? null,
-            response: dispatch?.response ?? null,
-            // Spelled out rather than left to the reader: 'no_response' and "never asked"
-            // are both "not accepted", and only one of them is a firm declining.
-            accepted: dispatch?.response === 'will_tender',
-            declined: dispatch?.response === 'decline',
-            tendered_sum: tenderReturn?.tendered_sum ?? null,
-            // Test data travels through the same tables as a real bid, and every read that
-            // reaches a human has to say which it is looking at.
-            is_fabricated: tenderReturn?.is_fabricated ?? false
-          };
-        })
+        package_config_id: pkg.id,
+        seq: pkg.seq,
+        sub_seq: pkg.sub_seq,
+        display_ref: pkg.display_ref,
+        is_heading: pkg.is_heading,
+        is_sub_package: pkg.parent_id != null,
+        package_name: pkg.name,
+        configured_route: pkg.route_of_procurement,
+        route_of_procurement: shortlist?.route_of_procurement ?? pkg.route_of_procurement,
+        trade_terms: (pkg.trade_terms as string[] | null) ?? [],
+        wp_code: pkg.wp_code ?? null,
+        wp_scope_condition: pkg.wp_scope_condition ?? null,
+        derived_from_takeoff: pkg.derived_from_takeoff ?? null,
+        notes: pkg.notes,
+        confirmed_at: shortlist?.confirmed_at ?? null,
+        board_override_notes: shortlist?.board_override_notes ?? null,
+        tender_return_period_value: shortlist?.tender_return_period_value ?? null,
+        tender_return_period_unit: shortlist?.tender_return_period_unit ?? null,
+        tender_return_deadline: shortlist?.tender_return_deadline ?? null,
+        subcontractors: chosen
+          .filter((row) => String(row.package_name) === String(pkg.name))
+          .map((row) => {
+            const firm = firms.get(String(row.subcontractor_id));
+            const dispatch = dispatchBy.get(key(pkg.name, row.subcontractor_id));
+            const tenderReturn = returnBy.get(key(pkg.name, row.subcontractor_id));
+            return {
+              ...(firm ?? {}),
+              subcontractor_id: row.subcontractor_id,
+              // A firm can be picked and later leave the register. Step 1 keeps the meeting's
+              // record visible in that case and so does this.
+              name: firm?.name ?? '(no longer in the register)',
+              selected: true,
+              // The wording the meeting was actually shown, persisted at the time — not
+              // recomputed now against a register that has since moved.
+              suggestion_reason: row.suggestion_reason ?? '',
+              usp: firm ? describeUsp(firm) : '',
+              off_register: !firm,
+              dispatched_at: dispatch?.dispatched_at ?? null,
+              response: dispatch?.response ?? null,
+              // Spelled out rather than left to the reader: 'no_response' and "never asked"
+              // are both "not accepted", and only one of them is a firm declining.
+              accepted: dispatch?.response === 'will_tender',
+              declined: dispatch?.response === 'decline',
+              tendered_sum: tenderReturn?.tendered_sum ?? null,
+              // Test data travels through the same tables as a real bid, and every read that
+              // reaches a human has to say which it is looking at.
+              is_fabricated: tenderReturn?.is_fabricated ?? false
+            };
+          })
       } as Row;
     });
   }
@@ -1895,6 +1968,24 @@ export class TenderPrepDatabase {
    * Every package with an ITT to show: those the meeting confirmed and selected firms for.
    * The index behind Step 2 — one line per package, without assembling every pack.
    */
+  /**
+   * Every package the tender launch meeting has confirmed, with what has happened to its ITT.
+   *
+   * It used to end `HAVING count(*) FILTER (WHERE se.selected) > 0`, which dropped a confirmed
+   * package that had nobody to invite — silently, with no row and nothing anywhere to explain the
+   * gap. `savePackageSelection` stamps `confirmed_at` whether or not a firm was ticked, so a
+   * shortlist row existing IS the buyer having signed the package off, and it belongs on this
+   * page whatever state it is in. Reading had eight confirmed packages and showed six.
+   *
+   * `candidates` is what tells the two causes apart, and they need different answers:
+   *   recipients > 0                  — ready to send;
+   *   recipients = 0, candidates = 0  — no firm in the register carries this trade, so nothing
+   *                                     was selectable. The remedy is to build the supply chain.
+   *   recipients = 0, candidates > 0  — firms were offered and none was picked. The remedy is to
+   *                                     reopen the package and choose.
+   * The placeholder firm is excluded from `candidates` for exactly that reason: it is an
+   * affordance saying "nobody here", not a firm somebody declined to pick.
+   */
   async listItts(actor: Actor, workflowId: string): Promise<Row[]> {
     await this.assertWorkflowAccess(actor, workflowId);
     return this.db.query(
@@ -1903,6 +1994,7 @@ export class TenderPrepDatabase {
               sl.route_of_procurement,
               sl.confirmed_at,
               count(*) FILTER (WHERE se.selected) AS recipients,
+              count(*) FILTER (WHERE se.id IS NOT NULL AND se.subcontractor_id <> $2::uuid) AS candidates,
               count(d.id) FILTER (WHERE d.dispatched_at IS NOT NULL) AS dispatched,
               count(d.id) FILTER (WHERE d.email_status = 'sent') AS sent,
               count(d.id) FILTER (WHERE d.email_status = 'failed') AS failed,
@@ -1921,9 +2013,8 @@ export class TenderPrepDatabase {
          LEFT JOIN pricing_portal_links ppl ON ppl.shortlist_entry_id = se.id
         WHERE sl.workflow_id = $1
         GROUP BY sl.package_name, sl.package_seq, sl.route_of_procurement, sl.confirmed_at
-        HAVING count(*) FILTER (WHERE se.selected) > 0
         ORDER BY sl.package_seq NULLS LAST, sl.package_name`,
-      [workflowId]
+      [workflowId, PLACEHOLDER_SUBCONTRACTOR_ID]
     );
   }
 

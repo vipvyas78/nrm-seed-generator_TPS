@@ -1069,9 +1069,8 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
     return <div className="panel">
       <h3>No ITTs yet</h3>
       <p className="muted">
-        An ITT is built for each package once the tender launch meeting has selected the firms
-        to invite. Go back to the Tender Launch Pack, tick the subcontractors for a package and
-        confirm it.
+        A package appears here once the tender launch meeting has confirmed it. Go back to the
+        Tender Launch Pack, tick the subcontractors for a package and confirm it.
       </p>
     </div>;
   }
@@ -1131,7 +1130,14 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
             <td>{r.package_seq ?? '—'}</td>
             <td><strong>{r.package_name}</strong></td>
             <td className="tiny">{r.route_of_procurement ?? '—'}</td>
-            <td>{r.recipients}</td>
+            <td>
+              {r.recipients}
+              {Number(r.recipients) === 0 && <div className="tiny" style={{ color: '#d97706', marginTop: 4 }}>
+                {Number(r.candidates) === 0
+                  ? 'no firm in the register carries this trade — build the supply chain'
+                  : 'confirmed without inviting anyone — reopen the package and pick'}
+              </div>}
+            </td>
             <td>
               {Number(r.sent) > 0 && <span className="badge badge-green">sent {r.sent}</span>}
               {' '}{Number(r.failed) > 0 && <span className="badge badge-red">failed {r.failed}</span>}
@@ -1162,7 +1168,9 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
               <button
                 className="small"
                 disabled={!r.confirmed_at || Number(r.recipients) === 0 || (confirm.isPending && confirm.variables === r.package_name)}
-                title={!r.confirmed_at ? 'Confirm the package at Step 1 first' : undefined}
+                title={!r.confirmed_at ? 'Confirm the package at Step 1 first'
+                  : Number(r.recipients) === 0 ? 'Nobody is invited to this package, so there is no ITT to send'
+                  : undefined}
                 onClick={() => confirm.mutate(r.package_name)}
               >
                 {confirm.isPending && confirm.variables === r.package_name ? 'Sending…' : Number(r.dispatched) > 0 ? 'Resend ITT' : 'Confirm ITT'}

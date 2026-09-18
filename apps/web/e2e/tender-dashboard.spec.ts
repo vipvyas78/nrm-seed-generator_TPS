@@ -70,6 +70,11 @@ function fixture(): Pkg[] {
       confirmed_at: '2026-09-10T10:00:00Z', tender_return_period_value: 3,
       tender_return_period_unit: 'weeks', tender_return_deadline: '01/10/2026',
       subcontractors: [firm('sc-3', 'Gamma Drylining', true), firm('sc-4', 'Delta Drylining', true)]
+    }),
+    // Signed off with nobody to invite — the state that made a package vanish from Step 2.
+    shell({
+      package_config_id: 'pc-4', seq: 3, display_ref: '3', package_name: 'Roofing',
+      confirmed_at: '2026-09-18T20:33:00Z', subcontractors: []
     })
   ];
 }
@@ -128,7 +133,7 @@ async function dashboard(page: Page) {
 test('reports each package with the firms it went to and what came back', async ({ page }) => {
   await dashboard(page);
   await expect(page.getByRole('heading', { name: 'Tender Dashboard' })).toBeVisible();
-  await expect(page.getByText('1 of 2 packages confirmed')).toBeVisible();
+  await expect(page.getByText('2 of 3 packages confirmed')).toBeVisible();
 
   const accepted = page.locator('tr', { hasText: 'Gamma Drylining' });
   await expect(accepted).toContainText('184,250');
@@ -139,6 +144,17 @@ test('reports each package with the firms it went to and what came back', async 
   await expect(declined).not.toContainText('184,250');
 
   await expect(page.locator('tr', { hasText: 'Mechanical' }).first()).toContainText('No firms selected yet');
+});
+
+test('a package confirmed with nobody invited does not read as plain Confirmed', async ({ page }) => {
+  // Confirming and having recipients are different facts. Showing them as one green badge is
+  // what let a package be signed off and silently absent from ITT Dispatch at the same time.
+  await dashboard(page);
+  const roofing = page.locator('tr', { hasText: 'Roofing' });
+  await expect(roofing).toContainText('Confirmed · nobody invited');
+  await expect(roofing).toContainText('No firms selected yet');
+  // It is confirmed, so it is not offered for approval again.
+  await expect(page.getByRole('button', { name: 'Approve Roofing' })).toHaveCount(0);
 });
 
 test('offers approval on a pending package only, and never on a heading', async ({ page }) => {
@@ -176,5 +192,5 @@ test('approving opens Step 1 for that package alone, and confirming updates the 
 
   // The dashboard is keyed under the launch table, so confirming refreshes it with no
   // further wiring: the count moves and the approval control goes.
-  await expect(page.getByText('2 of 2 packages confirmed')).toBeVisible();
+  await expect(page.getByText('3 of 3 packages confirmed')).toBeVisible();
 });
