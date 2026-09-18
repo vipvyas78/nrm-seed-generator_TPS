@@ -1760,6 +1760,79 @@ export class TenderPrepDatabase {
   }
 
   /**
+   * The tender dashboard: one row per trade package, carrying the firms it went to and what
+   * came back from them.
+   *
+   * Built ON `getTenderLaunchTable` rather than beside it, so the package, its route, its
+   * confirmation, its return period and each firm's USP, contact and reasoning are the very
+   * facts Step 1 shows. A dashboard that disagreed with the page you confirm on would be
+   * worse than no dashboard. Only the two things a launch table has no reason to carry are
+   * added here: what each firm answered, and what they priced.
+   *
+   * Deliberately scoped to one workflow. The launch table runs an SCMS candidate search per
+   * package, which is fine for one project's list and would not stay cheap across every
+   * workflow in an organisation.
+   */
+  async dashboardRows(actor: Actor, workflowId: string, perPackage: number): Promise<Row[]> {
+    const packages = await this.getTenderLaunchTable(actor, workflowId, perPackage);
+
+    // Both reads are one statement each, keyed and zipped in memory rather than joined into
+    // the loop above: a query per package per firm is how a 40-package dashboard becomes
+    // hundreds of round trips.
+    const dispatches = await this.db.query<{
+      package_name: string; subcontractor_id: string; response: string | null; dispatched_at: string | null;
+    }>(
+      `SELECT sl.package_name, se.subcontractor_id::text AS subcontractor_id,
+              d.response, d.dispatched_at
+         FROM shortlists sl
+         JOIN shortlist_entries se ON se.shortlist_id = sl.id
+         LEFT JOIN itt_dispatch d ON d.shortlist_entry_id = se.id
+        WHERE sl.workflow_id = $1 AND se.selected`,
+      [workflowId]
+    );
+    const returns = await this.db.query<{
+      package_name: string; subcontractor_id: string | null; tendered_sum: string | null; is_fabricated: boolean;
+    }>(
+      `SELECT package_name, subcontractor_id::text AS subcontractor_id, tendered_sum, is_fabricated
+         FROM tender_returns WHERE workflow_id = $1 AND subcontractor_id IS NOT NULL`,
+      [workflowId]
+    );
+
+    // Keyed as a JSON pair rather than a joined string: a package name is free text, so any
+    // separator picked here is one a client could put in a package name.
+    const key = (packageName: unknown, subcontractorId: unknown) =>
+      JSON.stringify([String(packageName), String(subcontractorId)]);
+    const dispatchBy = new Map(dispatches.map((row) => [key(row.package_name, row.subcontractor_id), row]));
+    const returnBy = new Map(returns.map((row) => [key(row.package_name, row.subcontractor_id), row]));
+
+    return packages.map((pkg) => {
+      // Only the firms the meeting actually picked. Before a package is confirmed that list
+      // is empty, which is exactly what the pending state on this dashboard means.
+      const chosen = ((pkg.subcontractors as Row[] | undefined) ?? []).filter((firm) => firm.selected);
+      return {
+        ...pkg,
+        subcontractors: chosen.map((firm) => {
+          const dispatch = dispatchBy.get(key(pkg.package_name, firm.subcontractor_id));
+          const tenderReturn = returnBy.get(key(pkg.package_name, firm.subcontractor_id));
+          return {
+            ...firm,
+            dispatched_at: dispatch?.dispatched_at ?? null,
+            response: dispatch?.response ?? null,
+            // Spelled out rather than left to the reader: 'no_response' and "never asked"
+            // are both "not accepted", and only one of them is a firm declining.
+            accepted: dispatch?.response === 'will_tender',
+            declined: dispatch?.response === 'decline',
+            tendered_sum: tenderReturn?.tendered_sum ?? null,
+            // Test data travels through the same tables as a real bid, and every read that
+            // reaches a human has to say which it is looking at.
+            is_fabricated: tenderReturn?.is_fabricated ?? false
+          };
+        })
+      } as Row;
+    });
+  }
+
+  /**
    * Records what the tender launch meeting decided for one package.
    *
    * Every firm put in front of the meeting is stored, not just the chosen ones, with the

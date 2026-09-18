@@ -438,6 +438,20 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       return tpDb.getTenderLaunchTable(requireActor(request), workflowId, perPackage);
     });
 
+    /**
+     * The tender dashboard — one row per trade package, for BuildFlow's projects page to
+     * link into and for a buyer to work down. Workflow-scoped like every other route here;
+     * BuildFlow links with its own package id, which the page resolves to a workflow through
+     * the lookup the tender-prep page already uses.
+     */
+    protectedApi.get('/api/tender-prep/:workflowId/dashboard', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const { perPackage } = query(request, z.object({
+        perPackage: z.coerce.number().int().min(1).max(50).default(10)
+      }));
+      return tpDb.dashboardRows(requireActor(request), workflowId, perPackage);
+    });
+
     protectedApi.post('/api/tender-prep/:workflowId/packages/selection', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));
       const input = body(request, z.object({

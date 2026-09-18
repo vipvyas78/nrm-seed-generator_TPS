@@ -4,10 +4,10 @@ import { Link, Outlet, useNavigate, useParams } from 'react-router-dom';
 import { api, TENDER_RETURN_MAX, type ConfirmIttResult, type IttDispatch, type IttLetterDetailsInput, type IttLineSection, type IttPack, type LaunchTableRow, type PortalResponseSummary, type SendAllIttsResult, type SendIttDraftResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow, type TenderReturnUnit } from './api';
 import { oidc, signIn } from './auth';
 
-function ErrorMessage({ error }: { error: unknown }) {
+export function ErrorMessage({ error }: { error: unknown }) {
   return error ? <p className="error">{error instanceof Error ? error.message : 'Something went wrong'}</p> : null;
 }
-function Busy({ children = 'Loading…' }: { children?: string }) { return <p className="muted">{children}</p>; }
+export function Busy({ children = 'Loading…' }: { children?: string }) { return <p className="muted">{children}</p>; }
 
 // Parsed Outputs, Employer RFIs and SoA RAG live in the take-off module, not here. A
 // completed take-off launches a workflow straight onto Tender Launch Pack.
@@ -217,7 +217,7 @@ function TakeoffSummary({ takeoff, packageId }: { takeoff: TakeoffCompletion; pa
  * One package. Selection is held locally until saved, so management can work down the
  * table during the meeting and commit a package once, rather than firing a write per tick.
  */
-function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowId: string }) {
+export function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowId: string }) {
   const queryClient = useQueryClient();
   const [picked, setPicked] = useState<Set<string>>(
     () => new Set(row.subcontractors.filter((s) => s.selected).map((s) => s.subcontractor_id))

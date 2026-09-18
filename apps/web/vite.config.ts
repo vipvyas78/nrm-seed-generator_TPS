@@ -13,5 +13,13 @@ export default defineConfig({
   // the values as build ARGs.
   envDir: '../..',
   server: { port: 5175 },
-  build: { sourcemap: true }
+  build: { sourcemap: true },
+  test: {
+    // Vitest's default include is every *.test.ts / *.spec.ts under the package, which takes
+    // in the Playwright specs in e2e/ — they import @playwright/test, so vitest collects them
+    // and fails with "Playwright Test did not expect test() to be called here" while still
+    // reporting the rest as passed. Playwright owns e2e/ (its testDir); vitest owns src/.
+    include: ['src/**/*.test.ts'],
+    exclude: ['e2e/**', 'node_modules/**']
+  }
 });
