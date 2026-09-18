@@ -89,6 +89,23 @@ export type LaunchTableRow = {
   subcontractors: LaunchCandidate[];
 };
 
+/** A firm on the dashboard: everything the launch table knows, plus what came back. */
+export type DashboardCandidate = LaunchCandidate & {
+  dispatched_at: string | null;
+  response: 'will_tender' | 'decline' | 'considering' | 'no_response' | null;
+  /** Spelled out because "not accepted" covers a decline, a silence and a firm never asked. */
+  accepted: boolean;
+  declined: boolean;
+  tendered_sum: string | null;
+  /** Test data travelling the same tables as a real bid. Always shown, never filtered out. */
+  is_fabricated: boolean;
+};
+
+/** One dashboard row: a trade package, and only the firms the meeting actually picked. */
+export type DashboardRow = Omit<LaunchTableRow, 'subcontractors'> & {
+  subcontractors: DashboardCandidate[];
+};
+
 /** Weeks are calendar weeks; days are WORKING days, so five days is a working week.
  *  Mirrors apps/bff/src/tenderReturnPeriod.ts and the CHECK in migration 021 — the two
  *  are separate packages, so the limits are restated rather than imported. The server
@@ -486,6 +503,9 @@ export const api = {
     request<TradeCategory[]>(`/api/tender-prep/trades${search ? `?search=${encodeURIComponent(search)}` : ''}`),
   getLaunchTable: (workflowId: string, perPackage?: number) =>
     request<LaunchTableRow[]>(`/api/tender-prep/${workflowId}/launch-table${perPackage ? `?perPackage=${perPackage}` : ''}`),
+  // The tender dashboard: the launch table plus what came back from each firm.
+  getDashboard: (workflowId: string, perPackage?: number) =>
+    request<DashboardRow[]>(`/api/tender-prep/${workflowId}/dashboard${perPackage ? `?perPackage=${perPackage}` : ''}`),
   savePackageSelection: (workflowId: string, input: {
     packageName: string;
     packageSeq?: number;

@@ -225,3 +225,15 @@ code { font-family: monospace; font-size: 0.85em; background: #f3f4f6; padding: 
 .portal-header h1 { font-size: 1.4rem; margin-bottom: 4px; }
 .portal-lines input[type="number"], .portal-lines input[type="text"] { min-width: 90px; }
 .portal-lines select { min-width: 150px; }
+
+/* The tender dashboard. The approve control is an icon rather than a button with words
+   because it sits in a 2.5rem gutter beside every pending package, and a row that needs
+   nothing shows nothing at all there. */
+.approve-icon {
+  border: 1px solid var(--green, #2e7d32); background: transparent; color: var(--green, #2e7d32);
+  border-radius: 999px; width: 1.6rem; height: 1.6rem; line-height: 1; cursor: pointer;
+  font-size: .85rem; padding: 0;
+}
+.approve-icon:hover { background: var(--green, #2e7d32); color: #fff; }
+.dashboard-table td { vertical-align: top; }
+.dashboard-table .num { text-align: right; }

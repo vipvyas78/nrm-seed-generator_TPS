@@ -174,7 +174,11 @@ describe('the tender return period', () => {
     } finally {
       await cleanup(db, f);
     }
-  });
+    // This one reads the whole launch table, which runs an SCMS candidate search per
+    // package — seconds of real work against a real register, where its siblings write a
+    // row or two. On the default 5s budget it passed only while it had the database to
+    // itself; 30s is what every other integration suite here allows.
+  }, 30_000);
 
   it('refuses an out-of-range or half-stated period at the database, not only in the API', async () => {
     const { db, tpDb } = connect();

@@ -6,3 +6,9 @@ __pycache__/
 .pytest_cache/
 .claude/settings.local.json
 .claude/local/
+
+# Playwright output
+apps/web/test-results/
+apps/web/playwright-report/
+apps/web/blob-report/
+apps/web/.playwright/

@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { TenderDashboardPage } from './dashboard';
 import { AppShell, AuthCallback, PackagesListPage, TenderPrepPage } from './pages';
 import { PortalPage } from './portal';
 import './styles.css';
@@ -23,6 +24,9 @@ export function Main() {
         <Route path="/respond/:token" element={<PortalPage />} />
         <Route element={<AppShell />}>
           <Route path="/" element={<PackagesListPage />} />
+          {/* Where BuildFlow's projects page links once a take-off is tendered, carrying its
+              own package id: ?packageId=<bf package>. */}
+          <Route path="/dashboard" element={<TenderDashboardPage />} />
           <Route path="/packages/:packageId/tender-prep" element={<TenderPrepPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
