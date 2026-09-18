@@ -1,6 +1,7 @@
 import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
 import type { BuildflowBundle, BuildflowDocumentBundlesClient } from './buildflowDocumentBundlesClient.js';
 import type { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
+import { templateLinesAsBoqRows, type BuildflowMepBoqClient } from './buildflowMepBoqClient.js';
 import type { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
 import { domainOf, isPublicEmailDomain, type CloudflareAccessAdmin } from './cloudflareAccess.js';
 import type { Database, Row } from './db.js';
@@ -214,8 +215,38 @@ export class TenderPrepDatabase {
     // than a send with no online-pricing section.
     private readonly accessAdmin?: CloudflareAccessAdmin,
     private readonly portalBaseUrl?: string,
-    private readonly portalLinkTtlDays: number = 90
+    private readonly portalLinkTtlDays: number = 90,
+    // Optional: without one configured, a WP-MEP-* package's bill is the measured
+    // take-off lines exactly as it was before BuildFlow issue #28 — see mepTemplateLines.
+    private readonly mepBoq?: BuildflowMepBoqClient
   ) {}
+
+  /**
+   * A WP-MEP-* package's bill as BuildFlow's own configured MEP template states it, or
+   * null to say "use the measured take-off lines, as before".
+   *
+   * WHY IT REPLACES RATHER THAN JOINS THE MEASURED LINES. The two are two answers to one
+   * question — what does this subcontractor price? — and printing both would ask for the
+   * same work twice under two different wordings. The template is the client's own house
+   * sequence and the document they expect back; the take-off's role here is to have
+   * decided which of its sections this project carries. What the measured lines are still
+   * read for is the specification documents they cite, which the template cannot name.
+   *
+   * NULL IN FOUR CASES, and all four mean the same thing to the caller: no client bill
+   * has displaced the template (`source: 'client_boq'` — that bill is authoritative for
+   * MEP and the measured lines are reconciled against it); the client's template
+   * produced nothing for this trade; BuildFlow could not be reached; or the integration
+   * is not configured at all.
+   */
+  private async mepTemplateLines(takeoffId: string | null, wpCode: unknown): Promise<Row[] | null> {
+    const code = typeof wpCode === 'string' ? wpCode : '';
+    if (!this.mepBoq || !takeoffId || !code.startsWith('WP-MEP-')) return null;
+    const bill = await this.mepBoq.billFor(takeoffId);
+    if (!bill || bill.source !== 'template') return null;
+    const forPackage = bill.packages.find((entry) => entry.wpCode === code);
+    if (!forPackage || forPackage.lines.length === 0) return null;
+    return templateLinesAsBoqRows(forPackage.lines) as Row[];
+  }
 
   /**
    * The BoQ this workflow's tender is priced from, resolved through the take-off that
@@ -253,12 +284,14 @@ export class TenderPrepDatabase {
     );
     if (!pkg) throw notFound('Package is not configured');
 
-    const boqLines = pkg.wp_code
+    const measuredLines = pkg.wp_code
       ? [
           ...await this.boq.takeoffLinesForWorkPackage(input.takeoffId, String(pkg.wp_code)),
           ...await this.boq.takeoffLinesUnattributed(input.takeoffId, attributionFor(pkg))
         ]
       : await this.boq.linesForPackage(input.boqId, attributionFor(pkg));
+    // Asked first, and the measured lines are the fallback — see mepTemplateLines.
+    const boqLines = (await this.mepTemplateLines(input.takeoffId, pkg.wp_code)) ?? measuredLines;
 
     const billLines = await this.db.query<Row>(
       `SELECT id, seq, section, ref, description, unit, quantity, required_for, notes
@@ -393,7 +426,7 @@ export class TenderPrepDatabase {
     // The two are never OR-ed. The work-package pass sees only items that HAVE one and the
     // NRM-code pass only items that do not, so a line cannot be claimed twice, and each
     // carries `attributed_by` so a surveyor can see which mechanism put it there.
-    const boqLines = pkg.wp_code && takeoffId
+    const measuredLines = pkg.wp_code && takeoffId
       ? [
           ...await this.boq.takeoffLinesForWorkPackage(takeoffId, String(pkg.wp_code)),
           ...await this.boq.takeoffLinesUnattributed(takeoffId, attributionFor(pkg))
@@ -401,6 +434,12 @@ export class TenderPrepDatabase {
       : boqSession
         ? await this.boq.linesForPackage(String(boqSession.boq_id), attributionFor(pkg))
         : [];
+    // A WP-MEP-* package bills the client's own configured template where there is one,
+    // and the measured lines otherwise — see mepTemplateLines. Kept as two names rather
+    // than one because the measured lines are still read below for the specification
+    // documents they cite, and the review note has to be able to say what was set aside.
+    const templateLines = await this.mepTemplateLines(takeoffId, pkg.wp_code);
+    const boqLines = templateLines ?? measuredLines;
     // The pipeline session, not the BoQ session. A derived package's lines come from
     // takeoff_items and need no boq_sessions row at all, so gating the documents on one made
     // a package show a full bill and no documents whenever the BoQ run had not been written.
@@ -417,10 +456,15 @@ export class TenderPrepDatabase {
     // nrm_chunks keeps no path — and on Reading it is set on zero items of every work
     // package, which is exactly why Flooring's specification section came back empty while
     // its 17 clause-derived lines all named an Employer's Requirements PDF.
+    //
+    // Read off the MEASURED lines, not off boqLines, because a template-billed MEP package
+    // has none of its own: the template states the client's house sequence and cannot name
+    // a document. Which specification the take-off actually read is still true, and still
+    // the first thing a tenderer pricing this trade opens.
     const citedSpecFiles = [...new Set(
-      boqLines.flatMap((l) => (l.spec_source_files as string[] | null) ?? [])
+      measuredLines.flatMap((l) => (l.spec_source_files as string[] | null) ?? [])
     )];
-    const citingLines = boqLines.filter(
+    const citingLines = measuredLines.filter(
       (l) => ((l.spec_source_files as string[] | null) ?? []).length > 0
     ).length;
     const specDocuments = sessionId
@@ -562,6 +606,15 @@ export class TenderPrepDatabase {
           `Cited but not in the tender pack: ${unresolvedSpecFiles.join(', ')}.`,
         Boolean(pkg.wp_code) && boqLines.length > 0 && citingLines === 0 &&
           'No line in this package cites a specification, so the ITT names none. These lines were measured without a clause reference.',
+        // The substitution says so on the pack rather than happening quietly. A bill that
+        // silently stopped showing measured quantities would read exactly like a bill that
+        // never had any, and the count is the only thing that tells the two apart.
+        templateLines !== null &&
+          `Billed from the configured MEP BoQ template: ${templateLines.length} line${templateLines.length === 1 ? '' : 's'} in the client's own house sequence, unquantified for the tenderer to measure. ${measuredLines.length} measured take-off line${measuredLines.length === 1 ? '' : 's'} decided which sections appear and are not themselves billed.`,
+        // Not the same as "no template configured": without the integration a WP-MEP-*
+        // package silently bills the take-off's own working descriptions instead.
+        Boolean(pkg.wp_code) && String(pkg.wp_code).startsWith('WP-MEP-') && !this.mepBoq &&
+          "The MEP BoQ template is unavailable: BUILDFLOW_BASE_URL and BUILDFLOW_DOCUMENT_LINKS_TOKEN are not configured, so this bill is the raw measured take-off lines rather than the client's own house sequence.",
         // An unconfigured integration and an empty one are different facts, and the client
         // returns [] either way. Without this the ITT emails with no document link at all and
         // reads exactly as though the project had none.
