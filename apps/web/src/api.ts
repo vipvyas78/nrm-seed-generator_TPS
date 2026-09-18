@@ -89,8 +89,21 @@ export type LaunchTableRow = {
   subcontractors: LaunchCandidate[];
 };
 
-/** A firm on the dashboard: everything the launch table knows, plus what came back. */
-export type DashboardCandidate = LaunchCandidate & {
+/**
+ * A firm on the dashboard: what the meeting recorded about it, plus what came back.
+ *
+ * The register's own fields are OPTIONAL rather than inherited whole, because a firm picked
+ * months ago can have left the register since — the dashboard still shows the pairing, with
+ * the meeting's own wording, and nothing from SCMS to describe it.
+ */
+export type DashboardCandidate = Partial<LaunchCandidate> & {
+  subcontractor_id: string;
+  name: string;
+  selected: boolean;
+  /** The wording the meeting was shown, persisted at the time — not recomputed on read. */
+  suggestion_reason: string;
+  usp: string;
+  off_register: boolean;
   dispatched_at: string | null;
   response: 'will_tender' | 'decline' | 'considering' | 'no_response' | null;
   /** Spelled out because "not accepted" covers a decline, a silence and a firm never asked. */
@@ -101,8 +114,33 @@ export type DashboardCandidate = LaunchCandidate & {
   is_fabricated: boolean;
 };
 
-/** One dashboard row: a trade package, and only the firms the meeting actually picked. */
-export type DashboardRow = Omit<LaunchTableRow, 'subcontractors'> & {
+/**
+ * One dashboard row: a trade package, and only the firms the meeting actually picked.
+ *
+ * Listed field by field rather than derived from LaunchTableRow. This endpoint deliberately
+ * does NOT search the register, so it cannot answer for `route_options` or
+ * `stranded_bill_lines`; inheriting them would promise data that is never sent.
+ */
+export type DashboardRow = {
+  package_config_id: string;
+  seq: number;
+  sub_seq: number | null;
+  display_ref: string;
+  is_heading: boolean;
+  is_sub_package: boolean;
+  package_name: string;
+  configured_route: RouteOfProcurement;
+  route_of_procurement: RouteOfProcurement;
+  trade_terms: string[];
+  wp_code?: string | null;
+  wp_scope_condition?: string | null;
+  derived_from_takeoff?: string | null;
+  notes?: string | null;
+  confirmed_at: string | null;
+  board_override_notes: string | null;
+  tender_return_period_value: number | null;
+  tender_return_period_unit: TenderReturnUnit | null;
+  tender_return_deadline: string | null;
   subcontractors: DashboardCandidate[];
 };
 
@@ -120,6 +158,9 @@ export type IttSummary = {
   route_of_procurement: string;
   confirmed_at: string | null;
   recipients: number;
+  /** Firms actually offered for this package, excluding the "nobody here" placeholder. With
+   *  recipients at 0 this is what says whether the register is empty or nobody was picked. */
+  candidates: number;
   dispatched: number;
   sent: number;
   failed: number;
@@ -501,11 +542,18 @@ export const api = {
   // Step 1: Shortlist (Tender Launch Pack)
   listTrades: (search?: string) =>
     request<TradeCategory[]>(`/api/tender-prep/trades${search ? `?search=${encodeURIComponent(search)}` : ''}`),
-  getLaunchTable: (workflowId: string, perPackage?: number) =>
-    request<LaunchTableRow[]>(`/api/tender-prep/${workflowId}/launch-table${perPackage ? `?perPackage=${perPackage}` : ''}`),
+  // `packageConfigId` narrows the table to one package, which is one SCMS candidate search
+  // instead of one per package in the list — what the dashboard's approval modal needs.
+  getLaunchTable: (workflowId: string, perPackage?: number, packageConfigId?: string) => {
+    const search = new URLSearchParams();
+    if (perPackage) search.set('perPackage', String(perPackage));
+    if (packageConfigId) search.set('packageConfigId', packageConfigId);
+    const suffix = search.toString();
+    return request<LaunchTableRow[]>(`/api/tender-prep/${workflowId}/launch-table${suffix ? `?${suffix}` : ''}`);
+  },
   // The tender dashboard: the launch table plus what came back from each firm.
-  getDashboard: (workflowId: string, perPackage?: number) =>
-    request<DashboardRow[]>(`/api/tender-prep/${workflowId}/dashboard${perPackage ? `?perPackage=${perPackage}` : ''}`),
+  getDashboard: (workflowId: string) =>
+    request<DashboardRow[]>(`/api/tender-prep/${workflowId}/dashboard`),
   savePackageSelection: (workflowId: string, input: {
     packageName: string;
     packageSeq?: number;

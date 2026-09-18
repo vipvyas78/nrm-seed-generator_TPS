@@ -62,9 +62,9 @@ describe('the tender dashboard', () => {
       );
       for (const [rank, subcontractorId] of [accepted, declined].entries()) {
         const entry = await db.one<{ id: string }>(
-          `INSERT INTO shortlist_entries (shortlist_id, subcontractor_id, rank, selected)
-           VALUES ($1, $2, $3, TRUE) RETURNING id`,
-          [shortlist.id, subcontractorId, rank + 1]
+          `INSERT INTO shortlist_entries (shortlist_id, subcontractor_id, rank, selected, suggestion_reason)
+           VALUES ($1, $2, $3, TRUE, $4) RETURNING id`,
+          [shortlist.id, subcontractorId, rank + 1, `shown to the meeting as rank ${rank + 1}`]
         );
         await db.query(
           `INSERT INTO itt_dispatch (shortlist_entry_id, dispatched_at, response, responded_at)
@@ -78,7 +78,7 @@ describe('the tender dashboard', () => {
         [workflow.id, packageName, accepted]
       );
 
-      const rows = await tpDb.dashboardRows(actor, workflow.id, 10);
+      const rows = await tpDb.dashboardRows(actor, workflow.id);
       const row = rows.find((candidate) => candidate.package_name === packageName);
       expect(row).toBeTruthy();
 
@@ -95,6 +95,14 @@ describe('the tender dashboard', () => {
       expect(declinedFirm.declined).toBe(true);
       // The price belongs to the firm that quoted it, not to the package.
       expect(declinedFirm.tendered_sum).toBeNull();
+
+      // The reasoning is the wording the meeting was SHOWN, read back off the entry — not
+      // recomputed now by searching the register, which is what made this page take 17s.
+      expect(acceptedFirm.suggestion_reason).toBe('shown to the meeting as rank 1');
+      // These firms are not in the SCMS register, so nothing could describe them — and the
+      // row still comes back, carrying the meeting's own record.
+      expect(acceptedFirm.off_register).toBe(true);
+      expect(acceptedFirm.name).toBe('(no longer in the register)');
     } finally {
       // Reverse FK order; shortlists/entries/dispatches cascade from the workflow.
       await db.query(`DELETE FROM tender_returns WHERE package_name = $1`, [packageName]);
@@ -127,11 +135,25 @@ describe('the tender dashboard', () => {
         [organizationId, projectId, packageName]
       );
 
-      const rows = await tpDb.dashboardRows(actor, workflow.id, 10);
+      const rows = await tpDb.dashboardRows(actor, workflow.id);
       const row = rows.find((candidate) => candidate.package_name === packageName);
       expect(row).toBeTruthy();
       expect(row!.confirmed_at).toBeNull();
       expect(row!.subcontractors).toHaveLength(0);
+
+      // Confirmed, but the only entry is the placeholder — "no firm in the register carries
+      // this trade". It is not a firm anybody picked, so it must not be reported as one.
+      const shortlist = await db.one<{ id: string }>(
+        `INSERT INTO shortlists (workflow_id, package_name, package_seq, confirmed_at)
+         VALUES ($1, $2, 1, NOW()) RETURNING id`, [workflow.id, packageName]);
+      await db.query(
+        `INSERT INTO shortlist_entries (shortlist_id, subcontractor_id, rank, selected)
+         VALUES ($1, '00000000-0000-0000-0000-000000000000'::uuid, 1, FALSE)`, [shortlist.id]);
+
+      const afterConfirm = (await tpDb.dashboardRows(actor, workflow.id))
+        .find((candidate) => candidate.package_name === packageName)!;
+      expect(afterConfirm.confirmed_at).toBeTruthy();
+      expect(afterConfirm.subcontractors).toHaveLength(0);
     } finally {
       await db.query(`DELETE FROM workflows WHERE package_id = $1`, [packageId]);
       await db.query(`DELETE FROM package_config WHERE organization_id = $1`, [organizationId]);
