@@ -10,6 +10,7 @@ import { AppError } from './errors.js';
 import { BoqReadDatabase } from './boqReadDb.js';
 import { BuildflowDocumentBundlesClient } from './buildflowDocumentBundlesClient.js';
 import { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
+import { BuildflowMepBoqClient } from './buildflowMepBoqClient.js';
 import { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
 import { DropboxDocumentLinkProvider } from './documentLinkProvider.js';
 import { EmailService } from './emailService.js';
@@ -51,6 +52,11 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const specClauses = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
     ? new BuildflowSpecClauseClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
     : undefined;
+  // Same base URL and token as the other three BuildFlow reads: one integration, gated
+  // on one pair of variables, so a half-configured deployment is not a thing that exists.
+  const mepBoq = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
+    ? new BuildflowMepBoqClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
+    : undefined;
   const documentBundles = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
     ? new BuildflowDocumentBundlesClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
     : undefined;
@@ -80,7 +86,8 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
 
   const tpDb = new TenderPrepDatabase(
     db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, documentBundles,
-    emailService, testEmailOverride, portalDb, accessAdmin, portalBaseUrl, config.PORTAL_LINK_TTL_DAYS
+    emailService, testEmailOverride, portalDb, accessAdmin, portalBaseUrl, config.PORTAL_LINK_TTL_DAYS,
+    mepBoq
   );
 
   app.decorate('tps', { config, db, tpDb, scmsDb });
