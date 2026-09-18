@@ -80,8 +80,21 @@ export type LaunchTableRow = {
   notes?: string | null;
   confirmed_at: string | null;
   board_override_notes: string | null;
+  /** How long this package is tendered for: 1-5 days or 1-8 weeks. Null when undecided. */
+  tender_return_period_value: number | null;
+  tender_return_period_unit: TenderReturnUnit | null;
+  /** The return date actually issued for this package, dd/mm/yyyy. Null until an ITT goes
+   *  out; never recomputed on a read, so it cannot drift from the letter a tenderer holds. */
+  tender_return_deadline: string | null;
   subcontractors: LaunchCandidate[];
 };
+
+/** Weeks are calendar weeks; days are WORKING days, so five days is a working week.
+ *  Mirrors apps/bff/src/tenderReturnPeriod.ts and the CHECK in migration 021 — the two
+ *  are separate packages, so the limits are restated rather than imported. The server
+ *  refuses anything out of range whatever this says; this is only what the user is told. */
+export type TenderReturnUnit = 'days' | 'weeks';
+export const TENDER_RETURN_MAX: Record<TenderReturnUnit, number> = { days: 5, weeks: 8 };
 
 /** One line of the ITT index: a package with an ITT ready to view. */
 export type IttSummary = {
@@ -478,6 +491,7 @@ export const api = {
     packageSeq?: number;
     routeOfProcurement?: RouteOfProcurement;
     boardOverrideNotes?: string;
+    tenderReturnPeriod?: { value: number; unit: TenderReturnUnit } | null;
     entries: Array<{
       subcontractorId: string; rank: number; selected: boolean; suggestionReason?: string;
       performanceScore?: number; complianceFlags?: Record<string, unknown>;

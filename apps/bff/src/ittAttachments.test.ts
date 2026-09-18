@@ -7,6 +7,7 @@ const pack: IttEmailPack = {
   packageName: 'Secondary Structural Steel',
   displayRef: '12',
   routeOfProcurement: 'Subcontract — Design & Build',
+  tenderReturnDeadline: null,
   returnForms: [],
   boqSummary: { total: 2, priceable: 1, authored: 1 },
   specDocuments: [],

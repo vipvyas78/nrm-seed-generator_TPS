@@ -124,6 +124,9 @@ code { font-family: monospace; font-size: 0.85em; background: #f3f4f6; padding: 
 
 /* Route picker and package breakdown */
 .route-select { width: 100%; padding: 4px 6px; font-size: 0.78rem; }
+.return-period { display: flex; gap: 4px; align-items: center; }
+.return-period-value { width: 2.4rem; padding: 4px 6px; font-size: 0.78rem; text-align: right; }
+.return-period-unit { flex: 1; min-width: 4.2rem; padding: 4px 2px; font-size: 0.78rem; }
 .pkg-heading { background: #f9fafb; }
 .pkg-heading .pkg-name strong { color: #374151; }
 .pkg-child .pkg-seq { color: #9ca3af; font-weight: 600; }

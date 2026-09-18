@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Fragment, FormEvent, useEffect, useState } from 'react';
 import { Link, Outlet, useNavigate, useParams } from 'react-router-dom';
-import { api, type ConfirmIttResult, type IttDispatch, type IttLetterDetailsInput, type IttLineSection, type IttPack, type LaunchTableRow, type PortalResponseSummary, type SendAllIttsResult, type SendIttDraftResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow } from './api';
+import { api, TENDER_RETURN_MAX, type ConfirmIttResult, type IttDispatch, type IttLetterDetailsInput, type IttLineSection, type IttPack, type LaunchTableRow, type PortalResponseSummary, type SendAllIttsResult, type SendIttDraftResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow, type TenderReturnUnit } from './api';
 import { oidc, signIn } from './auth';
 
 function ErrorMessage({ error }: { error: unknown }) {
@@ -226,6 +226,12 @@ function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowId: stri
   const [open, setOpen] = useState(true);
   // The route is chosen the same way the subcontractors are: offered, then picked.
   const [route, setRoute] = useState(row.route_of_procurement);
+  // How long this package is tendered for. The value is held as a STRING, because an empty
+  // box is the only way to say "not decided" — and because the unit picker is never empty,
+  // "a unit with no number" cannot be expressed at all, which is the pairing rule the
+  // database enforces, made structural in the UI rather than validated.
+  const [periodValue, setPeriodValue] = useState(row.tender_return_period_value?.toString() ?? '');
+  const [periodUnit, setPeriodUnit] = useState<TenderReturnUnit>(row.tender_return_period_unit ?? 'weeks');
   const [splitting, setSplitting] = useState(false);
   const [splitNames, setSplitNames] = useState('');
 
@@ -245,6 +251,7 @@ function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowId: stri
       packageSeq: row.seq,
       routeOfProcurement: route,
       boardOverrideNotes: notes.trim() || undefined,
+      tenderReturnPeriod: periodNumber === null ? null : { value: periodNumber, unit: periodUnit },
       // Everything shown, not just the ticks — the record has to answer "who was
       // considered", not only "who was chosen".
       entries: row.subcontractors
@@ -267,11 +274,24 @@ function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowId: stri
     return next;
   });
 
+  // Mirrors TENDER_RETURN_MAX on the server and the CHECK in migration 021. Out of range is
+  // NOT clamped: clamping silently rewrites a number somebody typed during a meeting, so the
+  // rule is shown and the save is refused instead. Switching weeks -> days with 7 in the box
+  // keeps the 7 and says "Enter 1-5 days." — the user is mid-thought, it self-heals on the
+  // next keystroke, and it can never be saved wrong.
+  const periodMax = TENDER_RETURN_MAX[periodUnit];
+  const periodNumber = periodValue === '' ? null : Number(periodValue);
+  const periodInvalid = periodNumber !== null && (periodNumber < 1 || periodNumber > periodMax);
+
   const dirty = (() => {
     const saved = new Set(row.subcontractors.filter((s) => s.selected).map((s) => s.subcontractor_id));
     if (saved.size !== picked.size) return true;
     for (const id of picked) if (!saved.has(id)) return true;
     if (route !== row.route_of_procurement) return true;
+    if (periodNumber !== (row.tender_return_period_value ?? null)) return true;
+    // The unit only counts where a value exists: flipping the picker over an empty box
+    // changes nothing server-side, so it is not a pending edit.
+    if (periodNumber !== null && periodUnit !== (row.tender_return_period_unit ?? 'weeks')) return true;
     return notes.trim() !== (row.board_override_notes ?? '').trim();
   })();
 
@@ -325,6 +345,38 @@ function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowId: stri
             </select>
             {route !== row.configured_route &&
               <div className="muted tiny">was “{row.configured_route}”</div>}
+          </>}
+    </td>
+    <td>
+      {row.is_heading
+        ? <span className="muted tiny">—</span>
+        : <>
+            <div className="return-period">
+              {/* Text, not number: "only digits" is then literally true — a number input
+                  still accepts e/+/- in several browsers and hands back an empty string for
+                  input it dislikes, so the typist cannot see what they typed — and the
+                  scroll wheel cannot silently change a value on a long table. One character
+                  is enough; 8 is the largest legal number. */}
+              <input
+                className="return-period-value"
+                value={periodValue}
+                inputMode="numeric"
+                maxLength={1}
+                aria-label={`Tender return period for ${row.package_name}`}
+                onChange={(e) => setPeriodValue(e.target.value.replace(/\D/g, ''))}
+              />
+              <select className="return-period-unit" value={periodUnit}
+                      aria-label={`Tender return unit for ${row.package_name}`}
+                      onChange={(e) => setPeriodUnit(e.target.value as TenderReturnUnit)}>
+                <option value="weeks">weeks</option>
+                <option value="days">days</option>
+              </select>
+            </div>
+            {periodInvalid && <div className="alert alert-red tiny" style={{ marginTop: 4 }}>
+              Enter 1–{periodMax} {periodUnit}.
+            </div>}
+            {row.tender_return_deadline &&
+              <div className="muted tiny">issued {row.tender_return_deadline}</div>}
           </>}
     </td>
     <td className="pkg-subs">
@@ -381,7 +433,7 @@ function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowId: stri
               placeholder="Meeting notes / override reason (optional)…"
             />
             <span className="muted">{picked.size} selected</span>
-            <button className="small" onClick={() => save.mutate()} disabled={!dirty || save.isPending}>
+            <button className="small" onClick={() => save.mutate()} disabled={!dirty || periodInvalid || save.isPending}>
               {save.isPending ? 'Saving…' : row.confirmed_at ? 'Update' : 'Confirm'}
             </button>
             {row.confirmed_at && !dirty && <span className="badge badge-green">Confirmed</span>}
@@ -427,7 +479,9 @@ function Step1TenderLaunchPack({ workflowId }: { workflowId: string }) {
     </div>
     <p className="muted" style={{ marginBottom: 12 }}>
       Suggestions are read live from the supply chain register. Tick the firms to invite —
-      only those receive an ITT at Step 2.
+      only those receive an ITT at Step 2. Set how long each package is tendered for (1–5
+      working days, or 1–8 weeks); the return date is worked out from the day its ITT
+      actually goes out, and never moves afterwards.
     </p>
     <div className="table-scroll">
       <table className="data-table launch-table">
@@ -436,6 +490,7 @@ function Step1TenderLaunchPack({ workflowId }: { workflowId: string }) {
             <th style={{ width: '3rem' }}>#</th>
             <th style={{ width: '16rem' }}>Package</th>
             <th style={{ width: '11rem' }}>Route of Procurement</th>
+            <th style={{ width: '8rem' }}>Tender return</th>
             <th>Subcontractors · invite and why suggested</th>
           </tr>
         </thead>
@@ -906,7 +961,7 @@ function IttComposeModal({ workflowId, packageName, onClose, onSent }: {
  * Estimator name/email arrive pre-filled from the confirming user's own account
  * (server-side default) and are editable here before the first ITT goes out.
  */
-function IttLetterDetailsPanel({ workflowId }: { workflowId: string }) {
+function IttLetterDetailsPanel({ workflowId, anyDispatched }: { workflowId: string; anyDispatched: boolean }) {
   const queryClient = useQueryClient();
   const details = useQuery({ queryKey: ['itt-letter-details', workflowId], queryFn: () => api.getIttLetterDetails(workflowId) });
   const [draft, setDraft] = useState<IttLetterDetailsInput | null>(null);
@@ -935,6 +990,16 @@ function IttLetterDetailsPanel({ workflowId }: { workflowId: string }) {
       <div className="two-column">
         <label className="field"><span>Tender return deadline</span>
           <input type="date" value={current.tenderReturnDeadline ?? ''} onChange={(e) => setDraft({ ...current, tenderReturnDeadline: e.target.value })} />
+          {/* Leave it blank and each package's own return period decides its date, counted
+              from the day its ITT goes out. Set here, it overrides every one of them. */}
+          <span className="muted tiny">
+            Blank means each package uses the return period set at the Tender Launch Pack step.
+            A date here overrides all of them.
+          </span>
+          {anyDispatched && <span className="muted tiny">
+            ITTs have already gone out. Changing this changes the date the pricing portal shows
+            those firms, but not the letters already in their inbox.
+          </span>}
         </label>
         <label className="field"><span>Clarifications close</span>
           <input type="date" value={current.clarificationsCloseDate ?? ''} onChange={(e) => setDraft({ ...current, clarificationsCloseDate: e.target.value })} />
@@ -1012,7 +1077,7 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
   }
 
   return <div className="panel">
-    <IttLetterDetailsPanel workflowId={workflowId} />
+    <IttLetterDetailsPanel workflowId={workflowId} anyDispatched={rows.some((r) => Number(r.dispatched) > 0)} />
     <div className="shortlist-header">
       <h3>Invitations to Tender</h3>
       <span className="muted">{rows.length} package{rows.length === 1 ? '' : 's'} · {rows.reduce((n, r) => n + Number(r.recipients), 0)} recipients</span>

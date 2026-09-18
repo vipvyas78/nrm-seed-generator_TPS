@@ -14,6 +14,7 @@ import type { Block, RenderContext } from './blockPdfRenderer.js';
 import type { PortalLineDraftInput, PortalLineInput, PricingPortalDatabase } from './pricingPortalDb.js';
 import type { ScmsReadDatabase } from './scmsReadDb.js';
 import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js';
+import { deriveReturnDate, isTenderReturnUnit } from './tenderReturnPeriod.js';
 import type { Actor } from './types.js';
 
 /** Every ITT email is sent from this address, regardless of who confirms it in the UI. */
@@ -315,6 +316,9 @@ export class TenderPrepDatabase {
       packageName: pkg.name as string,
       displayRef: pkg.sub_seq == null ? String(pkg.seq) : `${pkg.seq}.${pkg.sub_seq}`,
       routeOfProcurement: (pkg.route_of_procurement as string | null) ?? null,
+      // A preview has no workflow, so no shortlist, so no return period to resolve. The
+      // letter falls back to letterContext, which for a preview is empty too.
+      tenderReturnDeadline: null,
       returnForms: returnForms.map((f) => ({
         name: String(f.name), description: (f.description as string | null) ?? null, isRequired: Boolean(f.is_required)
       })),
@@ -412,7 +416,9 @@ export class TenderPrepDatabase {
       [workflowId, packageName]
     );
     const [shortlist] = await this.db.query<Row>(
-      `SELECT route_of_procurement, confirmed_at FROM shortlists
+      `SELECT route_of_procurement, confirmed_at,
+              tender_return_period_value, tender_return_period_unit, tender_return_deadline
+         FROM shortlists
         WHERE workflow_id = $1 AND package_name = $2`,
       [workflowId, packageName]
     );
@@ -521,6 +527,11 @@ export class TenderPrepDatabase {
       display_ref: pkg.sub_seq == null ? String(pkg.seq) : `${pkg.seq}.${pkg.sub_seq}`,
       // The route in force for this tender, not merely what the client's list specifies.
       route_of_procurement: shortlist?.route_of_procurement ?? pkg.route_of_procurement,
+      // The decision (how long this package is tendered for) and, once an ITT has gone out,
+      // what it resolved to. assemblePackageForEmail turns the pair into a date.
+      tender_return_period_value: shortlist?.tender_return_period_value ?? null,
+      tender_return_period_unit: shortlist?.tender_return_period_unit ?? null,
+      tender_return_deadline: shortlist?.tender_return_deadline ?? null,
       takeoff: takeoff,
       boq_id: boqSession?.boq_id ?? null,
       confirmed_at: shortlist?.confirmed_at ?? null,
@@ -868,6 +879,66 @@ export class TenderPrepDatabase {
     return Number.isNaN(date.getTime()) ? null : date.toLocaleDateString('en-GB');
   };
 
+  /**
+   * The return date in force for one package, and whether it is new enough to record.
+   *
+   * Precedence, highest first:
+   *   1. the workflow's own explicit date (itt_letter_details) — a human said so;
+   *   2. the date already ISSUED for this package — whatever else has changed since, that
+   *      is the date a tenderer is holding;
+   *   3. this package's return period, counted from `asOf`;
+   *   4. nothing, which the letter prints as "to be confirmed".
+   *
+   * `asOf` OMITTED means never derive. A read-only surface — the launch table, a pricing
+   * portal opened a week after the ITT went out — must not show a date that slides forward
+   * every day it is looked at; it shows what was issued, or nothing.
+   *
+   * `toStamp` is non-null only on rung 3, so a date that came from a human is never written
+   * into the package's own column and rung 1 stays reversible.
+   */
+  private resolveReturnDeadline(
+    pkg: { tender_return_period_value?: unknown; tender_return_period_unit?: unknown; tender_return_deadline?: unknown },
+    explicit: unknown,
+    asOf?: Date
+  ): { display: string | null; toStamp: string | null } {
+    if (explicit) return { display: this.formatDate(explicit), toStamp: null };
+    if (pkg.tender_return_deadline) return { display: this.formatDate(pkg.tender_return_deadline), toStamp: null };
+
+    const unit = pkg.tender_return_period_unit;
+    const value = Number(pkg.tender_return_period_value);
+    if (!asOf || !isTenderReturnUnit(unit) || !Number.isInteger(value)) return { display: null, toStamp: null };
+
+    const derived = deriveReturnDate(asOf, value, unit);
+    return { display: this.formatDate(derived), toStamp: derived };
+  }
+
+  /**
+   * Records the return date an ITT actually went out with, once.
+   *
+   * `AND tender_return_deadline IS NULL` is the whole guarantee, and it is deliberately in
+   * the WHERE rather than folded into the SET as a COALESCE: a resend, a re-confirmation of
+   * the shortlist or a second reviewer racing the first cannot move a date a tenderer is
+   * already working to, and the invariant is checkable by reading one line.
+   */
+  async stampTenderReturnDeadlines(workflowId: string, stamps: Array<{ packageName: string; date: string }>): Promise<void> {
+    for (const stamp of stamps) {
+      await this.db.query(
+        `UPDATE shortlists SET tender_return_deadline = $3::date
+          WHERE workflow_id = $1 AND package_name = $2 AND tender_return_deadline IS NULL`,
+        [workflowId, stamp.packageName, stamp.date]
+      );
+    }
+  }
+
+  /** The workflow-wide date a human typed at Step 2, raw. Read once per send and threaded
+   *  into each package's assembly, rather than re-queried per package. */
+  private async explicitReturnDeadlineFor(workflowId: string): Promise<unknown> {
+    const [row] = await this.db.query<Row>(
+      `SELECT tender_return_deadline FROM itt_letter_details WHERE workflow_id = $1`, [workflowId]
+    );
+    return row?.tender_return_deadline ?? null;
+  }
+
   /** Builds an IttEmailLetterContext for a workflow, pre-filling estimator name/email
    * from the confirming actor's own account when no itt_letter_details row (or no
    * value in it) has been saved yet — see GET /api/tender-prep/:workflowId/itt-letter-details. */
@@ -904,7 +975,9 @@ export class TenderPrepDatabase {
       recipientName: recipient.name ?? '',
       recipientAddress: recipient.address ?? '',
       todayDate: new Date().toLocaleDateString('en-GB'),
-      tenderReturnDeadline: letterContext.tenderReturnDeadline ?? 'to be confirmed',
+      // Per-package, because attachmentsFor builds one render context per pack: a firm
+      // invited to three packages gets three cover letters, each stating its own date.
+      tenderReturnDeadline: pack.tenderReturnDeadline ?? letterContext.tenderReturnDeadline ?? 'to be confirmed',
       clarificationsCloseDate: letterContext.clarificationsCloseDate ?? 'to be confirmed',
       siteVisitPermitted: letterContext.siteVisitPermitted === null ? 'To be confirmed' : letterContext.siteVisitPermitted ? 'Yes' : 'No',
       estimatorName: letterContext.estimatorName ?? '',
@@ -1572,8 +1645,18 @@ export class TenderPrepDatabase {
     const projectId = workflow.step_data?.takeoff?.projectId ?? null;
     const packages = await this.listPackageConfig(actor, projectId);
 
-    const shortlists = await this.db.query<{ id: string; package_name: string; confirmed_at: string | null; board_override_notes: string | null; route_of_procurement: string | null }>(
-      `SELECT id, package_name, confirmed_at, board_override_notes, route_of_procurement
+    const shortlists = await this.db.query<{
+      id: string; package_name: string; confirmed_at: string | null; board_override_notes: string | null;
+      route_of_procurement: string | null; tender_return_period_value: number | null;
+      tender_return_period_unit: string | null; tender_return_deadline: string | null;
+    }>(
+      // The issued date is formatted in SQL rather than returned raw. The BFF installs no pg
+      // type parser, so a DATE comes back as a Date at LOCAL midnight and serialises to the
+      // PREVIOUS day under a positive UTC offset — a launch table reporting a date one day
+      // earlier than the letter a tenderer holds would be worse than reporting none.
+      `SELECT id, package_name, confirmed_at, board_override_notes, route_of_procurement,
+              tender_return_period_value, tender_return_period_unit,
+              to_char(tender_return_deadline, 'DD/MM/YYYY') AS tender_return_deadline
          FROM shortlists WHERE workflow_id = $1`,
       [workflowId]
     );
@@ -1646,6 +1729,12 @@ export class TenderPrepDatabase {
         notes: pkg.notes,
         confirmed_at: shortlist?.confirmed_at ?? null,
         board_override_notes: shortlist?.board_override_notes ?? null,
+        // How long this package is tendered for, and — once an ITT has gone out — the date
+        // that resolved to. The date is shown, never re-derived here: a read of the launch
+        // table must not invent a deadline that moves every day it is opened.
+        tender_return_period_value: shortlist?.tender_return_period_value ?? null,
+        tender_return_period_unit: shortlist?.tender_return_period_unit ?? null,
+        tender_return_deadline: shortlist?.tender_return_deadline ?? null,
         subcontractors: [
           ...withPlaceholder,
           ...suggested.map((c) => ({
@@ -1682,6 +1771,9 @@ export class TenderPrepDatabase {
     packageSeq?: number;
     routeOfProcurement?: string;
     boardOverrideNotes?: string;
+    /** How long this package is tendered for. Null clears it. Validated in app.ts against
+     *  the same 1-5 days / 1-8 weeks rule as shortlists_tender_return_period_check. */
+    tenderReturnPeriod?: { value: number; unit: 'days' | 'weeks' } | null;
     entries: Array<{
       subcontractorId: string; rank: number; selected: boolean; suggestionReason?: string;
       performanceScore?: number; complianceFlags?: Record<string, unknown>;
@@ -1689,17 +1781,24 @@ export class TenderPrepDatabase {
   }): Promise<Row> {
     await this.assertWorkflowAccess(actor, workflowId);
     return this.db.transaction(async (client) => {
+      // tender_return_deadline is deliberately absent from both the column list and the
+      // DO UPDATE SET. Re-confirming a shortlist must not move a date already issued — only
+      // stampTenderReturnDeadlines writes that column, and only where it is still NULL.
       const shortlist = await this.db.one(
-        `INSERT INTO shortlists (workflow_id, package_name, package_seq, route_of_procurement, confirmed_at, board_override_notes)
-         VALUES ($1,$2,$3,$4,NOW(),$5)
+        `INSERT INTO shortlists (workflow_id, package_name, package_seq, route_of_procurement, confirmed_at, board_override_notes,
+                                 tender_return_period_value, tender_return_period_unit)
+         VALUES ($1,$2,$3,$4,NOW(),$5,$6,$7)
          ON CONFLICT (workflow_id, package_name) DO UPDATE SET
            package_seq = EXCLUDED.package_seq,
            route_of_procurement = EXCLUDED.route_of_procurement,
            confirmed_at = NOW(),
-           board_override_notes = EXCLUDED.board_override_notes
+           board_override_notes = EXCLUDED.board_override_notes,
+           tender_return_period_value = EXCLUDED.tender_return_period_value,
+           tender_return_period_unit = EXCLUDED.tender_return_period_unit
          RETURNING *`,
         [workflowId, input.packageName, input.packageSeq ?? null,
-         input.routeOfProcurement ?? null, input.boardOverrideNotes ?? null], client
+         input.routeOfProcurement ?? null, input.boardOverrideNotes ?? null,
+         input.tenderReturnPeriod?.value ?? null, input.tenderReturnPeriod?.unit ?? null], client
       );
       await client.query(`DELETE FROM shortlist_entries WHERE shortlist_id = $1`, [shortlist.id]);
       for (const entry of input.entries) {
@@ -1789,8 +1888,11 @@ export class TenderPrepDatabase {
     actor: Actor,
     workflowId: string,
     packageName: string,
-    bundles: BuildflowBundle[]
-  ): Promise<{ emailPack: IttEmailPack; recipients: Row[]; projectName: string }> {
+    bundles: BuildflowBundle[],
+    /** The workflow's explicit Step 2 date, raw, from explicitReturnDeadlineFor. Read once
+     *  per send by the caller rather than re-queried for every package. */
+    explicitReturnDeadline?: unknown
+  ): Promise<{ emailPack: IttEmailPack; recipients: Row[]; projectName: string; returnDeadlineToStamp: string | null }> {
     const pack = await this.getPackageItt(actor, workflowId, packageName);
     const notIgnored = (items: Row[]) => items.filter((i) => i.ignored !== true);
 
@@ -1813,6 +1915,12 @@ export class TenderPrepDatabase {
 
     const priceable = boqLines.filter((l) => l.is_priceable).length;
 
+    // Resolved here, not in the send paths: the preview and the real send both come through
+    // this method, so what the modal shows and what the email carries are the same value by
+    // construction. Resolving is not recording — `returnDeadlineToStamp` is handed back and
+    // only a path that actually sends writes it.
+    const returnDeadline = this.resolveReturnDeadline(pack, explicitReturnDeadline, new Date());
+
     // Best-effort: an id BuildFlow can't resolve, or BuildFlow being unreachable, should
     // never block the ITT — the email just sends with no spec clauses section.
     const chunkIds = [...new Set(boqLines.flatMap((l) => (l.spec_chunk_ids as string[] | null) ?? []))];
@@ -1822,6 +1930,7 @@ export class TenderPrepDatabase {
       packageName: pack.package_name as string,
       displayRef: pack.display_ref as string,
       routeOfProcurement: (pack.route_of_procurement as string | null) ?? null,
+      tenderReturnDeadline: returnDeadline.display,
       returnForms: returnForms.map((f) => ({
         name: String(f.name), description: (f.description as string | null) ?? null, isRequired: Boolean(f.is_required)
       })),
@@ -1869,7 +1978,8 @@ export class TenderPrepDatabase {
     return {
       emailPack,
       recipients: pack.recipients as Row[],
-      projectName: (takeoff?.projectName as string | undefined) ?? 'the project'
+      projectName: (takeoff?.projectName as string | undefined) ?? 'the project',
+      returnDeadlineToStamp: returnDeadline.toStamp
     };
   }
 
@@ -2065,11 +2175,15 @@ export class TenderPrepDatabase {
     attachments: IttAttachment[];
     attachmentsOmittedOversize: boolean;
     recipients: IttDraftRecipient[];
+    /** Non-null when this draft's date came from the package's return period and has not
+     *  been issued yet. draftIttEmail ignores it — a preview records nothing. */
+    returnDeadlineToStamp: string | null;
   }> {
     const bundles = await this.bundlesForWorkflow(workflowId);
     const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
-    const assembled = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles);
     const letterContext = await this.letterContextFor(actor, workflowId);
+    const explicitReturnDeadline = await this.explicitReturnDeadlineFor(workflowId);
+    const assembled = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles, explicitReturnDeadline);
     // The compose box addresses whoever the sender types in, not one named firm, so
     // there is no single recipient to personalise the letter/forms to yet.
     const draftRecipient = { name: null as string | null, email: '', address: null as string | null };
@@ -2110,6 +2224,7 @@ export class TenderPrepDatabase {
       letterContext,
       attachments: attachmentsOmittedOversize ? [] : files,
       attachmentsOmittedOversize,
+      returnDeadlineToStamp: assembled.returnDeadlineToStamp,
       recipients
     };
   }
@@ -2138,7 +2253,7 @@ export class TenderPrepDatabase {
       throw conflict('Email is not configured in this environment, so this ITT cannot be sent from here.');
     }
 
-    const { emailPack, projectName, completeBundleUrl, letterContext, attachments, recipients } =
+    const { emailPack, projectName, completeBundleUrl, letterContext, attachments, recipients, returnDeadlineToStamp } =
       await this.buildIttDraft(actor, workflowId, packageName);
     const portalStatus = await this.draftPortalStatus(workflowId, packageName, emailPack, recipients);
     const rendered = renderIttEmail([emailPack], { name: null, email: '', address: null }, {
@@ -2151,6 +2266,13 @@ export class TenderPrepDatabase {
     const cc = [...new Set(input.cc.map((a) => a.trim()).filter(Boolean))]
       .filter((address) => !to.some((t) => normalise(t) === normalise(address)));
     if (to.length === 0) throw conflict('Add at least one recipient before sending.');
+
+    // Past the point of no return, and before the message leaves: the letter rendered below
+    // carries this date, so the column has to agree with it. draftIttEmail runs the same
+    // assembly and records nothing — a preview is not an issue.
+    if (returnDeadlineToStamp) {
+      await this.stampTenderReturnDeadlines(workflowId, [{ packageName, date: returnDeadlineToStamp }]);
+    }
 
     const addressed = new Set([...to, ...cc].map(normalise));
     const matched = recipients.filter((r) => r.email && addressed.has(normalise(r.email)));
@@ -2283,6 +2405,7 @@ export class TenderPrepDatabase {
     const bundles = await this.bundlesForWorkflow(workflowId);
     const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
     const letterContext = await this.letterContextFor(actor, workflowId);
+    const explicitReturnDeadline = await this.explicitReturnDeadlineFor(workflowId);
 
     // One assembly per package, shared across every firm invited to it. getPackageItt is the
     // expensive call in this flow and most packages have several recipients.
@@ -2293,11 +2416,14 @@ export class TenderPrepDatabase {
     // the send loop below isolates per-firm failures.
     const assembled = new Map<string, { emailPack: IttEmailPack; projectName: string }>();
     const unassembled: Array<{ packageName: string; error: string }> = [];
+    const returnDeadlineStamps: Array<{ packageName: string; date: string }> = [];
     const requestedPackages = [...new Set(entries.map((e) => e.package_name))];
     for (const name of requestedPackages) {
       try {
-        const { emailPack, projectName } = await this.assemblePackageForEmail(actor, workflowId, name, bundles);
+        const { emailPack, projectName, returnDeadlineToStamp } =
+          await this.assemblePackageForEmail(actor, workflowId, name, bundles, explicitReturnDeadline);
         assembled.set(name, { emailPack, projectName });
+        if (returnDeadlineToStamp) returnDeadlineStamps.push({ packageName: name, date: returnDeadlineToStamp });
       } catch (error) {
         unassembled.push({ packageName: name, error: error instanceof Error ? error.message : 'Could not assemble this package' });
       }
@@ -2340,6 +2466,12 @@ export class TenderPrepDatabase {
       }
     }
     const portalStatuses = await this.mintPortalLinksFor(portalRequests);
+
+    // Past everything that could still abort the send, and before the first message leaves.
+    // Only packages that assembled are in the list: the letters below carry these dates, so
+    // the column has to agree with them even if a particular firm's email then fails —
+    // while a package that dropped out is not issued anything, so it is not dated.
+    await this.stampTenderReturnDeadlines(workflowId, returnDeadlineStamps);
 
     let sent = 0, failed = 0, skippedNoEmail = 0;
     const detail: Array<{ subcontractorId: string; packages: string[]; status: string; error?: string }> = [];
@@ -2449,10 +2581,11 @@ export class TenderPrepDatabase {
     }
 
     const bundles = await this.bundlesForWorkflow(workflowId);
-    const assembled = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles);
+    const letterContext = await this.letterContextFor(actor, workflowId);
+    const explicitReturnDeadline = await this.explicitReturnDeadlineFor(workflowId);
+    const assembled = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles, explicitReturnDeadline);
     const { emailPack, projectName } = assembled;
     const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
-    const letterContext = await this.letterContextFor(actor, workflowId);
 
     const recipients = assembled.recipients;
     const subcontractorIds = recipients.map((r) => String(r.subcontractor_id));
@@ -2474,6 +2607,15 @@ export class TenderPrepDatabase {
         recipientEmail: email, emailPack
       };
     }));
+
+    // Past everything that could still abort the send, and before the first message leaves:
+    // the letters below carry this date, so the column has to agree with them even if a
+    // particular firm's email then fails. Stamping earlier would record a date for a send
+    // that never happened, and the next attempt would reuse it — handing the tenderer less
+    // time than the period promises.
+    if (assembled.returnDeadlineToStamp) {
+      await this.stampTenderReturnDeadlines(workflowId, [{ packageName, date: assembled.returnDeadlineToStamp }]);
+    }
 
     let sent = 0, failed = 0, skippedNoEmail = 0;
     const detail: Array<{ subcontractorId: string; status: string; error?: string }> = [];
@@ -2681,10 +2823,24 @@ export class TenderPrepDatabase {
   async getPortalPackage(token: string, accessEmail: string | null): Promise<Row> {
     const link = await this.resolvePortalToken(token, accessEmail);
     const lines = await this.portalDb!.getLines(String(link.id));
-    const [letterDetails] = await this.db.query<Row>(
-      `SELECT tender_return_deadline FROM itt_letter_details WHERE workflow_id = $1`, [link.workflow_id]
+    // Both sides of the precedence, for THIS link's own package — pricing_portal_links
+    // carries package_name, so the join is exact.
+    const [deadline] = await this.db.query<Row>(
+      `SELECT ild.tender_return_deadline AS explicit_deadline,
+              sl.tender_return_deadline  AS issued_deadline
+         FROM workflows w
+         LEFT JOIN itt_letter_details ild ON ild.workflow_id = w.id
+         LEFT JOIN shortlists sl ON sl.workflow_id = w.id AND sl.package_name = $2
+        WHERE w.id = $1`,
+      [link.workflow_id, link.package_name]
     );
-    return { ...link, lines, tender_return_deadline: letterDetails?.tender_return_deadline ?? null };
+    // No `asOf`: a portal link exists only after a send, so the date was stamped then.
+    // Deriving here instead would slide the deadline forward every day the tenderer opened
+    // the page. Formatted, never raw — see getTenderLaunchTable for why.
+    const resolved = this.resolveReturnDeadline(
+      { tender_return_deadline: deadline?.issued_deadline }, deadline?.explicit_deadline
+    );
+    return { ...link, lines, tender_return_deadline: resolved.display };
   }
 
   async savePortalDraft(token: string, accessEmail: string | null, input: {

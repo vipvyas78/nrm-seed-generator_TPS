@@ -5,6 +5,7 @@ const pack: IttEmailPack = {
   packageName: 'Secondary Structural Steel',
   displayRef: '12',
   routeOfProcurement: 'Subcontract — Design & Build',
+  tenderReturnDeadline: null,
   returnForms: [
     { name: 'Form of Tender', description: null, isRequired: true },
     { name: 'Method Statement', description: 'Optional but scored', isRequired: false }
@@ -245,6 +246,82 @@ describe('renderIttEmail', () => {
       const { html } = renderIttEmail([pack, secondPack], jo, withPortal);
       expect(html).toContain('href="https://tps.example/respond/first"');
       expect(html).toContain('href="https://tps.example/respond/second"');
+    });
+  });
+  // ── Return dates ──────────────────────────────────────────────────────────────────
+  //
+  // A package now carries its own return date, resolved from the return period set at the
+  // Tender Launch Pack step. A per-firm send puts several packages in one letter, so the
+  // shared "return by" sentence can only speak for all of them when they agree.
+  describe('return dates', () => {
+    const dated = (p: IttEmailPack, tenderReturnDeadline: string | null): IttEmailPack =>
+      ({ ...p, tenderReturnDeadline });
+
+    it("falls back to the letter's own deadline when the package states none", () => {
+      // The behaviour every caller predating per-package periods relies on, and the reason
+      // the fallback exists at all. `pack.tenderReturnDeadline` is null in the fixture.
+      const { html, text } = renderIttEmail([pack], jo, opts);
+      expect(text).toContain('no later than 01/01/2027');
+      expect(html).toContain('no later than <strong>01/01/2027</strong>');
+      expect(text).not.toContain('different return dates');
+    });
+
+    it("prints the package's own date in the shared sentence and against the package", () => {
+      const { html, text } = renderIttEmail([dated(pack, '14/10/2026')], jo, opts);
+      expect(text).toContain('no later than 14/10/2026');
+      expect(text).toContain('Return by: 14/10/2026');
+      expect(html).toContain('no later than <strong>14/10/2026</strong>');
+      expect(html).toContain('Return by: <strong>14/10/2026</strong>');
+      // The letter's own deadline is overridden, not printed alongside it.
+      expect(text).not.toContain('01/01/2027');
+    });
+
+    it('states one date once when every package on the send agrees', () => {
+      const { html, text } = renderIttEmail(
+        [dated(pack, '14/10/2026'), dated(secondPack, '14/10/2026')], jo, opts
+      );
+      expect(text).toContain('no later than 14/10/2026');
+      expect(text).not.toContain('different return dates');
+      expect(html).not.toContain('different return dates');
+    });
+
+    it('refuses to name one date when the packages disagree, and states each on its own block', () => {
+      const { html, text } = renderIttEmail(
+        [dated(pack, '14/10/2026'), dated(secondPack, '28/10/2026')], jo, opts
+      );
+      // The shared sentence must not pick one of them — a tenderer working to a single
+      // stated date would miss the other package's.
+      expect(text).toContain('different return dates');
+      expect(text).not.toContain('no later than');
+      expect(html).toContain('<strong>These packages have different return dates</strong>');
+      expect(html).not.toContain('no later than');
+      expect(text).toContain('Return by: 14/10/2026');
+      expect(text).toContain('Return by: 28/10/2026');
+      expect(html).toContain('Return by: <strong>14/10/2026</strong>');
+      expect(html).toContain('Return by: <strong>28/10/2026</strong>');
+    });
+
+    it('says "to be confirmed" on a package with no date rather than omitting the line', () => {
+      // Mixed: one package dated, one not. A silently missing date on one block of a
+      // multi-package letter reads exactly like a package with no deadline at all.
+      const { html, text } = renderIttEmail(
+        [dated(pack, '14/10/2026'), dated(secondPack, null)], jo,
+        { ...opts, letterContext: { ...letterContext, tenderReturnDeadline: null } }
+      );
+      expect(text).toContain('different return dates');
+      expect(text).toContain('Return by: 14/10/2026');
+      expect(text).toContain('Return by: to be confirmed');
+      expect(html).toContain('Return by: <strong>to be confirmed</strong>');
+    });
+
+    it('omits the per-package line entirely on an ordinary single-package letter', () => {
+      // Nothing anywhere states a date: the shared sentence already says "to be confirmed",
+      // and a second copy against the package adds nothing.
+      const { text } = renderIttEmail(
+        [pack], jo, { ...opts, letterContext: { ...letterContext, tenderReturnDeadline: null } }
+      );
+      expect(text).toContain('no later than to be confirmed');
+      expect(text).not.toContain('Return by:');
     });
   });
 });

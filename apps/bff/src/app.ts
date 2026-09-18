@@ -17,6 +17,7 @@ import { EmailService } from './emailService.js';
 import { PricingPortalDatabase } from './pricingPortalDb.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
 import { TenderPrepDatabase } from './tenderPrepDb.js';
+import { TENDER_RETURN_MAX, TENDER_RETURN_UNITS } from './tenderReturnPeriod.js';
 
 const uuid = z.string().uuid();
 
@@ -243,6 +244,25 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     // three originally assumed — see migration 004.
     const routeOfProcurement = z.string().trim().min(1).max(200);
 
+    // How long a package is tendered for. Nested rather than two flat fields: the pair IS
+    // the value, so "a number with no unit" cannot be expressed on the wire at all and the
+    // refinement only has to carry the part that genuinely needs it — a bound that depends
+    // on a sibling field. Two flat optionals would let { value: 3 } reach Postgres and fail
+    // as a raw constraint violation, which is a 500 where this is a 422 naming the rule.
+    const tenderReturnPeriod = z.object({
+      value: z.number().int(),
+      unit: z.enum(TENDER_RETURN_UNITS)
+    }).superRefine((period, ctx) => {
+      const max = TENDER_RETURN_MAX[period.unit];
+      if (period.value < 1 || period.value > max) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['value'],
+          message: `A tender return period in ${period.unit} must be between 1 and ${max}. Tenders are returned in 1-5 days or 1-8 weeks.`
+        });
+      }
+    });
+
     protectedApi.get('/api/tender-prep/config/packages', async (request) => {
       const { projectId } = query(request, z.object({ projectId: uuid.optional() }));
       return tpDb.listPackageConfig(requireActor(request), projectId ?? null);
@@ -425,6 +445,8 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
         packageSeq: z.number().int().positive().optional(),
         routeOfProcurement: routeOfProcurement.optional(),
         boardOverrideNotes: z.string().trim().max(2000).optional(),
+        // Null clears the period; omitted leaves it as it is.
+        tenderReturnPeriod: tenderReturnPeriod.nullish(),
         // Everything the meeting saw, not only what it picked — the record has to show
         // who was considered and why, so there is no .min() here and no cap of five.
         entries: z.array(z.object({

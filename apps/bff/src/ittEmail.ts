@@ -83,6 +83,16 @@ export interface IttEmailPack {
   packageName: string;
   displayRef: string;
   routeOfProcurement: string | null;
+  /**
+   * This package's own return date, already resolved and formatted dd/mm/yyyy.
+   *
+   * Resolution (explicit workflow date > the date already issued for this package > this
+   * package's return period counted from the dispatch date) happens in tenderPrepDb, not
+   * here: this file states no policy about dates, it only prints them. Null falls back to
+   * the letter-wide `letterContext.tenderReturnDeadline`, which is what a preview with no
+   * workflow behind it, and every caller predating per-package periods, relies on.
+   */
+  tenderReturnDeadline: string | null;
   returnForms: Array<{ name: string; description: string | null; isRequired: boolean }>;
   boqSummary: { total: number; priceable: number; authored: number };
   boqLines: IttEmailBoqLine[];
@@ -327,7 +337,7 @@ const dateOrTbc = (s: string | null): string => s ?? 'to be confirmed';
 
 const RULE = '='.repeat(78);
 
-const packageTextBlock = (pack: IttEmailPack, completeBundleUrl: string | null, portalStatus: IttEmailPortalStatus | undefined): string => {
+const packageTextBlock = (pack: IttEmailPack, completeBundleUrl: string | null, portalStatus: IttEmailPortalStatus | undefined, returnBy: string | null): string => {
   const boqRows = boqRowsFor(pack);
   const billRows = billRowsFor(pack);
   const specRows = specRowsFor(pack);
@@ -337,7 +347,7 @@ const packageTextBlock = (pack: IttEmailPack, completeBundleUrl: string | null, 
 
   return `${RULE}
 WORK PACKAGE: ${pack.packageName} (ref ${pack.displayRef})
-Route:   ${pack.routeOfProcurement ?? 'Not stated'}
+Route:     ${pack.routeOfProcurement ?? 'Not stated'}${returnBy ? `\nReturn by: ${returnBy}` : ''}
 ${RULE}
 
 SECTION 1 — TENDER RETURN: a compliant submission must contain
@@ -368,7 +378,7 @@ ${pack.valueEngineeringRequired ? `\nVALUE ENGINEERING\n${VALUE_ENGINEERING_SENT
 ${portalLine ? `\nSECTION 6 — PRICE THIS PACKAGE ONLINE\n${portalLine}\n` : ''}`;
 };
 
-const packageHtmlBlock = (pack: IttEmailPack, completeBundleUrl: string | null, portalStatus: IttEmailPortalStatus | undefined): string => {
+const packageHtmlBlock = (pack: IttEmailPack, completeBundleUrl: string | null, portalStatus: IttEmailPortalStatus | undefined, returnBy: string | null): string => {
   const boqHtmlRows = boqRowsFor(pack).map((r) => r.map(esc));
   const billHtmlRows = billRowsFor(pack).map((r) => r.map(esc));
   const specHtmlRows = specRowsFor(pack).map((r) => r.map(esc));
@@ -378,7 +388,8 @@ const packageHtmlBlock = (pack: IttEmailPack, completeBundleUrl: string | null, 
   return `
   <div style="border-top: 3px solid #1a1a1a; margin-top: 28px; padding-top: 8px;">
   <h2 style="font-size: 17px; margin-bottom: 2px;">Work Package: ${esc(pack.packageName)} <span style="color:#888; font-weight: normal;">(ref ${esc(pack.displayRef)})</span></h2>
-  <p style="color: #555; margin-top: 0; font-size: 13px;">Route: ${esc(pack.routeOfProcurement ?? 'Not stated')}</p>
+  <p style="color: #555; margin-top: 0; font-size: 13px;">Route: ${esc(pack.routeOfProcurement ?? 'Not stated')}${
+    returnBy ? `<br>Return by: <strong>${esc(returnBy)}</strong>` : ''}</p>
 
   <h3 style="font-size: 15px;">Section 1 — Tender return: a compliant submission must contain</h3>
   ${requiredForms.length > 0
@@ -461,6 +472,23 @@ export function renderIttEmail(
   const sections = sectionIndex(unionCodes);
   const today = new Date().toLocaleDateString('en-GB');
 
+  // A per-firm send puts several packages in one letter, and those packages can now carry
+  // different return dates. The letter's single "return by" sentence can only speak for all
+  // of them when they agree; where they do not it says so, and each package block states its
+  // own. The `?? letterContext` fallback is what keeps every pre-existing caller — and a
+  // preview with no workflow behind it — rendering exactly as before.
+  const returnDateFor = (p: IttEmailPack) => p.tenderReturnDeadline ?? letterContext.tenderReturnDeadline;
+  const distinctReturnDates = [...new Set(packages.map(returnDateFor))];
+  const oneReturnDate = distinctReturnDates.length <= 1;
+  const returnTo = letterContext.estimatorEmail ?? 'the address below';
+  const returnLead = 'Your completed Form of Tender, together with all necessary supporting information,';
+  // A block prints its own date whenever the shared sentence above cannot speak for it. In
+  // the single-date case the line is omitted when there is no date at all, so today's
+  // ordinary letter does not gain a second "to be confirmed"; in the mixed case every block
+  // states something, because a silently missing date is the failure that matters there.
+  const returnByFor = (p: IttEmailPack): string | null =>
+    oneReturnDate ? returnDateFor(p) : dateOrTbc(returnDateFor(p));
+
   const intro = many
     ? `You are invited to tender for the ${packages.length} packages listed below. Each package is set out in full — its scope of works, bill of quantities, document pack and return requirements — and each carries its own attached scope of works and pricing schedule. Please price each package separately.`
     : 'You are invited to tender for the package below. Please find its scope of works, bill of quantities, the documents this invitation carries and what a compliant return must contain. The scope of works and a pricing schedule are attached.';
@@ -487,13 +515,15 @@ ${intro}
 You are required to submit a fully priced Lump Sum tender return in support of your quotation. This must include:
 ${returnsList}
 
-Your completed Form of Tender, together with all necessary supporting information, should be returned to ${letterContext.estimatorEmail ?? 'the address below'}, no later than ${dateOrTbc(letterContext.tenderReturnDeadline)}.
+${oneReturnDate
+  ? `${returnLead} should be returned to ${returnTo}, no later than ${dateOrTbc(distinctReturnDates[0] ?? null)}.`
+  : `${returnLead} should be returned to ${returnTo}. These packages have different return dates — each one is stated against its package below.`}
 
 The below information forms the basis of the ITT and are our Employer's Contractor's Requirements which will be included within the Sub-Contract. Your price should reflect this and any omissions should be clarified clearly within your submission.
 
 ${sections}
 
-${packages.map((p) => packageTextBlock(p, completeBundleUrl, options.portalStatusByPackage?.[p.packageName])).join('\n')}
+${packages.map((p) => packageTextBlock(p, completeBundleUrl, options.portalStatusByPackage?.[p.packageName], returnByFor(p))).join('\n')}
 ${completeTextBlock}
 Please raise all technical and commercial queries in writing before the return date.
 
@@ -520,7 +550,9 @@ On behalf of ${letterContext.organizationName}
   <p>You are required to submit a fully priced Lump Sum tender return in support of your quotation. This must include:</p>
   <ul>${returnsList.split('\n').map((l) => `<li>${esc(l.replace(/^- /, ''))}</li>`).join('')}</ul>
 
-  <p>Your completed Form of Tender, together with all necessary supporting information, should be returned to ${esc(letterContext.estimatorEmail ?? 'the address below')}, no later than <strong>${esc(dateOrTbc(letterContext.tenderReturnDeadline))}</strong>.</p>
+  <p>${oneReturnDate
+    ? `${esc(returnLead)} should be returned to ${esc(returnTo)}, no later than <strong>${esc(dateOrTbc(distinctReturnDates[0] ?? null))}</strong>.`
+    : `${esc(returnLead)} should be returned to ${esc(returnTo)}. <strong>These packages have different return dates</strong> — each one is stated against its package below.`}</p>
 
   <p style="font-size: 13px; color: #555;">The below information forms the basis of the ITT and are our Employer's Contractor's Requirements which will be included within the Sub-Contract. Your price should reflect this and any omissions should be clarified clearly within your submission.</p>
 
@@ -530,7 +562,7 @@ On behalf of ${letterContext.organizationName}
   </table>
   <pre style="font-family: inherit; white-space: pre-wrap; font-size: 13px; color: #333;">${esc(sections)}</pre>
 
-  ${packages.map((p) => packageHtmlBlock(p, completeBundleUrl, options.portalStatusByPackage?.[p.packageName])).join('')}
+  ${packages.map((p) => packageHtmlBlock(p, completeBundleUrl, options.portalStatusByPackage?.[p.packageName], returnByFor(p))).join('')}
 
   ${completeBundleUrl ? `
   <div style="border-top: 3px solid #1a1a1a; margin-top: 28px; padding-top: 8px;">
