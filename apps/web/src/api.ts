@@ -481,6 +481,68 @@ export type PortalDraftInput = {
 
 export type PortalNewLineInput = { description: string; quantity: number | null; unit: string | null };
 
+// -- Subcontractor queries (RFIs) --------------------------------------------
+
+/** One file on a message. `share_token` is BuildFlow's durable redirect token, not a
+ *  presigned URL: it stays clickable for months, and the short-lived signed URL is minted
+ *  at click time. Null only when the link could not be refreshed. */
+export type CommsAttachment = {
+  id: string;
+  filename: string;
+  content_type: string | null;
+  byte_size: number | null;
+  /** Use THIS to link to the file. Built by BuildFlow from its own public host; nothing
+   *  here can reassemble it. Null only when the upload predates the column. */
+  share_url: string | null;
+  share_token: string | null;
+  share_expires_at: string | null;
+};
+
+export type CommsMessage = {
+  id: string;
+  direction: 'inbound' | 'outbound';
+  channel: 'portal' | 'email' | 'app';
+  kind: 'subcontractor_rfi' | 'client_forward' | 'client_reply' | 'relay_to_subcontractor' | 'note';
+  /** Who actually wrote it, which is routinely NOT the firm the ITT was addressed to. */
+  author_name: string | null;
+  author_email: string | null;
+  subject: string | null;
+  body_text: string | null;
+  occurred_at: string;
+  received_at: string;
+  shortlist_entry_id: string | null;
+  attachments: CommsAttachment[];
+};
+
+export type CommsThread = {
+  id: string;
+  workflow_id: string | null;
+  counterparty_kind: 'subcontractor' | 'client';
+  counterparty_email: string;
+  counterparty_name: string | null;
+  subject: string | null;
+  status: 'open' | 'awaiting_client' | 'answered' | 'closed';
+  last_message_at: string;
+};
+
+/** A row of the Communications list. The counts come from the same query as the thread,
+ *  so a tender with twenty firms is one round trip and not twenty-one. */
+export type CommsThreadSummary = CommsThread & {
+  message_count: string;
+  inbound_count: string;
+  attachment_count: string;
+};
+
+export type CommsThreadDetail = { thread: CommsThread; messages: CommsMessage[] };
+
+export type PortalRfiInput = {
+  authorName: string;
+  authorEmail: string;
+  subject: string | null;
+  body: string;
+  attachments: Array<{ filename: string; contentBase64: string }>;
+};
+
 export type TenderComparative = {
   id: string;
   workflow_id: string;
@@ -614,6 +676,14 @@ export const api = {
   reopenPortalResponse: (workflowId: string, linkId: string) =>
     request<PortalResponseDetail>(`/api/tender-prep/${workflowId}/portal-responses/${linkId}/reopen`, { method: 'POST' }),
 
+  // Step 2: subcontractor queries. Listed per tender, opened per thread — a thread that
+  // could not be attributed to a tender has no workflow to nest under, so addressing it
+  // by its own id is what keeps that case reachable.
+  listCommsThreads: (workflowId: string) =>
+    request<CommsThreadSummary[]>(`/api/tender-prep/${workflowId}/threads`),
+  getCommsThread: (threadId: string) =>
+    request<CommsThreadDetail>(`/api/comms/threads/${threadId}`),
+
   // Step 3: Comparative
   listComparative: (workflowId: string) => request<TenderComparative[]>(`/api/tender-prep/${workflowId}/comparative`),
   upsertComparative: (workflowId: string, input: Omit<TenderComparative, 'id' | 'workflow_id'>) =>
@@ -666,5 +736,12 @@ export const portalApi = {
   addLine: (token: string, input: PortalNewLineInput) =>
     portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}/lines`, { method: 'POST', body: JSON.stringify(input) }),
   deleteLine: (token: string, lineId: string) =>
-    portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}/lines/${encodeURIComponent(lineId)}`, { method: 'DELETE' })
+    portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}/lines/${encodeURIComponent(lineId)}`, { method: 'DELETE' }),
+  // Raising a query and reading one's own history use the SAME link and the same identity
+  // binding as pricing — a tenderer has one credential, not two.
+  raiseRfi: (token: string, input: PortalRfiInput) =>
+    portalRequest<CommsThreadDetail>(`/portal/${encodeURIComponent(token)}/rfi`, { method: 'POST', body: JSON.stringify(input) }),
+  // Null is an ordinary answer: nothing has been raised yet.
+  thread: (token: string) =>
+    portalRequest<CommsThreadDetail | null>(`/portal/${encodeURIComponent(token)}/thread`)
 };

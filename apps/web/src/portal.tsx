@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { portalApi, type PortalLineStatus } from './api';
+import { CommsTimeline } from './comms';
 
 type PortalLineEdit = { quantity: string; rate: string; status: PortalLineStatus; note: string };
 
@@ -126,6 +127,8 @@ export function PortalPage() {
       <p className="muted">Pricing on behalf of {pkg.tenderer_name} ({pkg.recipient_email})</p>
       {pkg.tender_return_deadline && <p className="muted">Return by {pkg.tender_return_deadline}</p>}
     </div>
+
+    <RequestInformation token={token} recipientEmail={pkg.recipient_email} />
 
     {submitted && <div className="alert alert-green">
       Submitted{pkg.submitted_at ? ` on ${new Date(pkg.submitted_at).toLocaleString()}` : ''}. This return is now
@@ -282,4 +285,145 @@ function PortalShell({ children }: { children: React.ReactNode }) {
 function PortalError({ error }: { error: unknown }) {
   const message = error instanceof Error ? error.message : 'Something went wrong';
   return <p className="error">{message}</p>;
+}
+
+/**
+ * "Request information" — a tenderer raising a query without leaving the pricing page.
+ *
+ * It collects a NAME AND EMAIL even though the link already identifies the firm, and that
+ * is the point rather than an oversight: the person raising a query is routinely a
+ * colleague of the estimator the ITT was addressed to. Their address is recorded on the
+ * MESSAGE so the buyer knows who actually asked, while the THREAD stays keyed on the firm
+ * so one firm has one conversation rather than one per person.
+ *
+ * The email is pre-filled from the link's recipient because that is right most of the
+ * time, and editable because it is not right every time.
+ *
+ * The same history is shown back here, rendered by the same component the buyer sees — so
+ * neither side can end up with a view of the conversation the other does not have.
+ */
+function RequestInformation({ token, recipientEmail }: { token: string; recipientEmail: string }) {
+  const queryClient = useQueryClient();
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState({ authorName: '', authorEmail: recipientEmail, subject: '', body: '' });
+  const [files, setFiles] = useState<File[]>([]);
+
+  const history = useQuery({ queryKey: ['portal-thread', token], queryFn: () => portalApi.thread(token) });
+
+  const raise = useMutation({
+    mutationFn: async () => {
+      const attachments = await Promise.all(files.map(async (file) => ({
+        filename: file.name,
+        contentBase64: await toBase64(file)
+      })));
+      return portalApi.raiseRfi(token, {
+        authorName: form.authorName.trim(),
+        authorEmail: form.authorEmail.trim(),
+        subject: form.subject.trim() || null,
+        body: form.body.trim(),
+        attachments
+      });
+    },
+    onSuccess: (thread) => {
+      queryClient.setQueryData(['portal-thread', token], thread);
+      setForm((prev) => ({ ...prev, subject: '', body: '' }));
+      setFiles([]);
+      setOpen(false);
+    }
+  });
+
+  const canSend = form.authorName.trim().length > 0
+    && form.authorEmail.trim().length > 0
+    && form.body.trim().length > 0;
+
+  const messages = history.data?.messages ?? [];
+
+  return <div className="panel">
+    <div className="inline-form" style={{ justifyContent: 'space-between' }}>
+      <h3 style={{ margin: 0 }}>Questions about this package</h3>
+      <button className="secondary" onClick={() => setOpen(true)}>Request information</button>
+    </div>
+
+    {messages.length > 0 && <div style={{ marginTop: 12 }}>
+      <CommsTimeline messages={messages} />
+    </div>}
+
+    {open && <div className="modal-backdrop" onClick={() => setOpen(false)}>
+      <div className="modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-header">
+          <h3>Request information</h3>
+          <button className="modal-close" onClick={() => setOpen(false)} aria-label="Close">×</button>
+        </div>
+        <div className="modal-body">
+          {raise.error && <PortalError error={raise.error} />}
+          <div className="compose-field">
+            <label htmlFor="rfi-name">Your name</label>
+            <input
+              id="rfi-name" type="text" value={form.authorName}
+              onChange={(event) => setForm((prev) => ({ ...prev, authorName: event.target.value }))}
+            />
+          </div>
+          <div className="compose-field">
+            <label htmlFor="rfi-email">Your email</label>
+            <input
+              id="rfi-email" type="email" value={form.authorEmail}
+              onChange={(event) => setForm((prev) => ({ ...prev, authorEmail: event.target.value }))}
+            />
+          </div>
+          <div className="compose-field">
+            <label htmlFor="rfi-subject">Subject</label>
+            <input
+              id="rfi-subject" type="text" value={form.subject}
+              onChange={(event) => setForm((prev) => ({ ...prev, subject: event.target.value }))}
+            />
+          </div>
+          <div className="compose-field">
+            <label htmlFor="rfi-body">Question</label>
+            <textarea
+              id="rfi-body" rows={6} value={form.body}
+              onChange={(event) => setForm((prev) => ({ ...prev, body: event.target.value }))}
+            />
+          </div>
+          <div className="compose-field">
+            <label htmlFor="rfi-files">Files</label>
+            <input
+              id="rfi-files" type="file" multiple
+              onChange={(event) => setFiles(Array.from(event.target.files ?? []).slice(0, 5))}
+            />
+          </div>
+          <p className="tiny muted">
+            Your question goes to the estimating team, who will answer it or put it to the
+            client. Anything they send back appears on this page.
+          </p>
+        </div>
+        <div className="modal-footer">
+          <button className="secondary" onClick={() => setOpen(false)} disabled={raise.isPending}>Cancel</button>
+          <button onClick={() => raise.mutate()} disabled={!canSend || raise.isPending}>
+            {raise.isPending ? 'Sending…' : 'Send'}
+          </button>
+        </div>
+      </div>
+    </div>}
+  </div>;
+}
+
+/**
+ * A file as base64, without the `data:` prefix FileReader adds.
+ *
+ * Base64 in the JSON body rather than multipart: this BFF registers no multipart parser,
+ * and adding one for a single optional file on one route is more surface than the ~33%
+ * encoding overhead costs. The server caps the DECODED size, which is the figure that
+ * actually matters.
+ */
+function toBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}`));
+    reader.onload = () => {
+      const result = String(reader.result);
+      const comma = result.indexOf(',');
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(file);
+  });
 }

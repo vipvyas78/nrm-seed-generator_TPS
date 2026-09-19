@@ -1,4 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
+import type { BuildflowCommsAttachmentsClient } from './buildflowCommsAttachmentsClient.js';
+import type { CommsAttachmentInput, CommsDatabase } from './commsDb.js';
 import type { BuildflowBundle, BuildflowDocumentBundlesClient } from './buildflowDocumentBundlesClient.js';
 import type { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
 import { templateLinesAsBoqRows, type BuildflowMepBoqClient } from './buildflowMepBoqClient.js';
@@ -17,7 +20,20 @@ import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js'
 import { deriveReturnDate, isTenderReturnUnit } from './tenderReturnPeriod.js';
 import type { Actor } from './types.js';
 
-/** Every ITT email is sent from this address, regardless of who confirms it in the UI. */
+/**
+ * What every ITT was sent from before BuildFlow issue #34 made it configurable, and still
+ * the fallback for an organisation that has not configured anything.
+ *
+ * The configured value lives in `public.itt_comms_config` (BuildFlow migration 088), which
+ * this module reads UNQUALIFIED through its own `search_path=tps,public` — the same way it
+ * already reads work_package_config and itt_attachment_templates. There is no second copy
+ * and no HTTP call, so a change on BuildFlow's Configuration page applies to the very next
+ * ITT sent from here.
+ *
+ * This literal is duplicated on the BuildFlow side (apps/bff/src/ittComms.ts). That is
+ * unavoidable — the two processes share a database, not a module — and it is safe because
+ * it is a FALLBACK on both sides rather than a value either of them writes.
+ */
 const ITT_FROM_ADDRESS = 'tenders@novamerx.ai';
 
 /**
@@ -219,7 +235,15 @@ export class TenderPrepDatabase {
     private readonly portalLinkTtlDays: number = 90,
     // Optional: without one configured, a WP-MEP-* package's bill is the measured
     // take-off lines exactly as it was before BuildFlow issue #28 — see mepTemplateLines.
-    private readonly mepBoq?: BuildflowMepBoqClient
+    private readonly mepBoq?: BuildflowMepBoqClient,
+    // Optional: without one configured, no subcontractor query can be raised or read and
+    // the portal shows no query form at all — the tender behaves exactly as it did before
+    // BuildFlow issue #34.
+    private readonly commsDb?: CommsDatabase,
+    // Optional: without one configured, a query can still be raised but NOT with a file
+    // attached. Refused outright rather than accepted and dropped — see
+    // storeCommsAttachments.
+    private readonly commsAttachments?: BuildflowCommsAttachmentsClient
   ) {}
 
   /**
@@ -2459,7 +2483,7 @@ export class TenderPrepDatabase {
     // Test mode redirects the whole message to one inbox and drops the cc list, so exercising
     // this against a real package cannot reach a real subcontractor. The subject names who it
     // was meant for, since every test send lands in the same place.
-    const from = this.testEmailOverride?.from ?? ITT_FROM_ADDRESS;
+    const from = this.testEmailOverride?.from ?? await this.ittFromAddress(actor.organizationId);
     const subject = this.testEmailOverride
       ? `[TEST → ${[...to, ...cc].join(', ')}] ${input.subject}`
       : input.subject;
@@ -2639,7 +2663,7 @@ export class TenderPrepDatabase {
 
     let sent = 0, failed = 0, skippedNoEmail = 0;
     const detail: Array<{ subcontractorId: string; packages: string[]; status: string; error?: string }> = [];
-    const from = this.testEmailOverride?.from ?? ITT_FROM_ADDRESS;
+    const from = this.testEmailOverride?.from ?? await this.ittFromAddress(actor.organizationId);
 
     for (const [subcontractorId, packages] of byFirm) {
       const packageNamesForFirm = [...packages.keys()];
@@ -2784,7 +2808,7 @@ export class TenderPrepDatabase {
     let sent = 0, failed = 0, skippedNoEmail = 0;
     const detail: Array<{ subcontractorId: string; status: string; error?: string }> = [];
 
-    const from = this.testEmailOverride?.from ?? ITT_FROM_ADDRESS;
+    const from = this.testEmailOverride?.from ?? await this.ittFromAddress(actor.organizationId);
 
     for (const recipient of recipients) {
       const subcontractorId = String(recipient.subcontractor_id);
@@ -3038,6 +3062,174 @@ export class TenderPrepDatabase {
     if (link.submitted_at) throw conflict('This return has already been submitted and can no longer be edited.');
     await this.portalDb!.deleteLine(String(link.id), lineId);
     return this.getPortalPackage(token, accessEmail);
+  }
+
+  // ── Subcontractor queries (RFIs) ──────────────────────────────────────────
+  //
+  // BuildFlow issue #34. The store is the `comms` schema and lives behind commsDb;
+  // everything about WHO may read or write is decided here, exactly as it is for the
+  // pricing portal above.
+
+  /**
+   * The address this organisation sends ITTs from.
+   *
+   * Read unqualified-except-for-`public` from BuildFlow's own configuration table, so a
+   * change on their Configuration page takes effect on the next send with no deploy and
+   * no second copy. Falls back to the literal every ITT used before it was configurable —
+   * an organisation that has never opened that page must keep sending exactly as it did.
+   */
+  private async ittFromAddress(organizationId: string): Promise<string> {
+    const [row] = await this.db.query<Row>(
+      `SELECT itt_from_address FROM public.itt_comms_config
+        WHERE organization_id = $1 AND project_id IS NULL`,
+      [organizationId]
+    );
+    return row?.itt_from_address ? String(row.itt_from_address) : ITT_FROM_ADDRESS;
+  }
+
+  /** The organisation a workflow belongs to. Needed because `comms` carries no
+   *  cross-schema foreign keys, so it stores the id rather than joining for it. */
+  private async organizationForWorkflow(workflowId: string): Promise<string> {
+    const [row] = await this.db.query<Row>(`SELECT organization_id FROM workflows WHERE id = $1`, [workflowId]);
+    if (!row) throw notFound('This tender no longer exists.');
+    return String(row.organization_id);
+  }
+
+  /**
+   * A subcontractor raising a query from their own pricing-portal link.
+   *
+   * The THREAD is keyed on the firm — the portal link's recipient — while the MESSAGE
+   * records whoever actually typed it. That distinction is the point of the form asking
+   * for a name and email at all: the person raising a query is routinely a colleague of
+   * the estimator the ITT was addressed to, and filing their query under their own
+   * address would give one firm several unrelated conversations.
+   *
+   * The package IS known here, because the link is per (package x firm), so the message
+   * carries `shortlist_entry_id` and the form needs no package selector.
+   *
+   * Attachments are stored BEFORE the message is recorded, and a storage failure aborts
+   * the whole thing. The other order would leave a row promising a file that does not
+   * exist, which nobody could diagnose months later.
+   */
+  async raisePortalRfi(token: string, accessEmail: string | null, input: {
+    authorName: string; authorEmail: string; subject: string | null; body: string;
+    attachments: Array<{ filename: string; content: Uint8Array<ArrayBuffer> }>;
+  }): Promise<{ thread: Row; messages: Row[] }> {
+    if (!this.commsDb) throw notFound('Queries are not available for this tender.');
+    const link = await this.resolvePortalToken(token, accessEmail);
+    const workflowId = String(link.workflow_id);
+    const organizationId = await this.organizationForWorkflow(workflowId);
+
+    const stored = await this.storeCommsAttachments(organizationId, input.attachments);
+
+    const thread = await this.commsDb.findOrCreateThread({
+      organizationId,
+      workflowId,
+      counterpartyKind: 'subcontractor',
+      counterpartyEmail: String(link.recipient_email),
+      counterpartyName: link.tenderer_name != null ? String(link.tenderer_name) : null,
+      subcontractorId: link.subcontractor_id != null ? String(link.subcontractor_id) : null,
+      subject: input.subject
+    });
+
+    await this.commsDb.recordMessage({
+      threadId: String(thread.id),
+      organizationId,
+      workflowId,
+      shortlistEntryId: String(link.shortlist_entry_id),
+      direction: 'inbound',
+      channel: 'portal',
+      kind: 'subcontractor_rfi',
+      authorName: input.authorName,
+      authorEmail: input.authorEmail,
+      subject: input.subject,
+      bodyText: input.body,
+      attachments: stored
+    });
+
+    return this.commsDb.getThread(String(thread.id));
+  }
+
+  /** What a subcontractor sees of their own conversation — one thread, never a list, and
+   *  only the one their link belongs to. */
+  async getPortalThread(token: string, accessEmail: string | null): Promise<{ thread: Row; messages: Row[] } | null> {
+    if (!this.commsDb) return null;
+    const link = await this.resolvePortalToken(token, accessEmail);
+    const thread = await this.commsDb.threadForCounterparty({
+      workflowId: String(link.workflow_id),
+      counterpartyKind: 'subcontractor',
+      counterpartyEmail: String(link.recipient_email)
+    });
+    if (!thread) return null;
+    return this.commsDb.getThread(String(thread.id));
+  }
+
+  /** Every conversation on one tender, for the Communications modal on ITT Dispatch. */
+  async listCommsThreads(actor: Actor, workflowId: string): Promise<Row[]> {
+    if (!this.commsDb) return [];
+    await this.assertWorkflowAccess(actor, workflowId);
+    return this.commsDb.listThreadsForWorkflow(workflowId);
+  }
+
+  /**
+   * One conversation in full.
+   *
+   * Authorised through the thread's WORKFLOW where it has one, so this inherits exactly
+   * the same rule as every other read on this tender. A thread with no workflow is an
+   * untriaged inbound message that could not be attributed to a tender at all; there is
+   * no workflow to check, so it falls back to the organisation — which is the only
+   * boundary such a message actually has.
+   */
+  async getCommsThread(actor: Actor, threadId: string): Promise<{ thread: Row; messages: Row[] }> {
+    if (!this.commsDb) throw notFound('Queries are not available.');
+    const result = await this.commsDb.getThread(threadId);
+    if (result.thread.workflow_id) {
+      await this.assertWorkflowAccess(actor, String(result.thread.workflow_id));
+    } else if (String(result.thread.organization_id) !== actor.organizationId) {
+      throw notFound('This conversation no longer exists.');
+    }
+    return result;
+  }
+
+  /**
+   * Puts each attachment in BuildFlow's object store and returns what to record.
+   *
+   * The attachment id is minted HERE, before the upload, because it is what the object
+   * key is built from — never the filename, which on an inbound email is chosen by
+   * whoever sent it.
+   *
+   * Throws if storage is unavailable, and the caller lets that fail the whole message.
+   * Unlike the ITT's document links, which degrade to an email without them, a query with
+   * its drawing silently missing is worse than a query that visibly failed to send.
+   */
+  private async storeCommsAttachments(
+    organizationId: string, attachments: Array<{ filename: string; content: Uint8Array<ArrayBuffer> }>
+  ): Promise<CommsAttachmentInput[]> {
+    if (attachments.length === 0) return [];
+    if (!this.commsAttachments) {
+      throw conflict('Attachments cannot be accepted at the moment. Send your query without one, or email it.');
+    }
+    const stored: CommsAttachmentInput[] = [];
+    for (const attachment of attachments) {
+      const id = randomUUID();
+      const result = await this.commsAttachments.store({
+        organizationId, attachmentId: id, filename: attachment.filename, content: attachment.content
+      });
+      stored.push({
+        id,
+        filename: attachment.filename,
+        contentType: result.contentType,
+        byteSize: result.byteSize,
+        sha256: result.sha256,
+        objectKey: result.objectKey,
+        // Stored verbatim. BUILDFLOW_COMMS_ATTACHMENTS_API.md: embed `url`, never
+        // construct it — the base we hold is the internal one, unreachable from a browser.
+        shareUrl: result.url,
+        shareToken: result.token,
+        shareExpiresAt: result.expiresAt
+      });
+    }
+    return stored;
   }
 
   // ── Step 3: Comparative ───────────────────────────────────────────────────

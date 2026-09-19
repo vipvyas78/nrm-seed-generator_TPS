@@ -3,6 +3,7 @@ import { Fragment, FormEvent, useEffect, useState } from 'react';
 import { Link, Outlet, useNavigate, useParams } from 'react-router-dom';
 import { api, TENDER_RETURN_MAX, type ConfirmIttResult, type IttDispatch, type IttLetterDetailsInput, type IttLineSection, type IttPack, type LaunchTableRow, type PortalResponseSummary, type SendAllIttsResult, type SendIttDraftResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow, type TenderReturnUnit } from './api';
 import { oidc, signIn } from './auth';
+import { CommsModal } from './comms';
 
 export function ErrorMessage({ error }: { error: unknown }) {
   return error ? <p className="error">{error instanceof Error ? error.message : 'Something went wrong'}</p> : null;
@@ -1035,6 +1036,10 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
   const [open, setOpen] = useState<string | null>(null);
   const [draftOpen, setDraftOpen] = useState<string | null>(null);
   const [responsesOpen, setResponsesOpen] = useState<string | null>(null);
+  // Per TENDER, not per package: a firm's queries are one conversation whichever package
+  // they are invited to, and an email carries no package at all. So the control sits in
+  // the header beside "Send all ITTs" rather than on a package row.
+  const [commsOpen, setCommsOpen] = useState(false);
   const [lastResult, setLastResult] = useState<ConfirmIttResult | null>(null);
   const [sendAllResult, setSendAllResult] = useState<SendAllIttsResult | null>(null);
   const queryClient = useQueryClient();
@@ -1099,9 +1104,14 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
             : `A firm invited to several of the ${confirmedPackages} confirmed package${confirmedPackages === 1 ? '' : 's'} receives a single email covering all of them, rather than one per package.`}
         </div>
       </div>
-      <button className="small" disabled={confirmedPackages === 0 || sendAll.isPending} onClick={() => sendAll.mutate()}>
-        {sendAll.isPending ? 'Sending…' : 'Send all ITTs'}
-      </button>
+      <span className="inline-form">
+        <button className="small secondary" onClick={() => setCommsOpen(true)}>
+          Communications
+        </button>
+        <button className="small" disabled={confirmedPackages === 0 || sendAll.isPending} onClick={() => sendAll.mutate()}>
+          {sendAll.isPending ? 'Sending…' : 'Send all ITTs'}
+        </button>
+      </span>
     </div>
 
     {sendAll.error && <ErrorMessage error={sendAll.error} />}
@@ -1207,6 +1217,8 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
       packageName={responsesOpen}
       onClose={() => setResponsesOpen(null)}
     />}
+
+    {commsOpen && <CommsModal workflowId={workflowId} onClose={() => setCommsOpen(false)} />}
   </div>;
 }
 

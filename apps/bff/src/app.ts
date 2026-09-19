@@ -5,6 +5,8 @@ import { buildAccessVerifier } from './accessJwt.js';
 import { buildAuthenticator, requireActor } from './auth.js';
 import type { Config } from './config.js';
 import { CloudflareAccessAdmin } from './cloudflareAccess.js';
+import { CommsDatabase } from './commsDb.js';
+import { BuildflowCommsAttachmentsClient } from './buildflowCommsAttachmentsClient.js';
 import { Database } from './db.js';
 import { AppError } from './errors.js';
 import { BoqReadDatabase } from './boqReadDb.js';
@@ -20,6 +22,19 @@ import { TenderPrepDatabase } from './tenderPrepDb.js';
 import { TENDER_RETURN_MAX, TENDER_RETURN_UNITS } from './tenderReturnPeriod.js';
 
 const uuid = z.string().uuid();
+
+/**
+ * What a subcontractor may attach to one query, and how big the request carrying it may be.
+ *
+ * Two numbers rather than one, and they are not the same thing. The REQUEST limit is what
+ * Fastify refuses outright, and has to allow for base64's ~33% overhead plus the JSON
+ * envelope. The ATTACHMENT limit is measured on the DECODED bytes, which is the figure a
+ * person would recognise, and is what the error message talks about — `Buffer.from(…,
+ * 'base64')` silently discards anything that is not base64, so the encoded length proves
+ * nothing about what actually arrived.
+ */
+const RFI_ATTACHMENT_BYTE_LIMIT = 8 * 1024 * 1024;
+const RFI_REQUEST_BYTE_LIMIT = 12 * 1024 * 1024;
 
 function body<T extends z.ZodTypeAny>(request: FastifyRequest, schema: T): z.infer<T> {
   return schema.parse(request.body);
@@ -73,6 +88,15 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   // every recipient as blocked ('access_unconfigured') and the ITT sends exactly as it
   // did before this feature existed. See config.ts for what each variable gates.
   const portalDb = new PricingPortalDatabase(db);
+  // The RFI message store (schema `comms`, migration 022). Unconditional: it needs only
+  // the database, exactly as portalDb does.
+  const commsDb = new CommsDatabase(db);
+  // Gated on the SAME pair as the other four BuildFlow clients, so a half-configured
+  // deployment is not a thing that exists. Without it a query can still be raised, just
+  // not with a file attached — and that is refused outright rather than silently dropped.
+  const commsAttachments = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
+    ? new BuildflowCommsAttachmentsClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
+    : undefined;
   // Falls back to WEB_ORIGIN so a portal link and the Cloudflare Access destination it must
   // match (cloudflareAccess.ts's `portalHost`) can never drift apart from each other just
   // because PORTAL_BASE_URL is unset — see tenderPrepDb.ts's use of this same value below.
@@ -88,7 +112,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const tpDb = new TenderPrepDatabase(
     db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, documentBundles,
     emailService, testEmailOverride, portalDb, accessAdmin, portalBaseUrl, config.PORTAL_LINK_TTL_DAYS,
-    mepBoq
+    mepBoq, commsDb, commsAttachments
   );
 
   app.decorate('tps', { config, db, tpDb, scmsDb });
@@ -179,6 +203,62 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     const { token, lineId } = params(request, portalLineIdParams);
     const identity = await verifyAccessIdentity(request);
     return tpDb.deletePortalLine(token, identity?.email ?? null, lineId);
+  });
+
+  // ── Subcontractor queries, raised from the same portal link ────────────────────
+  //
+  // Same authentication as every route above it — Cloudflare Access at the edge plus the
+  // token-to-recipient binding `resolvePortalToken` enforces in this process. Nothing new
+  // to configure and nothing new to get wrong.
+  //
+  // Attachments arrive base64-encoded inside the JSON body rather than as multipart: this
+  // BFF registers no multipart parser, and adding one for a single optional file on one
+  // route is more surface than the encoding costs. `bodyLimit` is raised for this route
+  // ALONE, because Fastify's default is 1MB and a single drawing exceeds it — a limit that
+  // would otherwise present as an opaque 413 on exactly the queries worth attaching
+  // something to.
+  app.post('/portal/:token/rfi', {
+    bodyLimit: RFI_REQUEST_BYTE_LIMIT
+  }, async (request) => {
+    const { token } = params(request, portalTokenParams);
+    const identity = await verifyAccessIdentity(request);
+    const input = body(request, z.object({
+      // Collected, not assumed. The person raising a query is routinely a colleague of
+      // the estimator the ITT was addressed to.
+      authorName: z.string().trim().min(1).max(200),
+      authorEmail: z.string().trim().email().max(320),
+      subject: z.string().trim().max(300).nullish(),
+      body: z.string().trim().min(1).max(20000),
+      attachments: z.array(z.object({
+        filename: z.string().trim().min(1).max(400),
+        contentBase64: z.string().max(RFI_REQUEST_BYTE_LIMIT)
+      })).max(5).default([])
+    }));
+    const attachments = input.attachments.map((attachment) => ({
+      filename: attachment.filename,
+      // Buffer.from ignores anything that is not base64 rather than throwing, so the
+      // decoded length is checked below instead of trusting the encoded one.
+      content: Uint8Array.from(Buffer.from(attachment.contentBase64, 'base64'))
+    }));
+    const totalBytes = attachments.reduce((sum, attachment) => sum + attachment.content.byteLength, 0);
+    if (totalBytes > RFI_ATTACHMENT_BYTE_LIMIT) {
+      throw new AppError(413, 'Those files are too large to send here. Email them instead.', 'ATTACHMENTS_TOO_LARGE');
+    }
+    return tpDb.raisePortalRfi(token, identity?.email ?? null, {
+      authorName: input.authorName,
+      authorEmail: input.authorEmail,
+      subject: input.subject ?? null,
+      body: input.body,
+      attachments
+    });
+  });
+
+  // A tenderer's own history: one thread, never a list, and only the one their link
+  // belongs to. `null` means they have raised nothing yet, which is an ordinary answer.
+  app.get('/portal/:token/thread', async (request) => {
+    const { token } = params(request, portalTokenParams);
+    const identity = await verifyAccessIdentity(request);
+    return tpDb.getPortalThread(token, identity?.email ?? null);
   });
 
   await app.register(async (protectedApi) => {
@@ -569,6 +649,25 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     protectedApi.post('/api/tender-prep/:workflowId/portal-responses/:linkId/reopen', async (request) => {
       const { workflowId, linkId } = params(request, z.object({ workflowId: uuid, linkId: uuid }));
       return tpDb.reopenPortalResponse(requireActor(request), workflowId, linkId);
+    });
+
+    // ── Subcontractor queries: the buyer's side ─────────────────────────────
+    //
+    // The "Communications" modal on ITT Dispatch. Listed per tender and opened per
+    // thread, because a thread is a conversation with one firm and the list is the set of
+    // firms currently talking to us.
+    protectedApi.get('/api/tender-prep/:workflowId/threads', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.listCommsThreads(requireActor(request), workflowId);
+    });
+
+    // Addressed by thread rather than nested under the workflow: a thread that could not
+    // be attributed to a tender at all has no workflow to nest under, and inventing a
+    // placeholder one to keep the URL tidy would make the untriaged case unreachable.
+    // getCommsThread authorises through the thread's own workflow where it has one.
+    protectedApi.get('/api/comms/threads/:threadId', async (request) => {
+      const { threadId } = params(request, z.object({ threadId: uuid }));
+      return tpDb.getCommsThread(requireActor(request), threadId);
     });
 
     // ── Step 3: Comparative ─────────────────────────────────────────────────

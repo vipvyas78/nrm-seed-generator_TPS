@@ -20,6 +20,10 @@ The TPS services join the parent's external Docker network `buildflow` and share
 
 The parent platform owns the `buildflow` database and its `public` schema. TPS keeps every one of its objects in its own **`tps` schema**, including its own `tps.schema_migrations` ledger — it never writes to the parent's `public.bf_schema_migrations`. The BFF connects with `search_path=tps,public`, so the parent's `bf_*` identity tables stay reachable and are referenced explicitly as `public.bf_*`.
 
+TPS also **creates and migrates a second schema, `comms`** (migration `022`), which holds subcontractor and Client correspondence: threads, messages, attachments, forwards and notifications. It is a separate module rather than more `tps.` tables because it is fed by a Cloudflare Email Worker living in its own repository (`novamerx-comms-worker`) and read by two different front ends. It carries **no cross-schema foreign keys** — `workflow_id`, `shortlist_entry_id`, `organization_id` and `subcontractor_id` are bare UUIDs, the same rule TPS already follows for its own links out — so the store can move repositories without unpicking anything. `search_path` is deliberately **not** widened to include it: every reference is written `comms.`-qualified, the same way `public.bf_*` and `scms.*` are, and `apps/bff/src/commsDb.ts` is the only file that names a `comms.` table. Its migration is applied by TPS's runner and recorded in `tps.schema_migrations`, because a Cloudflare Worker cannot reach a private Postgres — it POSTs over HTTPS and holds no connection string.
+
+Attachment **bytes** are not stored here at all. TPS has no object storage and no S3 client; a file goes to BuildFlow through `POST /internal/comms/attachments` and comes back as a durable link, because the primitive that serves a file to someone who is not a BuildFlow user lives where the bucket is. See `BUILDFLOW_COMMS_ATTACHMENTS_API.md` in the parent repo.
+
 Links out of TPS (`package_id`, `organization_id`, `created_by`, and `subcontractor_id` → `scms.subcontractors`) are bare UUIDs with no cross-schema foreign keys, by design.
 
 ### Reading the SCMS schema
