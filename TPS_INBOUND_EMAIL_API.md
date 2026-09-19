@@ -135,9 +135,22 @@ whole message is the one outcome that must not happen.
 | `202` | `{"status":"recorded","messageId":…,"threadId":…,"attributed":true|false,"attributionMethod":…}` | done |
 | `200` | `{"status":"duplicate","threadId":…}` | done — already stored |
 | `401` | `UNAUTHENTICATED` / `BAD_SIGNATURE` | do not retry; alert |
-| `413` | `MESSAGE_TOO_LARGE` | re-post truncated (§7) |
+| `413` | *(see below)* | re-post truncated (§7) |
 | `422` | `VALIDATION_FAILED` / `UNKNOWN_RECIPIENT` | do not retry; alert |
 | `5xx` | — | **retry with backoff** |
+
+### Branch on the 413 STATUS CODE, never on the error string
+
+A 413 can come from three places and only one of them says `MESSAGE_TOO_LARGE`:
+
+| source | body |
+|---|---|
+| the app's attachment cap | `{"error":"MESSAGE_TOO_LARGE", ...}` |
+| Fastify's own `bodyLimit` | `{"error":"REQUEST_FAILED", ...}` — it is a generic 4xx to the error handler |
+| nginx, if a limit is ever set below the app's | **HTML**, not JSON at all |
+
+So a worker that keys its truncation retry on the string silently stops retrying the moment
+the body limit rather than the attachment cap is what fired. Key it on the status.
 
 **`attributed: false` is a success.** It means the message was stored but could not be tied
 to a tender — an unknown sender, or a firm on no shortlist. It lands in a triage thread and
