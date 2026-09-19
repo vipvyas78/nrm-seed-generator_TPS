@@ -318,6 +318,9 @@ Both repos provision actors through the issuer `buildflow-dev` and upsert on `(o
 | `BUILDFLOW_DOCUMENT_LINKS_TOKEN` | No | — | Shared secret for both BuildFlow internal routes. **Must equal `TPS_INTERNAL_TOKEN` on the BuildFlow side** (compose default `buildflow-tps-dev-token`) or every call 401s. Unset, the ITT still sends and says so in its review notes. |
 | `ENGINE_INTERNAL_URL` | No | — | Internal URL of the Python API |
 | `ENGINE_INTERNAL_TOKEN` | No | — | Bearer token for BFF→API calls |
+| `INBOUND_EMAIL_TOKEN` | No | — | Bearer for `POST /internal/email/inbound`. Set **with** the signing secret or the BFF refuses to boot; unset, the route does not exist. |
+| `INBOUND_EMAIL_SIGNING_SECRET` | No | — | HMAC secret for the same route. Required because it is the one endpoint reachable from the public internet — see `TPS_INBOUND_EMAIL_API.md`. |
+| `CLIENT_LINK_TTL_DAYS` | No | `30` | How long a client's in-app reply link lives. |
 | `LOG_LEVEL` | No | `info` | Fastify log level |
 
 ### Web (`apps/web`) — build-time args

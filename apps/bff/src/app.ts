@@ -6,6 +6,9 @@ import { buildAuthenticator, requireActor } from './auth.js';
 import type { Config } from './config.js';
 import { CloudflareAccessAdmin } from './cloudflareAccess.js';
 import { CommsDatabase } from './commsDb.js';
+import {
+  decodedAttachmentBytes, idempotencyKeyFor, inboundEmailPayload, verifyInboundSignature
+} from './inboundEmail.js';
 import { BuildflowCommsAttachmentsClient } from './buildflowCommsAttachmentsClient.js';
 import { Database } from './db.js';
 import { AppError } from './errors.js';
@@ -35,6 +38,18 @@ const uuid = z.string().uuid();
  */
 const RFI_ATTACHMENT_BYTE_LIMIT = 8 * 1024 * 1024;
 const RFI_REQUEST_BYTE_LIMIT = 12 * 1024 * 1024;
+
+/**
+ * The same pair for an inbound email, and the same distinction.
+ *
+ * 20MB of request allows for base64's ~33% overhead plus the JSON envelope and the raw
+ * .eml copy, against ~15MB of message — Cloudflare Email Routing caps a message near
+ * 25MB anyway. Fastify's own default is 1MB, which every real email with a drawing
+ * attached would exceed, presenting as an opaque 413 on exactly the messages worth
+ * keeping.
+ */
+const INBOUND_ATTACHMENT_BYTE_LIMIT = 15 * 1024 * 1024;
+const INBOUND_EMAIL_BYTE_LIMIT = 20 * 1024 * 1024;
 
 function body<T extends z.ZodTypeAny>(request: FastifyRequest, schema: T): z.infer<T> {
   return schema.parse(request.body);
@@ -112,7 +127,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const tpDb = new TenderPrepDatabase(
     db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, documentBundles,
     emailService, testEmailOverride, portalDb, accessAdmin, portalBaseUrl, config.PORTAL_LINK_TTL_DAYS,
-    mepBoq, commsDb, commsAttachments
+    mepBoq, commsDb, commsAttachments, config.CLIENT_LINK_TTL_DAYS
   );
 
   app.decorate('tps', { config, db, tpDb, scmsDb });
@@ -260,6 +275,87 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     const identity = await verifyAccessIdentity(request);
     return tpDb.getPortalThread(token, identity?.email ?? null);
   });
+
+  // ── The Client's reply page: PUBLIC, same shape as the portal above ────────────
+  //
+  // Declared here for the same reason every /portal route is: the Client is not a
+  // BuildFlow user and carries no OIDC bearer. Cloudflare Access gates the path at the
+  // edge — which is why forwardQueriesToClient unions the Client addresses into the
+  // include list BEFORE the email leaves — and `resolveClientToken` proves in this
+  // process that the verified identity matches the link.
+  app.get('/client/:token', async (request) => {
+    const { token } = params(request, portalTokenParams);
+    const identity = await verifyAccessIdentity(request);
+    return tpDb.getClientReplyPage(token, identity?.email ?? null);
+  });
+
+  app.post('/client/:token', async (request) => {
+    const { token } = params(request, portalTokenParams);
+    const identity = await verifyAccessIdentity(request);
+    const input = body(request, z.object({ body: z.string().trim().min(1).max(20000) }));
+    return tpDb.submitClientReply(token, identity?.email ?? null, { body: input.body });
+  });
+
+  // ── Inbound email, from the Cloudflare Email Worker ────────────────────────────
+  //
+  // Registered ONLY when both secrets are set. Unset, this route does not exist at all
+  // and the feature is in-app only — which is a far better failure than a route that
+  // accepts unauthenticated mail from the internet.
+  //
+  // THIS IS THE ONE ENDPOINT IN EITHER REPO REACHABLE FROM THE PUBLIC INTERNET. Every
+  // other /internal/* route is called over the shared Docker network, so a bearer is
+  // enough for them. Here a leaked bearer would let anyone forge the Client's answer to a
+  // tender query, so the body is signed as well and the timestamp sits inside the
+  // signature. See TPS_INBOUND_EMAIL_API.md.
+  if (config.INBOUND_EMAIL_TOKEN && config.INBOUND_EMAIL_SIGNING_SECRET) {
+    const inboundToken = config.INBOUND_EMAIL_TOKEN;
+    const inboundSecret = config.INBOUND_EMAIL_SIGNING_SECRET;
+    await app.register(async (inbound) => {
+      // An encapsulated scope so this parser applies to this route ALONE. The signature
+      // covers the bytes that arrived, so the raw string has to survive parsing — and
+      // making every route in the app keep its raw body to serve one would be a cost
+      // paid on every request.
+      inbound.addContentTypeParser<string>(
+        'application/json', { parseAs: 'string', bodyLimit: INBOUND_EMAIL_BYTE_LIMIT },
+        (request, rawBody, done) => {
+          (request as FastifyRequest & { rawBody?: string }).rawBody = rawBody;
+          try {
+            done(null, JSON.parse(rawBody));
+          } catch {
+            done(new AppError(422, 'Body is not valid JSON', 'VALIDATION_FAILED'));
+          }
+        }
+      );
+
+      inbound.post('/internal/email/inbound', { bodyLimit: INBOUND_EMAIL_BYTE_LIMIT }, async (request, reply) => {
+        if (request.headers.authorization !== `Bearer ${inboundToken}`) {
+          throw new AppError(401, 'Invalid inbound email token', 'UNAUTHENTICATED');
+        }
+        const verification = verifyInboundSignature({
+          secret: inboundSecret,
+          signatureHeader: request.headers['x-tps-signature'] as string | undefined,
+          timestampHeader: request.headers['x-tps-timestamp'] as string | undefined,
+          rawBody: (request as FastifyRequest & { rawBody?: string }).rawBody ?? ''
+        });
+        if (!verification.ok) {
+          throw new AppError(401, `Signature ${verification.reason}`, 'BAD_SIGNATURE');
+        }
+
+        const payload = inboundEmailPayload.parse(request.body);
+        if (decodedAttachmentBytes(payload) > INBOUND_ATTACHMENT_BYTE_LIMIT) {
+          throw new AppError(413, 'Attachments exceed the inbound limit', 'MESSAGE_TOO_LARGE');
+        }
+        const key = idempotencyKeyFor(payload, request.headers['idempotency-key'] as string | undefined);
+
+        // 202, and a DUPLICATE is a 200 rather than a 409: a retry from a Worker is
+        // ordinary traffic, and a 4xx would make it retry for ever. Anything that failed
+        // to persist throws instead, so the Worker retries — never 2xx a message that
+        // was not stored.
+        const result = await tpDb.ingestInboundEmail(payload, key);
+        return reply.status(result.status === 'duplicate' ? 200 : 202).send(result);
+      });
+    });
+  }
 
   await app.register(async (protectedApi) => {
     protectedApi.addHook('preHandler', buildAuthenticator(config, db));
@@ -668,6 +764,52 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     protectedApi.get('/api/comms/threads/:threadId', async (request) => {
       const { threadId } = params(request, z.object({ threadId: uuid }));
       return tpDb.getCommsThread(requireActor(request), threadId);
+    });
+
+    protectedApi.get('/api/tender-prep/:workflowId/queries', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.listCommsQueries(requireActor(request), workflowId);
+    });
+
+    protectedApi.get('/api/tender-prep/:workflowId/client-answers', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.listClientAnswers(requireActor(request), workflowId);
+    });
+
+    // What to pre-fill the forward form with: the Client contact this organisation
+    // configured in BuildFlow. Overridable on the form — the configured contact is a
+    // default, not a rule.
+    protectedApi.get('/api/tender-prep/:workflowId/comms-defaults', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.commsDefaults(requireActor(request), workflowId);
+    });
+
+    // Several selected queries put to the Client as ONE message. The ids are checked
+    // against this tender server-side: assertWorkflowAccess vouches for the workflow, not
+    // for a list of message ids a caller supplied.
+    protectedApi.post('/api/tender-prep/:workflowId/threads/forward', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const input = body(request, z.object({
+        messageIds: z.array(uuid).min(1).max(50),
+        clientEmail: z.string().trim().email('The client needs a valid email address').max(320),
+        clientName: z.string().trim().max(200).nullish(),
+        note: z.string().trim().max(4000).nullish()
+      }));
+      return tpDb.forwardQueriesToClient(requireActor(request), workflowId, {
+        messageIds: input.messageIds,
+        clientEmail: input.clientEmail,
+        clientName: input.clientName ?? null,
+        note: input.note ?? null
+      });
+    });
+
+    // The Client's answer passed back to the firms that asked. The recipients are derived
+    // from comms.forward_items, never chosen by the caller — letting a caller pick would
+    // let an answer reach a competitor pricing the same package.
+    protectedApi.post('/api/comms/messages/:messageId/relay', async (request) => {
+      const { messageId } = params(request, z.object({ messageId: uuid }));
+      const input = body(request, z.object({ note: z.string().trim().max(4000).nullish() }));
+      return tpDb.relayClientAnswer(requireActor(request), messageId, { note: input.note ?? null });
     });
 
     // ── Step 3: Comparative ─────────────────────────────────────────────────

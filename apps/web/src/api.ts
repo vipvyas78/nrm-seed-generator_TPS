@@ -535,6 +535,55 @@ export type CommsThreadSummary = CommsThread & {
 
 export type CommsThreadDetail = { thread: CommsThread; messages: CommsMessage[] };
 
+/** One query in the tender-wide list the forward selects from. */
+export type CommsQuery = {
+  id: string; thread_id: string;
+  subject: string | null; body_text: string | null; occurred_at: string;
+  author_name: string | null; author_email: string | null;
+  counterparty_name: string | null; counterparty_email: string;
+  attachment_count: string;
+  /** Set once this query has been put to the Client — so it is not sent twice. */
+  forwarded_at: string | null;
+};
+
+/** A Client answer, and whether it has been passed back yet. */
+export type ClientAnswer = {
+  id: string; body_text: string | null; occurred_at: string;
+  in_reply_to_message_id: string | null;
+  counterparty_name: string | null; counterparty_email: string;
+  covers: string; relayed: boolean;
+};
+
+/** What a forward put to the Client, and what came of it. */
+export type ForwardResult = {
+  forward_message_id: string; thread_id: string; forwarded: number;
+  sent: boolean; error?: string;
+  /** Why no in-app reply link could be issued. The email still went, and says so. */
+  link_blocked_reason: 'public_email_domain' | 'access_unconfigured' | null;
+  reply_url: string | null;
+};
+
+export type RelayResult = {
+  relayed: number;
+  recipients: Array<{ thread_id: string; to: string; status: string; error?: string }>;
+};
+
+/** The Client contact configured in BuildFlow, used to pre-fill the forward form. */
+export type CommsDefaults = {
+  client_contact_name: string | null;
+  client_contact_email: string | null;
+  itt_comms_address: string | null;
+};
+
+/** What the Client sees on their own reply page. The firm that asked is deliberately not
+ *  named: which subcontractor raised a query is commercially ours, not theirs. */
+export type ClientReplyPage = {
+  project_name: string | null;
+  recipient_email: string;
+  queries: Array<{ id: string; subject: string | null; body_text: string | null; raised_at: string }>;
+  messages: CommsMessage[];
+};
+
 export type PortalRfiInput = {
   authorName: string;
   authorEmail: string;
@@ -683,6 +732,23 @@ export const api = {
     request<CommsThreadSummary[]>(`/api/tender-prep/${workflowId}/threads`),
   getCommsThread: (threadId: string) =>
     request<CommsThreadDetail>(`/api/comms/threads/${threadId}`),
+  listCommsQueries: (workflowId: string) =>
+    request<CommsQuery[]>(`/api/tender-prep/${workflowId}/queries`),
+  listClientAnswers: (workflowId: string) =>
+    request<ClientAnswer[]>(`/api/tender-prep/${workflowId}/client-answers`),
+  commsDefaults: (workflowId: string) =>
+    request<CommsDefaults>(`/api/tender-prep/${workflowId}/comms-defaults`),
+  forwardQueries: (workflowId: string, input: {
+    messageIds: string[]; clientEmail: string; clientName: string | null; note: string | null;
+  }) => request<ForwardResult>(`/api/tender-prep/${workflowId}/threads/forward`, {
+    method: 'POST', body: JSON.stringify(input)
+  }),
+  // The recipients are derived server-side from what the forward carried — never chosen
+  // here, or an answer could reach a competitor pricing the same package.
+  relayClientAnswer: (messageId: string, note: string | null) =>
+    request<RelayResult>(`/api/comms/messages/${messageId}/relay`, {
+      method: 'POST', body: JSON.stringify({ note })
+    }),
 
   // Step 3: Comparative
   listComparative: (workflowId: string) => request<TenderComparative[]>(`/api/tender-prep/${workflowId}/comparative`),
@@ -744,4 +810,18 @@ export const portalApi = {
   // Null is an ordinary answer: nothing has been raised yet.
   thread: (token: string) =>
     portalRequest<CommsThreadDetail | null>(`/portal/${encodeURIComponent(token)}/thread`)
+};
+
+/**
+ * The Client's own reply page. A sibling of `portalApi`, not part of `api`, for exactly
+ * the same reason: the Client is not a BuildFlow user, so a dev header on `request()`
+ * would provision an actor for them. Same runtime-resolved base URL, so the host-scoped
+ * Cloudflare Access cookie rides along.
+ */
+export const clientApi = {
+  get: (token: string) => portalRequest<ClientReplyPage>(`/client/${encodeURIComponent(token)}`),
+  reply: (token: string, body: string) =>
+    portalRequest<{ recorded: boolean }>(`/client/${encodeURIComponent(token)}`, {
+      method: 'POST', body: JSON.stringify({ body })
+    })
 };

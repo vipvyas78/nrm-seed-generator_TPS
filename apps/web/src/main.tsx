@@ -4,6 +4,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { TenderDashboardPage } from './dashboard';
 import { AppShell, AuthCallback, PackagesListPage, TenderPrepPage } from './pages';
 import { PortalPage } from './portal';
+import { ClientReplyPage } from './clientReply';
 import './styles.css';
 
 const client = new QueryClient({ defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } } });
@@ -22,6 +23,9 @@ export function Main() {
             outside <AppShell/> for the same reason /auth/callback is: no BuildFlow
             branding or sign-in button belongs in front of an external visitor. */}
         <Route path="/respond/:token" element={<PortalPage />} />
+        {/* The Client's own reply page. Outside AppShell, beside the portal, for the same
+            reason: the viewer is not a BuildFlow user. */}
+        <Route path="/client/:token" element={<ClientReplyPage />} />
         <Route element={<AppShell />}>
           <Route path="/" element={<PackagesListPage />} />
           {/* Where BuildFlow's projects page links once a take-off is tendered, carrying its

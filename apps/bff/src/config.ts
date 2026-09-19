@@ -74,6 +74,25 @@ const schema = z.object({
   // loadConfig refuses this in production, below.
   PORTAL_ACCESS_REQUIRED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
   PORTAL_LINK_TTL_DAYS: z.coerce.number().int().positive().default(90),
+
+  // ── Inbound email (BuildFlow issue #34) ──────────────────────────────────────
+  //
+  // POST /internal/email/inbound is registered ONLY when BOTH of these are set. Unset,
+  // the route does not exist and the feature is in-app only — a subcontractor can still
+  // raise a query from their pricing link, and nothing silently accepts unauthenticated
+  // mail.
+  //
+  // TWO secrets, not one, and this is the only endpoint in either repo that needs both.
+  // Every other /internal/* route is reached over the shared Docker network; this one is
+  // reachable from the public internet, because the Cloudflare Email Worker
+  // (`novamerx-comms-worker`, its own repository) runs at the edge. A leaked bearer alone
+  // would let anyone forge the Client's answer to a tender query, so the body is signed
+  // as well. See TPS_INBOUND_EMAIL_API.md.
+  INBOUND_EMAIL_TOKEN: z.string().min(16).optional(),
+  INBOUND_EMAIL_SIGNING_SECRET: z.string().min(32).optional(),
+  // How long a Client's reply link stays live. Shorter than a portal link by default: a
+  // tender query is answered in days, and the link is a bearer capability in an inbox.
+  CLIENT_LINK_TTL_DAYS: z.coerce.number().int().positive().default(30),
   // Optional here on purpose: migrate.ts calls loadConfig() and migrate-tps has no Redis.
   // The worker requires it through loadWorkerConfig below.
   REDIS_URL: z.string().min(1).optional(),
@@ -118,6 +137,15 @@ export function loadConfig(input: NodeJS.ProcessEnv = process.env): Config {
   }
   if (config.NODE_ENV === 'production' && !config.PORTAL_ACCESS_REQUIRED) {
     throw new Error('PORTAL_ACCESS_REQUIRED must not be disabled in production');
+  }
+  // Half-configured is the dangerous state, not unconfigured. With a token and no signing
+  // secret the route would still exist, and would accept anything presenting the bearer —
+  // from anywhere on the internet. Refused at boot rather than discovered later.
+  if (Boolean(config.INBOUND_EMAIL_TOKEN) !== Boolean(config.INBOUND_EMAIL_SIGNING_SECRET)) {
+    throw new Error(
+      'INBOUND_EMAIL_TOKEN and INBOUND_EMAIL_SIGNING_SECRET must be set together. '
+      + 'The inbound email route is reachable from the public internet and requires both.'
+    );
   }
   return config;
 }
