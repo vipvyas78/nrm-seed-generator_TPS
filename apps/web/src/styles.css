@@ -237,3 +237,39 @@ code { font-family: monospace; font-size: 0.85em; background: #f3f4f6; padding: 
 .approve-icon:hover { background: var(--green, #2e7d32); color: #fff; }
 .dashboard-table td { vertical-align: top; }
 .dashboard-table .num { text-align: right; }
+
+/* The notification bell, in the shell on every page (issue #34).
+   `header nav.header-nav` claims the auto margin so the bell and the sign-in button do
+   not each take half the free space and leave a gap between them — the same fix the
+   BuildFlow shell carries for the same reason. */
+header nav.header-nav { margin-left: auto; display: flex; gap: 12px; align-items: center; }
+header nav.header-nav .link-button { margin-left: 0; }
+.bell-button {
+  position: relative; background: none; border: none; color: #e2e8f0; cursor: pointer;
+  padding: 4px; line-height: 0; border-radius: 6px;
+}
+.bell-button:hover { background: rgba(255, 255, 255, .12); }
+.bell-icon { position: relative; display: inline-block; line-height: 0; }
+/* The count, not just a dot: "3 firms are waiting on you" and "one is" are different
+   days, and the badge is the only place that number appears before the modal opens. */
+.bell-dot {
+  position: absolute; top: -6px; right: -8px; min-width: 16px; height: 16px; padding: 0 4px;
+  border-radius: 999px; background: #dc2626; color: #fff; font-size: .65rem; line-height: 16px;
+  text-align: center; font-weight: 600;
+}
+.notification-row {
+  display: flex; flex-direction: column; gap: 4px; width: 100%; text-align: left;
+  background: #fff; border: 1px solid #e5e7eb; border-left: 3px solid #2563eb;
+  border-radius: 6px; padding: 10px 12px; cursor: pointer; font: inherit; color: inherit;
+}
+.notification-row:hover { background: #f8fafc; }
+/* Read rows stay in the list rather than disappearing — the bell is a history as well as
+   an inbox, and a notification that vanishes on click cannot be found again. */
+.notification-row.is-read { border-left-color: #cbd5e1; opacity: .7; }
+.notification-body { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* The dashboard's per-firm query icon: leading cell, against the contractor that asked. */
+.query-cell { text-align: center; }
+.query-icon { text-decoration: none; font-size: .95rem; line-height: 1; color: #2563eb; }
+.query-icon:hover { text-decoration: none; }
+.query-icon.is-outstanding { color: #d97706; }
+.query-icon .query-count { font-size: .65rem; font-weight: 600; vertical-align: super; }

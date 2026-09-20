@@ -67,6 +67,20 @@ const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;
  * not buried. "No performance history" is stated outright rather than shown as a zero,
  * because unrated and bad are not the same thing.
  */
+/**
+ * A one-line preview of a message, for a notification that has no subject.
+ *
+ * Truncated on a character count rather than a word boundary: the text came from outside
+ * the organisation, and a "smart" summariser is one more thing that can be wrong about
+ * somebody else's words. Whitespace is collapsed so a pasted email body does not render
+ * as a blank line in the bell.
+ */
+function firstLine(body: string | null, limit = 140): string | null {
+  const text = body?.replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
 function describeSuggestion(c: Row): string {
   const parts: string[] = [];
   const trades = (c.matched_trades as string[] | null) ?? [];
@@ -1878,6 +1892,32 @@ export class TenderPrepDatabase {
       [workflowId]
     );
 
+    // Which firms have asked for clarification, so the dashboard can put the icon the
+    // issue asks for against them. Its own round trip rather than a join into the query
+    // above, because `comms` is owned by another repository and `commsDb.ts` is the only
+    // file here allowed to name it — one indexed read is a cheaper price than a second
+    // file in that blast radius. Absent comms, every firm simply has no icon.
+    const queryThreads = this.commsDb ? await this.commsDb.threadQueryCountsForWorkflow(workflowId) : [];
+    // Ordered most-recent-first by the query, so the first thread seen for a firm is the
+    // one to open. A firm writing from two addresses genuinely has two conversations —
+    // the counts add up, the deep link goes to the live one.
+    const commsBy = new Map<string, { thread_id: string; queries: number; outstanding: number }>();
+    for (const thread of queryThreads) {
+      if (thread.subcontractor_id == null) continue;
+      const key = String(thread.subcontractor_id);
+      const existing = commsBy.get(key);
+      if (existing) {
+        existing.queries += Number(thread.query_count ?? 0);
+        existing.outstanding += Number(thread.outstanding_count ?? 0);
+      } else {
+        commsBy.set(key, {
+          thread_id: String(thread.thread_id),
+          queries: Number(thread.query_count ?? 0),
+          outstanding: Number(thread.outstanding_count ?? 0)
+        });
+      }
+    }
+
     // Keyed as a JSON pair rather than a joined string: a package name is free text, so any
     // separator picked here is one a client could put in a package name.
     const key = (packageName: unknown, subcontractorId: unknown) =>
@@ -1935,7 +1975,13 @@ export class TenderPrepDatabase {
               tendered_sum: tenderReturn?.tendered_sum ?? null,
               // Test data travels through the same tables as a real bid, and every read that
               // reaches a human has to say which it is looking at.
-              is_fabricated: tenderReturn?.is_fabricated ?? false
+              is_fabricated: tenderReturn?.is_fabricated ?? false,
+              // Per FIRM, not per package: a thread is one conversation with one firm
+              // across this tender, so the same icon appears on each package that firm
+              // is pricing. That is the truth — the query was asked once.
+              query_count: commsBy.get(String(row.subcontractor_id))?.queries ?? 0,
+              outstanding_queries: commsBy.get(String(row.subcontractor_id))?.outstanding ?? 0,
+              comms_thread_id: commsBy.get(String(row.subcontractor_id))?.thread_id ?? null
             };
           })
       } as Row;
@@ -3116,6 +3162,30 @@ export class TenderPrepDatabase {
     return row?.project_name != null ? String(row.project_name) : null;
   }
 
+  /**
+   * Where a notification about this conversation should send its reader.
+   *
+   * Stored on the notification at write time, so it says where the event MEANT rather
+   * than where that tender has got to by the time anyone clicks.
+   *
+   * A thread attributed to a tender opens that tender's Communications modal, on the firm
+   * in question — which is the ITT Dispatch step, exactly as the issue asks. A thread
+   * with no workflow has no such page: nobody could work out which tender it belongs to,
+   * so it opens the cross-tender timeline instead, which is the only place an untriaged
+   * conversation is reachable at all.
+   */
+  private async commsDeepLink(workflowId: string | null, threadId: string): Promise<string> {
+    if (workflowId) {
+      const [row] = await this.db.query<Row>(
+        `SELECT package_id FROM workflows WHERE id = $1`, [workflowId]
+      );
+      if (row?.package_id) {
+        return `/packages/${String(row.package_id)}/tender-prep?thread=${threadId}`;
+      }
+    }
+    return `/communications?thread=${threadId}`;
+  }
+
   /** The organisation a workflow belongs to. Needed because `comms` carries no
    *  cross-schema foreign keys, so it stores the id rather than joining for it. */
   private async organizationForWorkflow(workflowId: string): Promise<string> {
@@ -3173,7 +3243,17 @@ export class TenderPrepDatabase {
       authorEmail: input.authorEmail,
       subject: input.subject,
       bodyText: input.body,
-      attachments: stored
+      attachments: stored,
+      // The firm is the thread's counterparty; the person is whoever filled the form in.
+      // Both are named, because "Acme Drylining" is what a buyer recognises and
+      // "Sam Patel" is who they reply to.
+      notify: {
+        kind: 'subcontractor_rfi',
+        title: `${thread.counterparty_name ?? thread.counterparty_email} raised a query`,
+        body: input.subject ?? firstLine(input.body),
+        deepLinkPath: await this.commsDeepLink(workflowId, String(thread.id)),
+        subcontractorId: link.subcontractor_id != null ? String(link.subcontractor_id) : null
+      }
     });
 
     return this.commsDb.getThread(String(thread.id));
@@ -3232,6 +3312,88 @@ export class TenderPrepDatabase {
       throw notFound('This conversation no longer exists.');
     }
     return result;
+  }
+
+  // ── Notifications, and the cross-tender timeline ──────────────────────────
+
+  /**
+   * What the bell shows: this organisation's communications events, newest first, each
+   * carrying whether THIS reader has seen it.
+   *
+   * Scoped by the actor's own organisation and never by a parameter — a notification list
+   * is the one read where "show me another organisation's" has no legitimate caller, and
+   * every id it hands out is a thread somebody can then open.
+   *
+   * Degrades to an empty list rather than throwing when comms is not configured, exactly
+   * as `listCommsThreads` does: a shell that renders a bell on every page must not be able
+   * to break every page.
+   */
+  async listNotifications(actor: Actor, options: { limit?: number; unreadOnly?: boolean } = {}): Promise<Row> {
+    if (!this.commsDb) return { items: [], unread: 0 };
+    const [items, unread] = await Promise.all([
+      this.commsDb.listNotifications({
+        organizationId: actor.organizationId, userId: actor.userId,
+        limit: options.limit, unreadOnly: options.unreadOnly
+      }),
+      this.commsDb.unreadNotificationCount(actor.organizationId, actor.userId)
+    ]);
+    return { items, unread };
+  }
+
+  /** Marks notifications read for this reader. An empty list means everything — which is
+   *  what "mark all as read" sends, rather than the client enumerating 200 ids. */
+  async markNotificationsRead(actor: Actor, notificationIds: string[]): Promise<Row> {
+    if (!this.commsDb) return { marked: 0, unread: 0 };
+    const marked = await this.commsDb.markNotificationsRead({
+      organizationId: actor.organizationId, userId: actor.userId,
+      notificationIds: notificationIds.length > 0 ? notificationIds : null
+    });
+    return { marked, unread: await this.commsDb.unreadNotificationCount(actor.organizationId, actor.userId) };
+  }
+
+  /**
+   * Every conversation this organisation has, across every tender — the timeline behind
+   * the bell, and the only view in which "filter by tender" is a question with more than
+   * one answer.
+   *
+   * The tender name is resolved HERE rather than in `comms`, which holds no cross-schema
+   * foreign keys by design. A thread whose workflow has since been deleted keeps its id
+   * and reads as an unknown tender rather than vanishing: the conversation happened.
+   */
+  async commsTimeline(actor: Actor): Promise<Row> {
+    if (!this.commsDb) return { threads: [], tenders: [] };
+    const threads = await this.commsDb.listThreadsForOrganisation(actor.organizationId);
+    const workflowIds = [...new Set(threads
+      .map((thread) => (thread.workflow_id != null ? String(thread.workflow_id) : null))
+      .filter((id): id is string => id != null))];
+    const workflows = workflowIds.length === 0 ? [] : await this.db.query<Row>(
+      // Package name first, project name second: the rest of this app labels a workflow
+      // by its package (PackagesListPage, the dashboard picker), and the project is what
+      // a workflow started before the take-off landed has instead. Either is a name
+      // somebody recognises; the id is not, so it is the last resort and lives in the UI.
+      `SELECT id::text AS id, package_id::text AS package_id,
+              COALESCE(step_data -> 'takeoff' ->> 'packageName',
+                       step_data -> 'takeoff' ->> 'projectName') AS package_name
+         FROM workflows WHERE id = ANY($1::uuid[]) AND organization_id = $2`,
+      [workflowIds, actor.organizationId]
+    );
+    const byId = new Map(workflows.map((row) => [String(row.id), row]));
+    return {
+      threads: threads.map((thread) => {
+        const workflow = thread.workflow_id != null ? byId.get(String(thread.workflow_id)) : undefined;
+        return {
+          ...thread,
+          package_id: workflow?.package_id ?? null,
+          tender_name: workflow?.package_name ?? null
+        };
+      }),
+      // The filter's options, derived from the threads that exist rather than from every
+      // tender: a filter offering fifty tenders with no conversation on them is a list to
+      // scroll past, not a filter.
+      tenders: [...byId.values()].map((workflow) => ({
+        workflow_id: workflow.id, package_id: workflow.package_id, name: workflow.package_name
+      }))
+    };
   }
 
   // ── The Client's own reply page ───────────────────────────────────────────
@@ -3304,7 +3466,14 @@ export class TenderPrepDatabase {
       inReplyToMessageId: String(link.forward_message_id),
       // In-app, so the identity is the Access one rather than anything a mail header
       // claimed. Recorded as such so a reviewer can tell the two apart later.
-      attributionMethod: 'reply_token'
+      attributionMethod: 'reply_token',
+      notify: {
+        kind: 'client_reply',
+        title: 'The client answered your queries',
+        body: firstLine(input.body),
+        deepLinkPath: await this.commsDeepLink(
+          link.workflow_id != null ? String(link.workflow_id) : null, String(link.thread_id))
+      }
     });
     await this.commsDb!.setThreadStatus(String(link.thread_id), 'answered');
     return { recorded: message != null };
@@ -3361,7 +3530,26 @@ export class TenderPrepDatabase {
       inReplyToMessageId: resolved.inReplyToMessageId,
       rawObjectKey: stored.rawObjectKey,
       attachmentsTruncated: payload.attachmentsTruncated,
-      attachments: stored.attachments
+      attachments: stored.attachments,
+      // A message nobody could attribute gets its OWN notification kind rather than
+      // being announced as a query on a tender it was never placed on. It is the one
+      // most worth a human's attention and the one a buyer is least likely to find by
+      // looking — the bell is the only route to it.
+      notify: resolved.workflowId == null
+        ? {
+            kind: 'unattributed_email',
+            title: `Unattributed email from ${payload.from.name ?? sender}`,
+            body: payload.subject ?? firstLine(payload.textBody ?? null),
+            deepLinkPath: await this.commsDeepLink(null, resolved.threadId)
+          }
+        : {
+            kind: resolved.kind === 'client_reply' ? 'client_reply' : 'subcontractor_rfi',
+            title: resolved.kind === 'client_reply'
+              ? 'The client answered your queries'
+              : `${payload.from.name ?? sender} raised a query`,
+            body: payload.subject ?? firstLine(payload.textBody ?? null),
+            deepLinkPath: await this.commsDeepLink(resolved.workflowId, resolved.threadId)
+          }
     });
 
     if (!message) return { status: 'duplicate', thread_id: resolved.threadId, attributed: resolved.workflowId != null };
@@ -3649,6 +3837,24 @@ export class TenderPrepDatabase {
     });
     await this.commsDb.setExternalMessageId(String(forward.id), sent.externalMessageId);
     await this.commsDb.setThreadStatus(String(thread.id), 'awaiting_client');
+
+    // A forward that did not send is the one failure here nobody sees. The caller is
+    // told in its response, but that response is gone the moment the page is closed,
+    // while the thread now says "awaiting client" of an employer who was never asked.
+    // Raised AFTER the send rather than with the message, because whether it sent is not
+    // knowable inside the transaction that recorded it.
+    if (!sent.ok) {
+      await this.commsDb.recordNotification({
+        kind: 'forward_failed',
+        organizationId,
+        workflowId,
+        threadId: String(thread.id),
+        messageId: String(forward.id),
+        title: `Queries to ${input.clientEmail} did not send`,
+        body: sent.error ?? 'The email was recorded but the provider rejected it.',
+        deepLinkPath: await this.commsDeepLink(workflowId, String(thread.id))
+      });
+    }
 
     return {
       forward_message_id: forward.id, thread_id: thread.id,

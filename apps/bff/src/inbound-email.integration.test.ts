@@ -260,4 +260,68 @@ describe('inbound email', () => {
         .rejects.toThrow(/not linked to any query/);
     });
   });
+
+  // -- the notification bell (issue #34) -------------------------------------
+  //
+  // The half that can only be exercised here: WHERE a notification sends its reader.
+  // The path is stored at write time, so it has to be resolved from the tender the
+  // message was attributed to -- and getting it wrong is silent, because a link that
+  // goes to the wrong tender still looks like a link.
+  describe('what the bell says', () => {
+    it('sends a query to its own tender, and an untriaged email to the timeline', async () => {
+      const known = await tpDb.ingestInboundEmail(
+        payload({ subject: 'Bell test' }), `<bell-${randomUUID()}@mail.test>`);
+      const stranger = `stranger-${randomUUID().slice(0, 8)}@gmail.com`;
+      const untriaged = await tpDb.ingestInboundEmail(
+        payload({ from: { address: stranger, name: 'Jo Bloggs' }, subject: 'Who are you' }),
+        `<bell-untriaged-${randomUUID()}@mail.test>`);
+
+      const feed = await tpDb.listNotifications(actor, { limit: 100 });
+      const items = feed.items as Array<Record<string, unknown>>;
+
+      const forKnown = items.find((item) => String(item.thread_id) === String(known.thread_id));
+      expect(forKnown, 'a query raised by email must reach the bell').toBeDefined();
+      expect(forKnown!.kind).toBe('subcontractor_rfi');
+      // The package id, not the workflow id: the link is a TPS route, and TPS addresses
+      // a tender by BuildFlow's package id -- the only identifier the two modules share.
+      const [workflow] = await db.query<{ package_id: string }>(
+        `SELECT package_id::text AS package_id FROM workflows WHERE id = $1`, [workflowId]);
+      expect(forKnown!.deep_link_path)
+        .toBe(`/packages/${workflow.package_id}/tender-prep?thread=${known.thread_id}`);
+
+      const forUntriaged = items.find((item) => String(item.thread_id) === String(untriaged.thread_id));
+      expect(forUntriaged!.kind).toBe('unattributed_email');
+      // There is no tender page for a message nobody could place, so it goes to the
+      // cross-tender timeline -- the only view it is reachable from at all.
+      expect(forUntriaged!.deep_link_path).toBe(`/communications?thread=${untriaged.thread_id}`);
+      expect(forUntriaged!.workflow_id).toBeNull();
+    });
+
+    it('offers the tenders that actually have conversations, and nothing else', async () => {
+      const timeline = await tpDb.commsTimeline(actor);
+      const tenders = timeline.tenders as Array<{ workflow_id: string; name: string | null }>;
+      // Derived from the threads that exist. A filter offering every tender in the
+      // organisation would be a list to scroll past rather than a filter.
+      expect(tenders.map((tender) => tender.workflow_id)).toEqual([workflowId]);
+      expect(tenders[0].name).toBe('Reading Riverside');
+
+      const threads = timeline.threads as Array<{ workflow_id: string | null; tender_name: string | null }>;
+      // The untriaged thread is listed, not hidden: it is the one most worth looking at.
+      expect(threads.some((thread) => thread.workflow_id == null)).toBe(true);
+      expect(threads.some((thread) => thread.tender_name === 'Reading Riverside')).toBe(true);
+    });
+
+    it('counts unread for this reader, and stops counting once they have read it', async () => {
+      const before = await tpDb.listNotifications(actor, { limit: 100 });
+      expect(Number(before.unread)).toBeGreaterThan(0);
+      const marked = await tpDb.markNotificationsRead(actor, []);
+      expect(Number(marked.unread)).toBe(0);
+
+      // A colleague on the same tender has read none of it. Two estimators each need to
+      // see a query arrive, so read state cannot be a property of the notification.
+      const colleague: Actor = { ...actor, userId: randomUUID(), subject: 'colleague' };
+      const theirs = await tpDb.listNotifications(colleague, { limit: 100 });
+      expect(Number(theirs.unread)).toBe(Number(before.unread));
+    });
+  });
 });

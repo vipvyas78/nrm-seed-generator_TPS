@@ -17,8 +17,12 @@ import { notFound } from './errors.js';
  * So this file staying the ONLY non-test file in TPS that names a `comms.` table is not a
  * tidiness preference — it keeps the blast radius of a schema change to one file, and
  * `commsBoundary.test.ts` asserts it rather than trusting this comment.
- * The one deliberate exception is the per-firm RFI count on the tender dashboard, which
- * has to be a LATERAL join against a `tps` query to avoid a second round trip.
+ *
+ * THERE IS NO EXCEPTION, INCLUDING THE ONE PLANNED FOR. The per-firm query count on the
+ * tender dashboard was going to be a LATERAL join written into the `tps` dashboard query
+ * to save a round trip; it is `threadQueryCountsForWorkflow` below instead, joined to the
+ * firms in JavaScript. One indexed read per dashboard load is not worth putting a second
+ * file in the blast radius of a schema this repository is not allowed to change.
  *
  * Nothing here knows about actors or workflow-as-authorization. The caller
  * (`tenderPrepDb.ts`) owns that, exactly as it does for the pricing portal.
@@ -45,6 +49,27 @@ export type CounterpartyKind = 'subcontractor' | 'client';
 export type AttributionMethod =
   | 'reply_token' | 'subject_marker' | 'in_reply_to' | 'sender_email' | 'sender_domain' | 'manual';
 
+export type NotificationKind =
+  | 'subcontractor_rfi' | 'client_reply' | 'forward_failed' | 'unattributed_email';
+
+/**
+ * What the bell says, decided by the caller rather than derived here.
+ *
+ * `deepLinkPath` is stored at write time on purpose, the rule
+ * `tps.shortlist_entries.suggestion_reason` already follows: where a reader is sent should
+ * be where the event MEANT, not wherever that tender has got to by the time somebody
+ * clicks. A thread that could not be attributed to a tender has no ITT Dispatch page to
+ * open, so its link goes to the cross-tender timeline instead — which is the only place
+ * an untriaged conversation is reachable at all.
+ */
+export interface NotificationInput {
+  kind: NotificationKind;
+  title: string;
+  body: string | null;
+  deepLinkPath: string;
+  subcontractorId?: string | null;
+}
+
 export type MessageKind =
   | 'subcontractor_rfi' | 'client_forward' | 'client_reply' | 'relay_to_subcontractor' | 'note';
 
@@ -65,6 +90,9 @@ export interface RecordMessageInput {
   idempotencyKey?: string | null;
   createdBy?: string | null;
   attachments?: CommsAttachmentInput[];
+  /** Tell somebody about this message. Written in the SAME transaction as the message —
+   *  see `NotificationInput`. */
+  notify?: NotificationInput | null;
 
   // ── provenance, for anything that arrived by email ───────────────────────
   /** Which of the three routes attached this message to its thread. Recorded so a
@@ -242,6 +270,18 @@ export class CommsDatabase {
            attachments.map((a) => a.shareUrl),
            attachments.map((a) => a.shareToken),
            attachments.map((a) => a.shareExpiresAt)],
+          client
+        );
+      }
+
+      // In the SAME transaction as the message it is about, which is what makes "a
+      // message nobody was told about" unrepresentable rather than merely unlikely. The
+      // other order — notify after committing — loses the notification on any crash
+      // between the two, and the symptom is a query sitting unread for a week.
+      if (input.notify) {
+        await this.insertNotification(
+          { ...input.notify, organizationId: input.organizationId, workflowId: input.workflowId,
+            threadId: input.threadId, messageId: String(message.id) },
           client
         );
       }
@@ -437,6 +477,164 @@ export class CommsDatabase {
 
   async setThreadStatus(threadId: string, status: 'open' | 'awaiting_client' | 'answered' | 'closed'): Promise<void> {
     await this.db.query(`UPDATE comms.threads SET status = $2 WHERE id = $1`, [threadId, status]);
+  }
+
+  // ── notifications ─────────────────────────────────────────────────────────
+
+  /**
+   * One notification, keyed on the message it is about.
+   *
+   * `ON CONFLICT (message_id) DO NOTHING` rather than an upsert: a second attempt to
+   * announce the same message is a redelivery, not a correction, and rewriting the title
+   * would change what somebody has already read. Private, because every caller should be
+   * going through `recordMessage`'s `notify` — `recordNotification` below is the one
+   * exception and says why.
+   */
+  private async insertNotification(input: NotificationInput & {
+    organizationId: string; workflowId: string | null; threadId: string | null; messageId: string | null;
+  }, client?: Parameters<Database['query']>[2]): Promise<void> {
+    await this.db.query(
+      `INSERT INTO comms.notifications
+         (organization_id, kind, thread_id, message_id, workflow_id, subcontractor_id,
+          title, body, deep_link_path)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT (message_id) DO NOTHING`,
+      [input.organizationId, input.kind, input.threadId, input.messageId, input.workflowId,
+       input.subcontractorId ?? null, input.title, input.body, input.deepLinkPath],
+      client
+    );
+  }
+
+  /**
+   * A notification raised AFTER its message was committed.
+   *
+   * The one case is `forward_failed`: the forward is recorded first and sent second,
+   * because a send that half-worked must still leave a record of what was put to the
+   * Client. So whether it failed is not knowable inside the transaction that wrote it.
+   * `message_id` being UNIQUE still makes this idempotent.
+   */
+  async recordNotification(input: NotificationInput & {
+    organizationId: string; workflowId: string | null; threadId: string | null; messageId: string | null;
+  }): Promise<void> {
+    await this.insertNotification(input);
+  }
+
+  /**
+   * The bell's list: this organisation's notifications, newest first, each carrying
+   * whether THIS reader has seen it.
+   *
+   * Read state is per-user and joined rather than filtered, so "5 unread of 20" and the
+   * list itself come from one shape. An organisation-wide read-all would be wrong: two
+   * estimators on the same tender each need to see a query arrive.
+   */
+  async listNotifications(input: {
+    organizationId: string; userId: string; limit?: number; unreadOnly?: boolean;
+  }): Promise<Row[]> {
+    return this.db.query<Row>(
+      `SELECT n.id, n.kind, n.title, n.body, n.deep_link_path, n.created_at,
+              n.thread_id, n.workflow_id, n.subcontractor_id, r.read_at
+         FROM comms.notifications n
+         LEFT JOIN comms.notification_reads r ON r.notification_id = n.id AND r.user_id = $2
+        WHERE n.organization_id = $1
+          AND ($4::boolean IS NOT TRUE OR r.read_at IS NULL)
+        ORDER BY n.created_at DESC
+        LIMIT $3`,
+      [input.organizationId, input.userId, Math.min(input.limit ?? 50, 200), input.unreadOnly ?? false]
+    );
+  }
+
+  async unreadNotificationCount(organizationId: string, userId: string): Promise<number> {
+    const [row] = await this.db.query<{ unread: string }>(
+      `SELECT COUNT(*) AS unread
+         FROM comms.notifications n
+         LEFT JOIN comms.notification_reads r ON r.notification_id = n.id AND r.user_id = $2
+        WHERE n.organization_id = $1 AND r.read_at IS NULL`,
+      [organizationId, userId]
+    );
+    return Number(row?.unread ?? 0);
+  }
+
+  /**
+   * Marks notifications read for one reader. An empty list means "everything".
+   *
+   * Scoped by organisation in the statement rather than trusted from the caller's list of
+   * ids: a read row is harmless on its own, but an id from another organisation landing
+   * here would be the first place this store stopped being org-scoped.
+   */
+  async markNotificationsRead(input: {
+    organizationId: string; userId: string; notificationIds: string[] | null;
+  }): Promise<number> {
+    const rows = await this.db.query<{ notification_id: string }>(
+      `INSERT INTO comms.notification_reads (notification_id, user_id)
+       SELECT n.id, $2 FROM comms.notifications n
+        WHERE n.organization_id = $1
+          AND ($3::uuid[] IS NULL OR n.id = ANY($3::uuid[]))
+       ON CONFLICT DO NOTHING
+       RETURNING notification_id`,
+      [input.organizationId, input.userId,
+       input.notificationIds && input.notificationIds.length > 0 ? input.notificationIds : null]
+    );
+    return rows.length;
+  }
+
+  // ── cross-tender reads ────────────────────────────────────────────────────
+
+  /**
+   * Every conversation this organisation has, across tenders — what the bell's timeline
+   * filters.
+   *
+   * `workflow_id` is carried rather than resolved here because `comms` holds no
+   * cross-schema foreign keys: the caller turns it into a tender name. NULL is the
+   * untriaged case and is a legitimate filter option of its own, not a row to hide — an
+   * email nobody could attribute is exactly the one worth looking at.
+   */
+  async listThreadsForOrganisation(organizationId: string, limit = 200): Promise<Row[]> {
+    return this.db.query<Row>(
+      `SELECT t.*,
+              COUNT(m.id)                                        AS message_count,
+              COUNT(m.id) FILTER (WHERE m.direction = 'inbound') AS inbound_count,
+              COUNT(a.id)                                        AS attachment_count
+         FROM comms.threads t
+         LEFT JOIN comms.messages m ON m.thread_id = t.id
+         LEFT JOIN comms.attachments a ON a.message_id = m.id
+        WHERE t.organization_id = $1
+        GROUP BY t.id
+        ORDER BY t.last_message_at DESC
+        LIMIT $2`,
+      [organizationId, limit]
+    );
+  }
+
+  /**
+   * Per-firm query counts for one tender — the icon the dashboard shows against a
+   * contractor that has asked for clarification.
+   *
+   * `outstanding` is a query nothing has forwarded to the Client yet, which is the state
+   * worth an icon: a question already put to the employer is being dealt with, and one
+   * that never was is somebody's to chase.
+   *
+   * Returned per THREAD rather than per firm, and reduced by the caller. A firm writing
+   * from two addresses has two threads by construction (the unique index is on the
+   * address), and summing them here would hide the second conversation rather than
+   * report it.
+   */
+  async threadQueryCountsForWorkflow(workflowId: string): Promise<Row[]> {
+    return this.db.query<Row>(
+      `SELECT t.id AS thread_id, t.subcontractor_id::text AS subcontractor_id,
+              t.counterparty_email, t.last_message_at,
+              COUNT(m.id) AS query_count,
+              COUNT(m.id) FILTER (
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM comms.forward_items f WHERE f.source_message_id = m.id)
+              ) AS outstanding_count
+         FROM comms.threads t
+         JOIN comms.messages m ON m.thread_id = t.id
+              AND m.kind = 'subcontractor_rfi' AND m.direction = 'inbound'
+        WHERE t.workflow_id = $1 AND t.counterparty_kind = 'subcontractor'
+        GROUP BY t.id
+        ORDER BY t.last_message_at DESC`,
+      [workflowId]
+    );
   }
 
   // ── the Client's reply link ────────────────────────────────────────────────

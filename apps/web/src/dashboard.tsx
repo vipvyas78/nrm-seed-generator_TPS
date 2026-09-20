@@ -51,7 +51,7 @@ export function TenderDashboardPage() {
           few seconds of the take-off being tendered in BuildFlow.
         </p>
       : dashboard.isLoading ? <Busy />
-      : <DashboardTable rows={dashboard.data ?? []} workflowId={workflowId} />}
+      : <DashboardTable rows={dashboard.data ?? []} workflowId={workflowId} packageId={packageId} />}
   </section>;
 }
 
@@ -75,7 +75,9 @@ function WorkflowPicker() {
   </section>;
 }
 
-function DashboardTable({ rows, workflowId }: { rows: DashboardRow[]; workflowId: string }) {
+function DashboardTable({ rows, workflowId, packageId }: {
+  rows: DashboardRow[]; workflowId: string; packageId: string;
+}) {
   const [approving, setApproving] = useState<DashboardRow>();
   if (rows.length === 0) return <p className="muted">This workflow has no packages yet.</p>;
   const tenderable = rows.filter((row) => !row.is_heading);
@@ -90,11 +92,14 @@ function DashboardTable({ rows, workflowId }: { rows: DashboardRow[]; workflowId
         <thead><tr>
           <th style={{ width: '2.5rem' }} />
           <th>Trade package</th><th>Route of procurement</th><th>Status</th><th>Tender return</th>
+          <th style={{ width: '2.5rem' }} title="Has asked for clarification">?</th>
           <th>Subcontractor</th><th>USP</th><th>Contact</th><th>Why</th>
           <th>Accepted</th><th>Declined</th><th>Return date</th><th className="num">Tender price</th>
         </tr></thead>
         <tbody>
-          {rows.map((row) => <PackageDashboardRows key={row.display_ref} row={row} onApprove={() => setApproving(row)} />)}
+          {rows.map((row) => <PackageDashboardRows
+            key={row.display_ref} row={row} packageId={packageId}
+            onApprove={() => setApproving(row)} />)}
         </tbody>
       </table>
     </div>
@@ -109,7 +114,9 @@ function DashboardTable({ rows, workflowId }: { rows: DashboardRow[]; workflowId
  * line — that is the pending state, and dropping the row would hide exactly the packages
  * this dashboard exists to chase.
  */
-function PackageDashboardRows({ row, onApprove }: { row: DashboardRow; onApprove: () => void }) {
+function PackageDashboardRows({ row, onApprove, packageId }: {
+  row: DashboardRow; onApprove: () => void; packageId: string;
+}) {
   const firms = row.subcontractors;
   const span = Math.max(firms.length, 1);
   const pending = !row.confirmed_at;
@@ -143,14 +150,28 @@ function PackageDashboardRows({ row, onApprove }: { row: DashboardRow; onApprove
         </td>
       </>}
       {firm
-        ? <FirmCells firm={firm} deadline={row.tender_return_deadline} />
-        : <td colSpan={8} className="muted">{row.is_heading ? 'Broken down below' : 'No firms selected yet'}</td>}
+        ? <FirmCells firm={firm} deadline={row.tender_return_deadline} packageId={packageId} />
+        : <td colSpan={9} className="muted">{row.is_heading ? 'Broken down below' : 'No firms selected yet'}</td>}
     </tr>)}
   </>;
 }
 
-function FirmCells({ firm, deadline }: { firm: DashboardCandidate; deadline: string | null }) {
+function FirmCells({ firm, deadline, packageId }: {
+  firm: DashboardCandidate; deadline: string | null; packageId: string;
+}) {
   return <>
+    {/* LEFTMOST against the contractor, as the issue asks — its own cell rather than a
+        mark inside the name, so a firm with no query leaves a blank column and the eye
+        runs straight down it. It is NOT the rowSpan'd approve column at the far left of
+        the table: that one belongs to the package, and a query belongs to one firm. */}
+    <td className="query-cell">{Number(firm.query_count) > 0 && <Link
+      className={`query-icon ${Number(firm.outstanding_queries) > 0 ? 'is-outstanding' : ''}`}
+      to={`/packages/${packageId}/tender-prep?thread=${firm.comms_thread_id ?? ''}`}
+      title={Number(firm.outstanding_queries) > 0
+        ? `${firm.name} has asked ${firm.query_count} question(s); ${firm.outstanding_queries} not yet put to the client`
+        : `${firm.name} has asked ${firm.query_count} question(s), all put to the client`}
+      aria-label={`Open ${firm.name}'s queries`}
+    >💬<span className="query-count">{firm.query_count}</span></Link>}</td>
     <td>{firm.name}{firm.is_fabricated && <small className="muted"> · test data</small>}</td>
     <td className="tiny muted">{firm.usp}</td>
     <td className="tiny">

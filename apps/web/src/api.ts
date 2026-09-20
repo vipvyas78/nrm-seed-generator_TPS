@@ -112,6 +112,12 @@ export type DashboardCandidate = Partial<LaunchCandidate> & {
   tendered_sum: string | null;
   /** Test data travelling the same tables as a real bid. Always shown, never filtered out. */
   is_fabricated: boolean;
+  /** Queries this firm has raised on this TENDER, not on this package — a thread is one
+   *  conversation with one firm, so the same count appears on each package they price. */
+  query_count: number;
+  /** Of those, the ones nothing has put to the client yet. The state worth chasing. */
+  outstanding_queries: number;
+  comms_thread_id: string | null;
 };
 
 /**
@@ -575,6 +581,37 @@ export type CommsDefaults = {
   itt_comms_address: string | null;
 };
 
+/**
+ * One thing that happened, and where to read it.
+ *
+ * `deep_link_path` was stored when the event happened rather than computed now, so it
+ * says where the event MEANT — a tender's Communications modal for anything attributable,
+ * and the cross-tender timeline for an email nobody could place.
+ */
+export type AppNotification = {
+  id: string;
+  kind: 'subcontractor_rfi' | 'client_reply' | 'forward_failed' | 'unattributed_email';
+  title: string;
+  body: string | null;
+  deep_link_path: string;
+  created_at: string;
+  thread_id: string | null;
+  workflow_id: string | null;
+  subcontractor_id: string | null;
+  /** Per READER. Two estimators on one tender each need to see a query arrive. */
+  read_at: string | null;
+};
+
+export type NotificationFeed = { items: AppNotification[]; unread: number };
+
+/** Every conversation this organisation has, and the tenders to filter them by. The
+ *  tender list is derived from the threads that exist — a filter offering fifty tenders
+ *  with no conversation on them is a list to scroll past, not a filter. */
+export type CommsTimeline = {
+  threads: Array<CommsThreadSummary & { package_id: string | null; tender_name: string | null }>;
+  tenders: Array<{ workflow_id: string; package_id: string | null; name: string | null }>;
+};
+
 /** What the Client sees on their own reply page. The firm that asked is deliberately not
  *  named: which subcontractor raised a query is commercially ours, not theirs. */
 export type ClientReplyPage = {
@@ -749,6 +786,20 @@ export const api = {
     request<RelayResult>(`/api/comms/messages/${messageId}/relay`, {
       method: 'POST', body: JSON.stringify({ note })
     }),
+
+  // The notification bell, in the shell rather than on any one tender — so it is
+  // organisation-scoped and takes no workflow. `unread` comes back beside the items so
+  // the badge and the list can never disagree.
+  listNotifications: (options: { limit?: number; unreadOnly?: boolean } = {}) =>
+    request<NotificationFeed>(
+      `/api/notifications?limit=${options.limit ?? 50}${options.unreadOnly ? '&unread=true' : ''}`),
+  // An empty list means "all of them" — what "Mark all as read" sends, rather than the
+  // page enumerating ids it may not be holding.
+  markNotificationsRead: (notificationIds: string[] = []) =>
+    request<{ marked: number; unread: number }>('/api/notifications/read', {
+      method: 'POST', body: JSON.stringify({ notificationIds })
+    }),
+  commsTimeline: () => request<CommsTimeline>('/api/comms/timeline'),
 
   // Step 3: Comparative
   listComparative: (workflowId: string) => request<TenderComparative[]>(`/api/tender-prep/${workflowId}/comparative`),

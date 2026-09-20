@@ -94,7 +94,15 @@ async function dashboard(page: Page) {
       accepted: f.subcontractor_id === 'sc-3',
       declined: f.subcontractor_id === 'sc-4',
       tendered_sum: f.subcontractor_id === 'sc-3' ? '184250.00' : null,
-      is_fabricated: false
+      is_fabricated: false,
+      // Per FIRM and per tender, not per package (issue #34): one conversation with one
+      // firm. Gamma has asked twice with one still to go to the client; Delta has asked
+      // once and it has been put to them; nobody else has asked at all.
+      ...(f.subcontractor_id === 'sc-3'
+        ? { query_count: 2, outstanding_queries: 1, comms_thread_id: 'thread-gamma' }
+        : f.subcontractor_id === 'sc-4'
+          ? { query_count: 1, outstanding_queries: 0, comms_thread_id: 'thread-delta' }
+          : { query_count: 0, outstanding_queries: 0, comms_thread_id: null })
     }))
   }));
 
@@ -193,4 +201,25 @@ test('approving opens Step 1 for that package alone, and confirming updates the 
   // The dashboard is keyed under the launch table, so confirming refreshes it with no
   // further wiring: the count moves and the approval control goes.
   await expect(page.getByText('3 of 3 packages confirmed')).toBeVisible();
+});
+
+test('marks the contractors that have asked for clarification, and only those', async ({ page }) => {
+  // The icon the issue asks for: leftmost against the contractor, on the dashboard, so a
+  // buyer scanning the page sees who is waiting on them without opening anything.
+  await dashboard(page);
+
+  const asked = page.getByRole('link', { name: "Open Gamma Drylining's queries" });
+  await expect(asked).toBeVisible();
+  await expect(asked.locator('.query-count')).toHaveText('2');
+  // Straight to that firm's conversation, not to the tender page to hunt for it.
+  await expect(asked).toHaveAttribute('href', /tender-prep\?thread=thread-gamma$/);
+
+  // A firm whose questions have all been put to the client is marked differently from
+  // one still holding an unanswered question: the second is somebody's to chase.
+  await expect(asked).toHaveClass(/is-outstanding/);
+  const settled = page.getByRole('link', { name: "Open Delta Drylining's queries" });
+  await expect(settled).not.toHaveClass(/is-outstanding/);
+
+  // And a firm that has asked nothing leaves the column blank, so the eye runs down it.
+  await expect(page.getByRole('link', { name: /Open Alpha Mechanical/ })).toHaveCount(0);
 });

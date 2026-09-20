@@ -1,9 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Fragment, FormEvent, useEffect, useState } from 'react';
-import { Link, Outlet, useNavigate, useParams } from 'react-router-dom';
+import { Link, Outlet, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { api, TENDER_RETURN_MAX, type ConfirmIttResult, type IttDispatch, type IttLetterDetailsInput, type IttLineSection, type IttPack, type LaunchTableRow, type PortalResponseSummary, type SendAllIttsResult, type SendIttDraftResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow, type TenderReturnUnit } from './api';
 import { oidc, signIn } from './auth';
 import { CommsModal } from './comms';
+import { NotificationBell } from './notifications';
 
 export function ErrorMessage({ error }: { error: unknown }) {
   return error ? <p className="error">{error instanceof Error ? error.message : 'Something went wrong'}</p> : null;
@@ -21,9 +22,16 @@ export function AppShell() {
   const [signingIn, setSigningIn] = useState(false);
   return <main className="shell">
     <header>
-      <span className="brand">BuildFlow</span>
+      <Link to="/" className="brand">BuildFlow</Link>
       <span className="header-sub">Tender Preparation</span>
-      {oidc && <button className="link-button" disabled={signingIn} onClick={() => { setSigningIn(true); void signIn(); }}>Sign in</button>}
+      {/* One element claims the auto margin, not each control: `.link-button` sets
+          margin-left:auto, so two of them split the free space and leave a gap. */}
+      <nav className="header-nav">
+        {/* On every page, because a subcontractor's query is not about the page you
+            happen to be on. */}
+        <NotificationBell />
+        {oidc && <button className="link-button" disabled={signingIn} onClick={() => { setSigningIn(true); void signIn(); }}>Sign in</button>}
+      </nav>
     </header>
     <Outlet />
   </main>;
@@ -74,6 +82,10 @@ export function PackagesListPage() {
 export function TenderPrepPage() {
   const { packageId = '' } = useParams();
   const queryClient = useQueryClient();
+  // Where a notification lands. `?thread=` rather than `?step=`, because the destination
+  // is a conversation and the step is only where that conversation is read.
+  const [searchParams] = useSearchParams();
+  const deepLinkThreadId = searchParams.get('thread');
 
   // A completed take-off launches the workflow with nobody in the app, so the page has
   // to look for one it never started. Polling while none exists means a page left open
@@ -103,6 +115,19 @@ export function TenderPrepPage() {
     mutationFn: (step: number) => api.setStep(workflowId!, step),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['workflow-by-package', packageId] })
   });
+
+  // A notification points at a conversation, and that conversation is read on Step 2.
+  // Moving the cursor is not a side effect anybody loses work to — the steps are freely
+  // navigable in both directions and each keeps its data independently — and landing on
+  // Step 4 with a Communications modal over it would be the stranger thing to do.
+  const stepNow = existing.data?.current_step;
+  useEffect(() => {
+    if (!deepLinkThreadId || !workflowId || stepNow == null || stepNow === 2) return;
+    goToStep.mutate(2);
+    // Keyed on the thread and the step alone. Including the mutation would re-run this
+    // every time its own state changed, which is once per click of its own.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepLinkThreadId, workflowId, stepNow]);
 
   if (existing.isLoading) return <Busy />;
 
@@ -165,7 +190,7 @@ export function TenderPrepPage() {
 
       {currentStep === 1 && takeoff && <TakeoffSummary takeoff={takeoff} packageId={packageId} />}
       {currentStep === 1 && <Step1TenderLaunchPack workflowId={workflowId} />}
-      {currentStep === 2 && <Step2IttDispatch workflowId={workflowId} />}
+      {currentStep === 2 && <Step2IttDispatch workflowId={workflowId} initialThreadId={deepLinkThreadId} />}
       {currentStep === 3 && <Step3Comparative workflowId={workflowId} />}
       {currentStep === 4 && <Step4Submission workflowId={workflowId} />}
     </section>
@@ -1032,14 +1057,18 @@ function IttLetterDetailsPanel({ workflowId, anyDispatched }: { workflowId: stri
   </details>;
 }
 
-function Step2IttDispatch({ workflowId }: { workflowId: string }) {
+function Step2IttDispatch({ workflowId, initialThreadId }: {
+  workflowId: string;
+  /** Set when a notification sent the reader here. Opens Communications on that firm. */
+  initialThreadId?: string | null;
+}) {
   const [open, setOpen] = useState<string | null>(null);
   const [draftOpen, setDraftOpen] = useState<string | null>(null);
   const [responsesOpen, setResponsesOpen] = useState<string | null>(null);
   // Per TENDER, not per package: a firm's queries are one conversation whichever package
   // they are invited to, and an email carries no package at all. So the control sits in
   // the header beside "Send all ITTs" rather than on a package row.
-  const [commsOpen, setCommsOpen] = useState(false);
+  const [commsOpen, setCommsOpen] = useState(Boolean(initialThreadId));
   const [lastResult, setLastResult] = useState<ConfirmIttResult | null>(null);
   const [sendAllResult, setSendAllResult] = useState<SendAllIttsResult | null>(null);
   const queryClient = useQueryClient();
@@ -1218,7 +1247,9 @@ function Step2IttDispatch({ workflowId }: { workflowId: string }) {
       onClose={() => setResponsesOpen(null)}
     />}
 
-    {commsOpen && <CommsModal workflowId={workflowId} onClose={() => setCommsOpen(false)} />}
+    {commsOpen && <CommsModal
+      workflowId={workflowId} initialThreadId={initialThreadId}
+      onClose={() => setCommsOpen(false)} />}
   </div>;
 }
 

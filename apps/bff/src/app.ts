@@ -23,8 +23,17 @@ import { PricingPortalDatabase } from './pricingPortalDb.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
 import { TenderPrepDatabase } from './tenderPrepDb.js';
 import { TENDER_RETURN_MAX, TENDER_RETURN_UNITS } from './tenderReturnPeriod.js';
+import type { Actor } from './types.js';
 
 const uuid = z.string().uuid();
+
+/** Shared by the reviewer's route and BuildFlow's, so the two cannot answer differently
+ *  about what a valid request is. `passthrough` because the internal one carries the
+ *  caller's identity in the same query string. */
+const notificationQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  unread: z.enum(['true', 'false']).optional()
+}).passthrough();
 
 /**
  * What a subcontractor may attach to one query, and how big the request carrying it may be.
@@ -354,6 +363,52 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
         const result = await tpDb.ingestInboundEmail(payload, key);
         return reply.status(result.status === 'duplicate' ? 200 : 202).send(result);
       });
+    });
+  }
+
+  // ── Notifications, read by BuildFlow's own BFF ────────────────────────────────
+  //
+  // The same bell appears in both shells, and a BuildFlow user on the take-off side has
+  // to see a subcontractor's query without opening TPS first. BuildFlow has no access to
+  // the `comms` schema — TPS owns every read of it — so it asks here.
+  //
+  // THE CALLER SUPPLIES THE IDENTITY, and that is exactly as much trust as the bearer
+  // buys. It is sound because the two applications provision their actors into the SAME
+  // `public.bf_users` / `public.bf_organizations` rows, so the ids BuildFlow holds ARE
+  // the ids stored here (see 001_comms_schema.sql). It is safe because this route is on
+  // the internal Docker network and unreachable from the internet, unlike
+  // /internal/email/inbound, which is why that one signs its body and this one does not.
+  //
+  // Registered only when the token is set, the same rule the inbound route follows: no
+  // token, no route, and BuildFlow's bell simply does not appear.
+  if (config.BUILDFLOW_NOTIFICATIONS_TOKEN) {
+    const notificationsToken = config.BUILDFLOW_NOTIFICATIONS_TOKEN;
+    const callerActor = (request: FastifyRequest): Actor => {
+      if (request.headers.authorization !== `Bearer ${notificationsToken}`) {
+        throw new AppError(401, 'Invalid internal notifications token', 'UNAUTHENTICATED');
+      }
+      const query = request.query as { organizationId?: string; userId?: string };
+      const identity = z.object({ organizationId: uuid, userId: uuid }).safeParse(query);
+      if (!identity.success) {
+        throw new AppError(422, 'organizationId and userId are required', 'VALIDATION_FAILED');
+      }
+      // `subject` is the OIDC subject and nothing here reads it; it is filled with a
+      // constant rather than left blank so a row written under this path is recognisable.
+      return { ...identity.data, subject: 'buildflow-internal' };
+    };
+
+    app.get('/internal/notifications', async (request) => {
+      const actor = callerActor(request);
+      const options = notificationQuery.parse(request.query);
+      return tpDb.listNotifications(actor, {
+        limit: options.limit, unreadOnly: options.unread === 'true'
+      });
+    });
+
+    app.post('/internal/notifications/read', async (request) => {
+      const actor = callerActor(request);
+      const input = body(request, z.object({ notificationIds: z.array(uuid).max(500).default([]) }));
+      return tpDb.markNotificationsRead(actor, input.notificationIds);
     });
   }
 
@@ -764,6 +819,35 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     protectedApi.get('/api/comms/threads/:threadId', async (request) => {
       const { threadId } = params(request, z.object({ threadId: uuid }));
       return tpDb.getCommsThread(requireActor(request), threadId);
+    });
+
+    // ── The notification bell, and the timeline behind it ───────────────────
+    //
+    // Organisation-scoped and NOT nested under a workflow, because the bell is on every
+    // page of the shell — including pages that belong to no tender. Scoped from the
+    // actor rather than a parameter: there is no legitimate caller for another
+    // organisation's notifications, so the parameter is not offered.
+    protectedApi.get('/api/notifications', async (request) => {
+      // Parsed rather than coerced by hand: `Number('abc')` is NaN, which reaches
+      // Postgres as `LIMIT NaN` and fails as a database error on a query-string typo.
+      const options = query(request, notificationQuery);
+      return tpDb.listNotifications(requireActor(request), {
+        limit: options.limit, unreadOnly: options.unread === 'true'
+      });
+    });
+
+    // POST with an empty list means "mark all as read", which is what the control sends
+    // rather than enumerating 200 ids a page may not even be holding.
+    protectedApi.post('/api/notifications/read', async (request) => {
+      const input = body(request, z.object({ notificationIds: z.array(uuid).max(500).default([]) }));
+      return tpDb.markNotificationsRead(requireActor(request), input.notificationIds);
+    });
+
+    // Every conversation this organisation has, with the tenders to filter them by. The
+    // one view where "filter by tender" has more than one answer — the Communications
+    // modal on ITT Dispatch is already one tender.
+    protectedApi.get('/api/comms/timeline', async (request) => {
+      return tpDb.commsTimeline(requireActor(request));
     });
 
     protectedApi.get('/api/tender-prep/:workflowId/queries', async (request) => {

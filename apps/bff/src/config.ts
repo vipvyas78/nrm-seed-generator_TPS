@@ -90,6 +90,15 @@ const schema = z.object({
   // as well. See TPS_INBOUND_EMAIL_API.md.
   INBOUND_EMAIL_TOKEN: z.string().min(16).optional(),
   INBOUND_EMAIL_SIGNING_SECRET: z.string().min(32).optional(),
+
+  // The bearer BuildFlow's own BFF presents on /internal/notifications, so the same bell
+  // can appear in both shells. Unset, those routes do not exist and BuildFlow shows no
+  // bell — the same all-or-nothing gating the inbound email route uses.
+  //
+  // Only a bearer, deliberately: unlike the inbound email route this one is reached over
+  // the shared Docker network and is not exposed by nginx, so there is no leaked-token
+  // path from the internet for a signature to defend against.
+  BUILDFLOW_NOTIFICATIONS_TOKEN: z.string().min(16).optional(),
   // How long a Client's reply link stays live. Shorter than a portal link by default: a
   // tender query is answered in days, and the link is a bearer capability in an inbox.
   CLIENT_LINK_TTL_DAYS: z.coerce.number().int().positive().default(30),

@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { TenderDashboardPage } from './dashboard';
 import { AppShell, AuthCallback, PackagesListPage, TenderPrepPage } from './pages';
+import { CommunicationsPage } from './notifications';
 import { PortalPage } from './portal';
 import { ClientReplyPage } from './clientReply';
 import './styles.css';
@@ -32,6 +33,10 @@ export function Main() {
               own package id: ?packageId=<bf package>. */}
           <Route path="/dashboard" element={<TenderDashboardPage />} />
           <Route path="/packages/:packageId/tender-prep" element={<TenderPrepPage />} />
+          {/* Where a notification about a conversation goes when it belongs to no tender.
+              An email nobody could attribute has no ITT Dispatch page to open, and this
+              is the only place it is reachable. Deep-linked as ?thread=<id>. */}
+          <Route path="/communications" element={<CommunicationsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>

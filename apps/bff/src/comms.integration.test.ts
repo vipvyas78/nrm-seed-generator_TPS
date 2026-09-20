@@ -206,6 +206,145 @@ describe('the communications store', () => {
     expect(loaded.messages).toHaveLength(1);
   });
 
+  // -- notifications (issue #34) ---------------------------------------------
+
+  it('announces a message in the SAME transaction that records it', async () => {
+    // The point of `notify` living on recordMessage rather than beside it. Written
+    // afterwards, the notification is lost on any crash between the two -- and the
+    // symptom is a subcontractor's query sitting unread for a week.
+    const thread = await comms.findOrCreateThread({
+      organizationId, workflowId, counterpartyKind: 'subcontractor',
+      counterpartyEmail: `notify@${randomUUID().slice(0, 8)}.test`, counterpartyName: 'Notify Ltd',
+      subcontractorId: null, subject: null
+    });
+    const message = await comms.recordMessage({
+      threadId: String(thread.id), organizationId, workflowId, shortlistEntryId: null,
+      direction: 'inbound', channel: 'portal', kind: 'subcontractor_rfi',
+      authorName: 'Sam', authorEmail: 'sam@notify.test', subject: 'Grid',
+      bodyText: 'Which grid?',
+      notify: {
+        kind: 'subcontractor_rfi', title: 'Notify Ltd raised a query', body: 'Grid',
+        deepLinkPath: '/packages/p/tender-prep?thread=x'
+      }
+    });
+    const [row] = await db.query(
+      `SELECT * FROM comms.notifications WHERE message_id = $1`, [String(message!.id)]);
+    expect(row).toBeDefined();
+    expect(row.title).toBe('Notify Ltd raised a query');
+    expect(row.deep_link_path).toBe('/packages/p/tender-prep?thread=x');
+  });
+
+  it('keeps one notification per message however often it is redelivered', async () => {
+    const thread = await comms.findOrCreateThread({
+      organizationId, workflowId, counterpartyKind: 'subcontractor',
+      counterpartyEmail: `once@${randomUUID().slice(0, 8)}.test`, counterpartyName: null,
+      subcontractorId: null, subject: null
+    });
+    const message = await comms.recordMessage({
+      threadId: String(thread.id), organizationId, workflowId, shortlistEntryId: null,
+      direction: 'inbound', channel: 'email', kind: 'subcontractor_rfi',
+      authorName: null, authorEmail: null, subject: null, bodyText: 'hello',
+      idempotencyKey: `<${randomUUID()}@mail.test>`,
+      notify: { kind: 'subcontractor_rfi', title: 'first', body: null, deepLinkPath: '/x' }
+    });
+    // A second attempt to announce the same message is a redelivery, not a correction:
+    // rewriting the title would change what somebody has already read.
+    await comms.recordNotification({
+      kind: 'subcontractor_rfi', organizationId, workflowId, threadId: String(thread.id),
+      messageId: String(message!.id), title: 'second', body: null, deepLinkPath: '/y'
+    });
+    const rows = await db.query<{ title: string }>(
+      `SELECT title FROM comms.notifications WHERE message_id = $1`, [String(message!.id)]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].title).toBe('first');
+  });
+
+  it('counts unread PER READER, because two estimators share a tender', async () => {
+    const alice = randomUUID();
+    const bob = randomUUID();
+    const before = await comms.unreadNotificationCount(organizationId, alice);
+    expect(before).toBeGreaterThan(0);
+    expect(await comms.unreadNotificationCount(organizationId, bob)).toBe(before);
+
+    const marked = await comms.markNotificationsRead({
+      organizationId, userId: alice, notificationIds: null
+    });
+    expect(marked).toBe(before);
+    expect(await comms.unreadNotificationCount(organizationId, alice)).toBe(0);
+    // Bob has read nothing, and Alice reading it all must not say otherwise.
+    expect(await comms.unreadNotificationCount(organizationId, bob)).toBe(before);
+
+    // The list still carries them -- the bell is a history as well as an inbox -- but
+    // each now knows when this reader saw it.
+    const listed = await comms.listNotifications({ organizationId, userId: alice, limit: 50 });
+    expect(listed.length).toBe(before);
+    expect(listed.every((row) => row.read_at != null)).toBe(true);
+    // Marking again is idempotent rather than an error.
+    expect(await comms.markNotificationsRead({
+      organizationId, userId: alice, notificationIds: null
+    })).toBe(0);
+  });
+
+  it('refuses to mark another organisation’s notification read', async () => {
+    // The id is the only thing the request carries, so the scope has to be in the
+    // statement. This is the first place the store would stop being org-scoped.
+    const [mine] = await db.query<{ id: string }>(
+      `SELECT id FROM comms.notifications WHERE organization_id = $1 LIMIT 1`, [organizationId]);
+    const marked = await comms.markNotificationsRead({
+      organizationId: randomUUID(), userId: randomUUID(), notificationIds: [String(mine.id)]
+    });
+    expect(marked).toBe(0);
+  });
+
+  it('counts a firm’s queries for the dashboard, and which are still outstanding', async () => {
+    const subcontractorId = randomUUID();
+    const dashWorkflow = randomUUID();
+    const thread = await comms.findOrCreateThread({
+      organizationId, workflowId: dashWorkflow, counterpartyKind: 'subcontractor',
+      counterpartyEmail: `dash@${randomUUID().slice(0, 8)}.test`, counterpartyName: 'Dash Ltd',
+      subcontractorId, subject: null
+    });
+    const base = {
+      threadId: String(thread.id), organizationId, workflowId: dashWorkflow,
+      shortlistEntryId: null, direction: 'inbound' as const, channel: 'portal' as const,
+      kind: 'subcontractor_rfi' as const, authorName: null, authorEmail: null,
+      subject: null
+    };
+    const first = await comms.recordMessage({ ...base, bodyText: 'one' });
+    await comms.recordMessage({ ...base, bodyText: 'two' });
+
+    let [counts] = await comms.threadQueryCountsForWorkflow(dashWorkflow);
+    expect(Number(counts.query_count)).toBe(2);
+    expect(Number(counts.outstanding_count)).toBe(2);
+
+    // Putting one to the client takes it off the outstanding list -- a question the
+    // employer already has is being dealt with, and one that never went is somebody's
+    // to chase. That difference is what the icon is showing.
+    const forward = await comms.recordMessage({
+      threadId: String(thread.id), organizationId, workflowId: dashWorkflow,
+      shortlistEntryId: null, direction: 'outbound', channel: 'email', kind: 'client_forward',
+      authorName: null, authorEmail: null, subject: null, bodyText: null
+    });
+    await comms.recordForwardItems(String(forward!.id), [String(first!.id)]);
+
+    [counts] = await comms.threadQueryCountsForWorkflow(dashWorkflow);
+    // Still two queries: the forward is outbound, so it is not itself one.
+    expect(Number(counts.query_count)).toBe(2);
+    expect(Number(counts.outstanding_count)).toBe(1);
+    expect(String(counts.subcontractor_id)).toBe(subcontractorId);
+  });
+
+  it('lists conversations across tenders, which is what the timeline filters', async () => {
+    const threads = await comms.listThreadsForOrganisation(organizationId);
+    const workflows = new Set(threads.map((thread) =>
+      (thread.workflow_id == null ? 'none' : String(thread.workflow_id))));
+    // More than one tender is the whole reason this view exists -- the per-tender modal
+    // would offer a filter with exactly one option.
+    expect(workflows.size).toBeGreaterThan(1);
+    const times = threads.map((thread) => at(thread.last_message_at));
+    expect([...times].sort((a, b) => b - a)).toEqual(times);
+  });
+
   it('summarises a tender’s threads without a query per thread', async () => {
     const threads = await comms.listThreadsForWorkflow(workflowId);
     expect(threads.length).toBeGreaterThan(0);

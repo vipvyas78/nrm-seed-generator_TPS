@@ -57,6 +57,37 @@ restart loop and a log line naming the repository and the command.
 
 Attachment **bytes** are not stored here at all. TPS has no object storage and no S3 client; a file goes to BuildFlow through `POST /internal/comms/attachments` and comes back as a durable link, because the primitive that serves a file to someone who is not a BuildFlow user lives where the bucket is. See `BUILDFLOW_COMMS_ATTACHMENTS_API.md` in the parent repo.
 
+### The notification bell, in two shells
+
+`comms.notifications` is a STORED event, not a derived one. "This thread is open" can be
+counted on read; "a contractor asked for clarification" has to stay notifiable after the
+thread has moved on, and read/unread is per-user and cannot be derived from a message row
+at all. The row is written in the **same transaction as its message** (`recordMessage`'s
+`notify`), and `message_id UNIQUE` makes both "two notifications for one message" and "a
+message nobody was told about" unrepresentable rather than merely unlikely.
+
+`deep_link_path` is stored at write time, the same rule `shortlist_entries.suggestion_reason`
+follows: it says where the event *meant*, not where that tender has got to by the time
+somebody clicks. A thread attributed to a tender opens that tender's Communications modal
+on the firm in question; one that could not be attributed opens `/communications`, the
+cross-tender timeline — the only view in which an untriaged email is reachable at all, and
+the only one where "filter by tender" is a question with more than one answer.
+
+**The same bell appears in BuildFlow's own shell**, which has no access to `comms`. It asks
+here, over `GET|POST /internal/notifications*`, gated on `BUILDFLOW_NOTIFICATIONS_TOKEN` —
+no token, no route, no bell. The caller supplies `organizationId` and `userId` in the query
+string and that is exactly as much trust as the bearer buys: it is sound because both
+applications provision their actors into the same `public.bf_users` /
+`public.bf_organizations` rows, so the ids BuildFlow holds *are* the ids stored here, and
+it is safe because the route is on the internal network. Unlike `/internal/email/inbound`
+it is not published by nginx, which is why that one signs its body and this one does not.
+
+The per-firm icon on the tender dashboard comes from `threadQueryCountsForWorkflow`, its
+own round trip rather than a join into the dashboard query: `commsDb.ts` staying the only
+file that names a `comms.` table is worth more than one indexed read. It distinguishes a
+query already put to the client from one still outstanding, because only the second is
+somebody's to chase.
+
 Links out of TPS (`package_id`, `organization_id`, `created_by`, and `subcontractor_id` → `scms.subcontractors`) are bare UUIDs with no cross-schema foreign keys, by design.
 
 ### Reading the SCMS schema
