@@ -1,10 +1,22 @@
-# CI — typecheck and unit tests for both Node packages.
+# CI - typecheck and unit tests for both Node packages.
 #
-# No secrets and no database. All four *.integration.test.ts files guard on DATABASE_URL
-# and self-skip when it is absent, so what runs here is the five unit suites (ittEmail,
-# emailService, documentLinkProvider, buildflowDocumentLinksClient, buildflowSpecClauseClient)
-# — a real gate that needs no infrastructure. There is no Python job: api/ has no tests and
-# the repo carries no ruff or mypy configuration.
+# No secrets and no database. Every *.integration.test.ts guards on DATABASE_URL and
+# self-skips when it is absent, so what runs here is the unit suites alone - a real gate
+# that needs no infrastructure. There is no Python job: api/ has no tests and the repo
+# carries no ruff or mypy configuration.
+#
+# Among the unit suites, two are contracts rather than ordinary tests and are worth knowing
+# about before deleting anything that looks redundant:
+#
+#   inboundEmail.test.ts   asserts fixed signature vectors shared byte-identically with the
+#                          novamerx-comms-worker repository. That repository signs with
+#                          WebCrypto and this one verifies with node:crypto; the vectors are
+#                          the only thing stopping the two drifting, and they work precisely
+#                          because the expectation is an absolute constant.
+#   commsBoundary.test.ts  asserts commsDb.ts is still the only non-test file querying a
+#                          `comms.` table. That schema's DDL lives in the other repository,
+#                          so the blast radius of a change there is however many files here
+#                          name it.
 name: CI
 
 on:

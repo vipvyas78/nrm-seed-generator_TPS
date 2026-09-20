@@ -5,6 +5,11 @@ import { buildAccessVerifier } from './accessJwt.js';
 import { buildAuthenticator, requireActor } from './auth.js';
 import type { Config } from './config.js';
 import { CloudflareAccessAdmin } from './cloudflareAccess.js';
+import { CommsDatabase } from './commsDb.js';
+import {
+  decodedAttachmentBytes, idempotencyKeyFor, inboundEmailPayload, verifyInboundSignature
+} from './inboundEmail.js';
+import { BuildflowCommsAttachmentsClient } from './buildflowCommsAttachmentsClient.js';
 import { Database } from './db.js';
 import { AppError } from './errors.js';
 import { BoqReadDatabase } from './boqReadDb.js';
@@ -18,8 +23,42 @@ import { PricingPortalDatabase } from './pricingPortalDb.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
 import { TenderPrepDatabase } from './tenderPrepDb.js';
 import { TENDER_RETURN_MAX, TENDER_RETURN_UNITS } from './tenderReturnPeriod.js';
+import type { Actor } from './types.js';
 
 const uuid = z.string().uuid();
+
+/** Shared by the reviewer's route and BuildFlow's, so the two cannot answer differently
+ *  about what a valid request is. `passthrough` because the internal one carries the
+ *  caller's identity in the same query string. */
+const notificationQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  unread: z.enum(['true', 'false']).optional()
+}).passthrough();
+
+/**
+ * What a subcontractor may attach to one query, and how big the request carrying it may be.
+ *
+ * Two numbers rather than one, and they are not the same thing. The REQUEST limit is what
+ * Fastify refuses outright, and has to allow for base64's ~33% overhead plus the JSON
+ * envelope. The ATTACHMENT limit is measured on the DECODED bytes, which is the figure a
+ * person would recognise, and is what the error message talks about — `Buffer.from(…,
+ * 'base64')` silently discards anything that is not base64, so the encoded length proves
+ * nothing about what actually arrived.
+ */
+const RFI_ATTACHMENT_BYTE_LIMIT = 8 * 1024 * 1024;
+const RFI_REQUEST_BYTE_LIMIT = 12 * 1024 * 1024;
+
+/**
+ * The same pair for an inbound email, and the same distinction.
+ *
+ * 20MB of request allows for base64's ~33% overhead plus the JSON envelope and the raw
+ * .eml copy, against ~15MB of message — Cloudflare Email Routing caps a message near
+ * 25MB anyway. Fastify's own default is 1MB, which every real email with a drawing
+ * attached would exceed, presenting as an opaque 413 on exactly the messages worth
+ * keeping.
+ */
+const INBOUND_ATTACHMENT_BYTE_LIMIT = 15 * 1024 * 1024;
+const INBOUND_EMAIL_BYTE_LIMIT = 20 * 1024 * 1024;
 
 function body<T extends z.ZodTypeAny>(request: FastifyRequest, schema: T): z.infer<T> {
   return schema.parse(request.body);
@@ -73,6 +112,15 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   // every recipient as blocked ('access_unconfigured') and the ITT sends exactly as it
   // did before this feature existed. See config.ts for what each variable gates.
   const portalDb = new PricingPortalDatabase(db);
+  // The RFI message store. The `comms` schema is owned by novamerx-comms-worker; this is
+  // the read/write half. Unconditional: it needs only the database, as portalDb does.
+  const commsDb = new CommsDatabase(db);
+  // Gated on the SAME pair as the other four BuildFlow clients, so a half-configured
+  // deployment is not a thing that exists. Without it a query can still be raised, just
+  // not with a file attached — and that is refused outright rather than silently dropped.
+  const commsAttachments = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
+    ? new BuildflowCommsAttachmentsClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
+    : undefined;
   // Falls back to WEB_ORIGIN so a portal link and the Cloudflare Access destination it must
   // match (cloudflareAccess.ts's `portalHost`) can never drift apart from each other just
   // because PORTAL_BASE_URL is unset — see tenderPrepDb.ts's use of this same value below.
@@ -88,7 +136,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const tpDb = new TenderPrepDatabase(
     db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, documentBundles,
     emailService, testEmailOverride, portalDb, accessAdmin, portalBaseUrl, config.PORTAL_LINK_TTL_DAYS,
-    mepBoq
+    mepBoq, commsDb, commsAttachments, config.CLIENT_LINK_TTL_DAYS
   );
 
   app.decorate('tps', { config, db, tpDb, scmsDb });
@@ -180,6 +228,189 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     const identity = await verifyAccessIdentity(request);
     return tpDb.deletePortalLine(token, identity?.email ?? null, lineId);
   });
+
+  // ── Subcontractor queries, raised from the same portal link ────────────────────
+  //
+  // Same authentication as every route above it — Cloudflare Access at the edge plus the
+  // token-to-recipient binding `resolvePortalToken` enforces in this process. Nothing new
+  // to configure and nothing new to get wrong.
+  //
+  // Attachments arrive base64-encoded inside the JSON body rather than as multipart: this
+  // BFF registers no multipart parser, and adding one for a single optional file on one
+  // route is more surface than the encoding costs. `bodyLimit` is raised for this route
+  // ALONE, because Fastify's default is 1MB and a single drawing exceeds it — a limit that
+  // would otherwise present as an opaque 413 on exactly the queries worth attaching
+  // something to.
+  app.post('/portal/:token/rfi', {
+    bodyLimit: RFI_REQUEST_BYTE_LIMIT
+  }, async (request) => {
+    const { token } = params(request, portalTokenParams);
+    const identity = await verifyAccessIdentity(request);
+    const input = body(request, z.object({
+      // Collected, not assumed. The person raising a query is routinely a colleague of
+      // the estimator the ITT was addressed to.
+      authorName: z.string().trim().min(1).max(200),
+      authorEmail: z.string().trim().email().max(320),
+      subject: z.string().trim().max(300).nullish(),
+      body: z.string().trim().min(1).max(20000),
+      attachments: z.array(z.object({
+        filename: z.string().trim().min(1).max(400),
+        contentBase64: z.string().max(RFI_REQUEST_BYTE_LIMIT)
+      })).max(5).default([])
+    }));
+    const attachments = input.attachments.map((attachment) => ({
+      filename: attachment.filename,
+      // Buffer.from ignores anything that is not base64 rather than throwing, so the
+      // decoded length is checked below instead of trusting the encoded one.
+      content: Uint8Array.from(Buffer.from(attachment.contentBase64, 'base64'))
+    }));
+    const totalBytes = attachments.reduce((sum, attachment) => sum + attachment.content.byteLength, 0);
+    if (totalBytes > RFI_ATTACHMENT_BYTE_LIMIT) {
+      throw new AppError(413, 'Those files are too large to send here. Email them instead.', 'ATTACHMENTS_TOO_LARGE');
+    }
+    return tpDb.raisePortalRfi(token, identity?.email ?? null, {
+      authorName: input.authorName,
+      authorEmail: input.authorEmail,
+      subject: input.subject ?? null,
+      body: input.body,
+      attachments
+    });
+  });
+
+  // A tenderer's own history: one thread, never a list, and only the one their link
+  // belongs to. `null` means they have raised nothing yet, which is an ordinary answer.
+  app.get('/portal/:token/thread', async (request) => {
+    const { token } = params(request, portalTokenParams);
+    const identity = await verifyAccessIdentity(request);
+    return tpDb.getPortalThread(token, identity?.email ?? null);
+  });
+
+  // ── The Client's reply page: PUBLIC, same shape as the portal above ────────────
+  //
+  // Declared here for the same reason every /portal route is: the Client is not a
+  // BuildFlow user and carries no OIDC bearer. Cloudflare Access gates the path at the
+  // edge — which is why forwardQueriesToClient unions the Client addresses into the
+  // include list BEFORE the email leaves — and `resolveClientToken` proves in this
+  // process that the verified identity matches the link.
+  app.get('/client/:token', async (request) => {
+    const { token } = params(request, portalTokenParams);
+    const identity = await verifyAccessIdentity(request);
+    return tpDb.getClientReplyPage(token, identity?.email ?? null);
+  });
+
+  app.post('/client/:token', async (request) => {
+    const { token } = params(request, portalTokenParams);
+    const identity = await verifyAccessIdentity(request);
+    const input = body(request, z.object({ body: z.string().trim().min(1).max(20000) }));
+    return tpDb.submitClientReply(token, identity?.email ?? null, { body: input.body });
+  });
+
+  // ── Inbound email, from the Cloudflare Email Worker ────────────────────────────
+  //
+  // Registered ONLY when both secrets are set. Unset, this route does not exist at all
+  // and the feature is in-app only — which is a far better failure than a route that
+  // accepts unauthenticated mail from the internet.
+  //
+  // THIS IS THE ONE ENDPOINT IN EITHER REPO REACHABLE FROM THE PUBLIC INTERNET. Every
+  // other /internal/* route is called over the shared Docker network, so a bearer is
+  // enough for them. Here a leaked bearer would let anyone forge the Client's answer to a
+  // tender query, so the body is signed as well and the timestamp sits inside the
+  // signature. See TPS_INBOUND_EMAIL_API.md.
+  if (config.INBOUND_EMAIL_TOKEN && config.INBOUND_EMAIL_SIGNING_SECRET) {
+    const inboundToken = config.INBOUND_EMAIL_TOKEN;
+    const inboundSecret = config.INBOUND_EMAIL_SIGNING_SECRET;
+    await app.register(async (inbound) => {
+      // An encapsulated scope so this parser applies to this route ALONE. The signature
+      // covers the bytes that arrived, so the raw string has to survive parsing — and
+      // making every route in the app keep its raw body to serve one would be a cost
+      // paid on every request.
+      inbound.addContentTypeParser<string>(
+        'application/json', { parseAs: 'string', bodyLimit: INBOUND_EMAIL_BYTE_LIMIT },
+        (request, rawBody, done) => {
+          (request as FastifyRequest & { rawBody?: string }).rawBody = rawBody;
+          try {
+            done(null, JSON.parse(rawBody));
+          } catch {
+            done(new AppError(422, 'Body is not valid JSON', 'VALIDATION_FAILED'));
+          }
+        }
+      );
+
+      inbound.post('/internal/email/inbound', { bodyLimit: INBOUND_EMAIL_BYTE_LIMIT }, async (request, reply) => {
+        if (request.headers.authorization !== `Bearer ${inboundToken}`) {
+          throw new AppError(401, 'Invalid inbound email token', 'UNAUTHENTICATED');
+        }
+        const verification = verifyInboundSignature({
+          secret: inboundSecret,
+          signatureHeader: request.headers['x-tps-signature'] as string | undefined,
+          timestampHeader: request.headers['x-tps-timestamp'] as string | undefined,
+          rawBody: (request as FastifyRequest & { rawBody?: string }).rawBody ?? ''
+        });
+        if (!verification.ok) {
+          throw new AppError(401, `Signature ${verification.reason}`, 'BAD_SIGNATURE');
+        }
+
+        const payload = inboundEmailPayload.parse(request.body);
+        if (decodedAttachmentBytes(payload) > INBOUND_ATTACHMENT_BYTE_LIMIT) {
+          throw new AppError(413, 'Attachments exceed the inbound limit', 'MESSAGE_TOO_LARGE');
+        }
+        const key = idempotencyKeyFor(payload, request.headers['idempotency-key'] as string | undefined);
+
+        // 202, and a DUPLICATE is a 200 rather than a 409: a retry from a Worker is
+        // ordinary traffic, and a 4xx would make it retry for ever. Anything that failed
+        // to persist throws instead, so the Worker retries — never 2xx a message that
+        // was not stored.
+        const result = await tpDb.ingestInboundEmail(payload, key);
+        return reply.status(result.status === 'duplicate' ? 200 : 202).send(result);
+      });
+    });
+  }
+
+  // ── Notifications, read by BuildFlow's own BFF ────────────────────────────────
+  //
+  // The same bell appears in both shells, and a BuildFlow user on the take-off side has
+  // to see a subcontractor's query without opening TPS first. BuildFlow has no access to
+  // the `comms` schema — TPS owns every read of it — so it asks here.
+  //
+  // THE CALLER SUPPLIES THE IDENTITY, and that is exactly as much trust as the bearer
+  // buys. It is sound because the two applications provision their actors into the SAME
+  // `public.bf_users` / `public.bf_organizations` rows, so the ids BuildFlow holds ARE
+  // the ids stored here (see 001_comms_schema.sql). It is safe because this route is on
+  // the internal Docker network and unreachable from the internet, unlike
+  // /internal/email/inbound, which is why that one signs its body and this one does not.
+  //
+  // Registered only when the token is set, the same rule the inbound route follows: no
+  // token, no route, and BuildFlow's bell simply does not appear.
+  if (config.BUILDFLOW_NOTIFICATIONS_TOKEN) {
+    const notificationsToken = config.BUILDFLOW_NOTIFICATIONS_TOKEN;
+    const callerActor = (request: FastifyRequest): Actor => {
+      if (request.headers.authorization !== `Bearer ${notificationsToken}`) {
+        throw new AppError(401, 'Invalid internal notifications token', 'UNAUTHENTICATED');
+      }
+      const query = request.query as { organizationId?: string; userId?: string };
+      const identity = z.object({ organizationId: uuid, userId: uuid }).safeParse(query);
+      if (!identity.success) {
+        throw new AppError(422, 'organizationId and userId are required', 'VALIDATION_FAILED');
+      }
+      // `subject` is the OIDC subject and nothing here reads it; it is filled with a
+      // constant rather than left blank so a row written under this path is recognisable.
+      return { ...identity.data, subject: 'buildflow-internal' };
+    };
+
+    app.get('/internal/notifications', async (request) => {
+      const actor = callerActor(request);
+      const options = notificationQuery.parse(request.query);
+      return tpDb.listNotifications(actor, {
+        limit: options.limit, unreadOnly: options.unread === 'true'
+      });
+    });
+
+    app.post('/internal/notifications/read', async (request) => {
+      const actor = callerActor(request);
+      const input = body(request, z.object({ notificationIds: z.array(uuid).max(500).default([]) }));
+      return tpDb.markNotificationsRead(actor, input.notificationIds);
+    });
+  }
 
   await app.register(async (protectedApi) => {
     protectedApi.addHook('preHandler', buildAuthenticator(config, db));
@@ -569,6 +800,100 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     protectedApi.post('/api/tender-prep/:workflowId/portal-responses/:linkId/reopen', async (request) => {
       const { workflowId, linkId } = params(request, z.object({ workflowId: uuid, linkId: uuid }));
       return tpDb.reopenPortalResponse(requireActor(request), workflowId, linkId);
+    });
+
+    // ── Subcontractor queries: the buyer's side ─────────────────────────────
+    //
+    // The "Communications" modal on ITT Dispatch. Listed per tender and opened per
+    // thread, because a thread is a conversation with one firm and the list is the set of
+    // firms currently talking to us.
+    protectedApi.get('/api/tender-prep/:workflowId/threads', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.listCommsThreads(requireActor(request), workflowId);
+    });
+
+    // Addressed by thread rather than nested under the workflow: a thread that could not
+    // be attributed to a tender at all has no workflow to nest under, and inventing a
+    // placeholder one to keep the URL tidy would make the untriaged case unreachable.
+    // getCommsThread authorises through the thread's own workflow where it has one.
+    protectedApi.get('/api/comms/threads/:threadId', async (request) => {
+      const { threadId } = params(request, z.object({ threadId: uuid }));
+      return tpDb.getCommsThread(requireActor(request), threadId);
+    });
+
+    // ── The notification bell, and the timeline behind it ───────────────────
+    //
+    // Organisation-scoped and NOT nested under a workflow, because the bell is on every
+    // page of the shell — including pages that belong to no tender. Scoped from the
+    // actor rather than a parameter: there is no legitimate caller for another
+    // organisation's notifications, so the parameter is not offered.
+    protectedApi.get('/api/notifications', async (request) => {
+      // Parsed rather than coerced by hand: `Number('abc')` is NaN, which reaches
+      // Postgres as `LIMIT NaN` and fails as a database error on a query-string typo.
+      const options = query(request, notificationQuery);
+      return tpDb.listNotifications(requireActor(request), {
+        limit: options.limit, unreadOnly: options.unread === 'true'
+      });
+    });
+
+    // POST with an empty list means "mark all as read", which is what the control sends
+    // rather than enumerating 200 ids a page may not even be holding.
+    protectedApi.post('/api/notifications/read', async (request) => {
+      const input = body(request, z.object({ notificationIds: z.array(uuid).max(500).default([]) }));
+      return tpDb.markNotificationsRead(requireActor(request), input.notificationIds);
+    });
+
+    // Every conversation this organisation has, with the tenders to filter them by. The
+    // one view where "filter by tender" has more than one answer — the Communications
+    // modal on ITT Dispatch is already one tender.
+    protectedApi.get('/api/comms/timeline', async (request) => {
+      return tpDb.commsTimeline(requireActor(request));
+    });
+
+    protectedApi.get('/api/tender-prep/:workflowId/queries', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.listCommsQueries(requireActor(request), workflowId);
+    });
+
+    protectedApi.get('/api/tender-prep/:workflowId/client-answers', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.listClientAnswers(requireActor(request), workflowId);
+    });
+
+    // What to pre-fill the forward form with: the Client contact this organisation
+    // configured in BuildFlow. Overridable on the form — the configured contact is a
+    // default, not a rule.
+    protectedApi.get('/api/tender-prep/:workflowId/comms-defaults', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.commsDefaults(requireActor(request), workflowId);
+    });
+
+    // Several selected queries put to the Client as ONE message. The ids are checked
+    // against this tender server-side: assertWorkflowAccess vouches for the workflow, not
+    // for a list of message ids a caller supplied.
+    protectedApi.post('/api/tender-prep/:workflowId/threads/forward', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const input = body(request, z.object({
+        messageIds: z.array(uuid).min(1).max(50),
+        clientEmail: z.string().trim().email('The client needs a valid email address').max(320),
+        clientName: z.string().trim().max(200).nullish(),
+        note: z.string().trim().max(4000).nullish()
+      }));
+      return tpDb.forwardQueriesToClient(requireActor(request), workflowId, {
+        messageIds: input.messageIds,
+        clientEmail: input.clientEmail,
+        clientName: input.clientName ?? null,
+        note: input.note ?? null
+      });
+    });
+
+    // The Client's answer passed back to the firms that asked. The recipients are derived
+    // from comms.forward_items, never chosen by the caller — letting a caller pick would
+    // let an answer reach a competitor pricing the same package.
+    protectedApi.post('/api/comms/messages/:messageId/relay', async (request) => {
+      const { messageId } = params(request, z.object({ messageId: uuid }));
+      const input = body(request, z.object({ note: z.string().trim().max(4000).nullish() }));
+      return tpDb.relayClientAnswer(requireActor(request), messageId, { note: input.note ?? null });
     });
 
     // ── Step 3: Comparative ─────────────────────────────────────────────────

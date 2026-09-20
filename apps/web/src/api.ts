@@ -112,6 +112,12 @@ export type DashboardCandidate = Partial<LaunchCandidate> & {
   tendered_sum: string | null;
   /** Test data travelling the same tables as a real bid. Always shown, never filtered out. */
   is_fabricated: boolean;
+  /** Queries this firm has raised on this TENDER, not on this package — a thread is one
+   *  conversation with one firm, so the same count appears on each package they price. */
+  query_count: number;
+  /** Of those, the ones nothing has put to the client yet. The state worth chasing. */
+  outstanding_queries: number;
+  comms_thread_id: string | null;
 };
 
 /**
@@ -481,6 +487,148 @@ export type PortalDraftInput = {
 
 export type PortalNewLineInput = { description: string; quantity: number | null; unit: string | null };
 
+// -- Subcontractor queries (RFIs) --------------------------------------------
+
+/** One file on a message. `share_token` is BuildFlow's durable redirect token, not a
+ *  presigned URL: it stays clickable for months, and the short-lived signed URL is minted
+ *  at click time. Null only when the link could not be refreshed. */
+export type CommsAttachment = {
+  id: string;
+  filename: string;
+  content_type: string | null;
+  byte_size: number | null;
+  /** Use THIS to link to the file. Built by BuildFlow from its own public host; nothing
+   *  here can reassemble it. Null only when the upload predates the column. */
+  share_url: string | null;
+  share_token: string | null;
+  share_expires_at: string | null;
+};
+
+export type CommsMessage = {
+  id: string;
+  direction: 'inbound' | 'outbound';
+  channel: 'portal' | 'email' | 'app';
+  kind: 'subcontractor_rfi' | 'client_forward' | 'client_reply' | 'relay_to_subcontractor' | 'note';
+  /** Who actually wrote it, which is routinely NOT the firm the ITT was addressed to. */
+  author_name: string | null;
+  author_email: string | null;
+  subject: string | null;
+  body_text: string | null;
+  occurred_at: string;
+  received_at: string;
+  shortlist_entry_id: string | null;
+  attachments: CommsAttachment[];
+};
+
+export type CommsThread = {
+  id: string;
+  workflow_id: string | null;
+  counterparty_kind: 'subcontractor' | 'client';
+  counterparty_email: string;
+  counterparty_name: string | null;
+  subject: string | null;
+  status: 'open' | 'awaiting_client' | 'answered' | 'closed';
+  last_message_at: string;
+};
+
+/** A row of the Communications list. The counts come from the same query as the thread,
+ *  so a tender with twenty firms is one round trip and not twenty-one. */
+export type CommsThreadSummary = CommsThread & {
+  message_count: string;
+  inbound_count: string;
+  attachment_count: string;
+};
+
+export type CommsThreadDetail = { thread: CommsThread; messages: CommsMessage[] };
+
+/** One query in the tender-wide list the forward selects from. */
+export type CommsQuery = {
+  id: string; thread_id: string;
+  subject: string | null; body_text: string | null; occurred_at: string;
+  author_name: string | null; author_email: string | null;
+  counterparty_name: string | null; counterparty_email: string;
+  attachment_count: string;
+  /** Set once this query has been put to the Client — so it is not sent twice. */
+  forwarded_at: string | null;
+};
+
+/** A Client answer, and whether it has been passed back yet. */
+export type ClientAnswer = {
+  id: string; body_text: string | null; occurred_at: string;
+  in_reply_to_message_id: string | null;
+  counterparty_name: string | null; counterparty_email: string;
+  covers: string; relayed: boolean;
+};
+
+/** What a forward put to the Client, and what came of it. */
+export type ForwardResult = {
+  forward_message_id: string; thread_id: string; forwarded: number;
+  sent: boolean; error?: string;
+  /** Why no in-app reply link could be issued. The email still went, and says so. */
+  link_blocked_reason: 'public_email_domain' | 'access_unconfigured' | null;
+  reply_url: string | null;
+};
+
+export type RelayResult = {
+  relayed: number;
+  recipients: Array<{ thread_id: string; to: string; status: string; error?: string }>;
+};
+
+/** The Client contact configured in BuildFlow, used to pre-fill the forward form. */
+export type CommsDefaults = {
+  client_contact_name: string | null;
+  client_contact_email: string | null;
+  itt_comms_address: string | null;
+};
+
+/**
+ * One thing that happened, and where to read it.
+ *
+ * `deep_link_path` was stored when the event happened rather than computed now, so it
+ * says where the event MEANT — a tender's Communications modal for anything attributable,
+ * and the cross-tender timeline for an email nobody could place.
+ */
+export type AppNotification = {
+  id: string;
+  kind: 'subcontractor_rfi' | 'client_reply' | 'forward_failed' | 'unattributed_email';
+  title: string;
+  body: string | null;
+  deep_link_path: string;
+  created_at: string;
+  thread_id: string | null;
+  workflow_id: string | null;
+  subcontractor_id: string | null;
+  /** Per READER. Two estimators on one tender each need to see a query arrive. */
+  read_at: string | null;
+};
+
+export type NotificationFeed = { items: AppNotification[]; unread: number };
+
+/** Every conversation this organisation has, and the tenders to filter them by. The
+ *  tender list is derived from the threads that exist — a filter offering fifty tenders
+ *  with no conversation on them is a list to scroll past, not a filter. */
+export type CommsTimeline = {
+  threads: Array<CommsThreadSummary & { package_id: string | null; tender_name: string | null }>;
+  tenders: Array<{ workflow_id: string; package_id: string | null; name: string | null }>;
+};
+
+/** What the Client sees on their own reply page. The firm that asked is deliberately not
+ *  named: which subcontractor raised a query is commercially ours, not theirs. */
+export type ClientReplyPage = {
+  project_name: string | null;
+  recipient_email: string;
+  queries: Array<{ id: string; subject: string | null; body_text: string | null; raised_at: string }>;
+  messages: CommsMessage[];
+};
+
+export type PortalRfiInput = {
+  authorName: string;
+  authorEmail: string;
+  subject: string | null;
+  body: string;
+  attachments: Array<{ filename: string; contentBase64: string }>;
+};
+
 export type TenderComparative = {
   id: string;
   workflow_id: string;
@@ -614,6 +762,45 @@ export const api = {
   reopenPortalResponse: (workflowId: string, linkId: string) =>
     request<PortalResponseDetail>(`/api/tender-prep/${workflowId}/portal-responses/${linkId}/reopen`, { method: 'POST' }),
 
+  // Step 2: subcontractor queries. Listed per tender, opened per thread — a thread that
+  // could not be attributed to a tender has no workflow to nest under, so addressing it
+  // by its own id is what keeps that case reachable.
+  listCommsThreads: (workflowId: string) =>
+    request<CommsThreadSummary[]>(`/api/tender-prep/${workflowId}/threads`),
+  getCommsThread: (threadId: string) =>
+    request<CommsThreadDetail>(`/api/comms/threads/${threadId}`),
+  listCommsQueries: (workflowId: string) =>
+    request<CommsQuery[]>(`/api/tender-prep/${workflowId}/queries`),
+  listClientAnswers: (workflowId: string) =>
+    request<ClientAnswer[]>(`/api/tender-prep/${workflowId}/client-answers`),
+  commsDefaults: (workflowId: string) =>
+    request<CommsDefaults>(`/api/tender-prep/${workflowId}/comms-defaults`),
+  forwardQueries: (workflowId: string, input: {
+    messageIds: string[]; clientEmail: string; clientName: string | null; note: string | null;
+  }) => request<ForwardResult>(`/api/tender-prep/${workflowId}/threads/forward`, {
+    method: 'POST', body: JSON.stringify(input)
+  }),
+  // The recipients are derived server-side from what the forward carried — never chosen
+  // here, or an answer could reach a competitor pricing the same package.
+  relayClientAnswer: (messageId: string, note: string | null) =>
+    request<RelayResult>(`/api/comms/messages/${messageId}/relay`, {
+      method: 'POST', body: JSON.stringify({ note })
+    }),
+
+  // The notification bell, in the shell rather than on any one tender — so it is
+  // organisation-scoped and takes no workflow. `unread` comes back beside the items so
+  // the badge and the list can never disagree.
+  listNotifications: (options: { limit?: number; unreadOnly?: boolean } = {}) =>
+    request<NotificationFeed>(
+      `/api/notifications?limit=${options.limit ?? 50}${options.unreadOnly ? '&unread=true' : ''}`),
+  // An empty list means "all of them" — what "Mark all as read" sends, rather than the
+  // page enumerating ids it may not be holding.
+  markNotificationsRead: (notificationIds: string[] = []) =>
+    request<{ marked: number; unread: number }>('/api/notifications/read', {
+      method: 'POST', body: JSON.stringify({ notificationIds })
+    }),
+  commsTimeline: () => request<CommsTimeline>('/api/comms/timeline'),
+
   // Step 3: Comparative
   listComparative: (workflowId: string) => request<TenderComparative[]>(`/api/tender-prep/${workflowId}/comparative`),
   upsertComparative: (workflowId: string, input: Omit<TenderComparative, 'id' | 'workflow_id'>) =>
@@ -666,5 +853,26 @@ export const portalApi = {
   addLine: (token: string, input: PortalNewLineInput) =>
     portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}/lines`, { method: 'POST', body: JSON.stringify(input) }),
   deleteLine: (token: string, lineId: string) =>
-    portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}/lines/${encodeURIComponent(lineId)}`, { method: 'DELETE' })
+    portalRequest<PortalPackage>(`/portal/${encodeURIComponent(token)}/lines/${encodeURIComponent(lineId)}`, { method: 'DELETE' }),
+  // Raising a query and reading one's own history use the SAME link and the same identity
+  // binding as pricing — a tenderer has one credential, not two.
+  raiseRfi: (token: string, input: PortalRfiInput) =>
+    portalRequest<CommsThreadDetail>(`/portal/${encodeURIComponent(token)}/rfi`, { method: 'POST', body: JSON.stringify(input) }),
+  // Null is an ordinary answer: nothing has been raised yet.
+  thread: (token: string) =>
+    portalRequest<CommsThreadDetail | null>(`/portal/${encodeURIComponent(token)}/thread`)
+};
+
+/**
+ * The Client's own reply page. A sibling of `portalApi`, not part of `api`, for exactly
+ * the same reason: the Client is not a BuildFlow user, so a dev header on `request()`
+ * would provision an actor for them. Same runtime-resolved base URL, so the host-scoped
+ * Cloudflare Access cookie rides along.
+ */
+export const clientApi = {
+  get: (token: string) => portalRequest<ClientReplyPage>(`/client/${encodeURIComponent(token)}`),
+  reply: (token: string, body: string) =>
+    portalRequest<{ recorded: boolean }>(`/client/${encodeURIComponent(token)}`, {
+      method: 'POST', body: JSON.stringify({ body })
+    })
 };

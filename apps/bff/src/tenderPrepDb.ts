@@ -1,4 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
+import type { BuildflowCommsAttachmentsClient } from './buildflowCommsAttachmentsClient.js';
+import type { AttributionMethod, CommsAttachmentInput, CommsDatabase } from './commsDb.js';
+import { renderClientAnswerRelayEmail, renderRfiForwardEmail } from './commsEmail.js';
+import {
+  findReplyToken, isVerified, referencedMessageIds, replyAddressFor, type InboundEmail
+} from './inboundEmail.js';
 import type { BuildflowBundle, BuildflowDocumentBundlesClient } from './buildflowDocumentBundlesClient.js';
 import type { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
 import { templateLinesAsBoqRows, type BuildflowMepBoqClient } from './buildflowMepBoqClient.js';
@@ -7,7 +14,7 @@ import { domainOf, isPublicEmailDomain, type CloudflareAccessAdmin } from './clo
 import type { Database, Row } from './db.js';
 import type { DocumentLinkProvider } from './documentLinkProvider.js';
 import type { EmailAttachment, EmailService } from './emailService.js';
-import { conflict, forbidden, notFound } from './errors.js';
+import { AppError, conflict, forbidden, notFound } from './errors.js';
 import { ittAttachmentsFor, type AttendanceRow, type IttAttachment, type ResolvedAttachmentTemplate } from './ittAttachments.js';
 import { renderIttEmail, requiredReturnsList, sectionIndex, type IttEmailLetterContext, type IttEmailPack, type IttEmailPortalStatus } from './ittEmail.js';
 import type { Block, RenderContext } from './blockPdfRenderer.js';
@@ -17,8 +24,27 @@ import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js'
 import { deriveReturnDate, isTenderReturnUnit } from './tenderReturnPeriod.js';
 import type { Actor } from './types.js';
 
-/** Every ITT email is sent from this address, regardless of who confirms it in the UI. */
+/**
+ * What every ITT was sent from before BuildFlow issue #34 made it configurable, and still
+ * the fallback for an organisation that has not configured anything.
+ *
+ * The configured value lives in `public.itt_comms_config` (BuildFlow migration 088), which
+ * this module reads UNQUALIFIED through its own `search_path=tps,public` — the same way it
+ * already reads work_package_config and itt_attachment_templates. There is no second copy
+ * and no HTTP call, so a change on BuildFlow's Configuration page applies to the very next
+ * ITT sent from here.
+ *
+ * This literal is duplicated on the BuildFlow side (apps/bff/src/ittComms.ts). That is
+ * unavoidable — the two processes share a database, not a module — and it is safe because
+ * it is a FALLBACK on both sides rather than a value either of them writes.
+ */
 const ITT_FROM_ADDRESS = 'tenders@novamerx.ai';
+
+/** Where a Client's answer comes back to when the organisation has configured nothing.
+ *  Duplicated from BuildFlow's ittComms.ts for the same reason ITT_FROM_ADDRESS is: the
+ *  two processes share a database, not a module, and this is a fallback on both sides
+ *  rather than a value either writes. */
+const DEFAULT_CLIENT_REPLY_ADDRESS = 'itt-reply@novamerx.co.uk';
 
 /**
  * Total base64 attachment budget for one ITT email.
@@ -41,6 +67,20 @@ const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;
  * not buried. "No performance history" is stated outright rather than shown as a zero,
  * because unrated and bad are not the same thing.
  */
+/**
+ * A one-line preview of a message, for a notification that has no subject.
+ *
+ * Truncated on a character count rather than a word boundary: the text came from outside
+ * the organisation, and a "smart" summariser is one more thing that can be wrong about
+ * somebody else's words. Whitespace is collapsed so a pasted email body does not render
+ * as a blank line in the bell.
+ */
+function firstLine(body: string | null, limit = 140): string | null {
+  const text = body?.replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
 function describeSuggestion(c: Row): string {
   const parts: string[] = [];
   const trades = (c.matched_trades as string[] | null) ?? [];
@@ -219,7 +259,18 @@ export class TenderPrepDatabase {
     private readonly portalLinkTtlDays: number = 90,
     // Optional: without one configured, a WP-MEP-* package's bill is the measured
     // take-off lines exactly as it was before BuildFlow issue #28 — see mepTemplateLines.
-    private readonly mepBoq?: BuildflowMepBoqClient
+    private readonly mepBoq?: BuildflowMepBoqClient,
+    // Optional: without one configured, no subcontractor query can be raised or read and
+    // the portal shows no query form at all — the tender behaves exactly as it did before
+    // BuildFlow issue #34.
+    private readonly commsDb?: CommsDatabase,
+    // Optional: without one configured, a query can still be raised but NOT with a file
+    // attached. Refused outright rather than accepted and dropped — see
+    // storeCommsAttachments.
+    private readonly commsAttachments?: BuildflowCommsAttachmentsClient,
+    // Shorter than a portal link by default: a tender query is answered in days, and the
+    // link is a bearer capability sitting in somebody's inbox.
+    private readonly clientLinkTtlDays: number = 30
   ) {}
 
   /**
@@ -1841,6 +1892,32 @@ export class TenderPrepDatabase {
       [workflowId]
     );
 
+    // Which firms have asked for clarification, so the dashboard can put the icon the
+    // issue asks for against them. Its own round trip rather than a join into the query
+    // above, because `comms` is owned by another repository and `commsDb.ts` is the only
+    // file here allowed to name it — one indexed read is a cheaper price than a second
+    // file in that blast radius. Absent comms, every firm simply has no icon.
+    const queryThreads = this.commsDb ? await this.commsDb.threadQueryCountsForWorkflow(workflowId) : [];
+    // Ordered most-recent-first by the query, so the first thread seen for a firm is the
+    // one to open. A firm writing from two addresses genuinely has two conversations —
+    // the counts add up, the deep link goes to the live one.
+    const commsBy = new Map<string, { thread_id: string; queries: number; outstanding: number }>();
+    for (const thread of queryThreads) {
+      if (thread.subcontractor_id == null) continue;
+      const key = String(thread.subcontractor_id);
+      const existing = commsBy.get(key);
+      if (existing) {
+        existing.queries += Number(thread.query_count ?? 0);
+        existing.outstanding += Number(thread.outstanding_count ?? 0);
+      } else {
+        commsBy.set(key, {
+          thread_id: String(thread.thread_id),
+          queries: Number(thread.query_count ?? 0),
+          outstanding: Number(thread.outstanding_count ?? 0)
+        });
+      }
+    }
+
     // Keyed as a JSON pair rather than a joined string: a package name is free text, so any
     // separator picked here is one a client could put in a package name.
     const key = (packageName: unknown, subcontractorId: unknown) =>
@@ -1898,7 +1975,13 @@ export class TenderPrepDatabase {
               tendered_sum: tenderReturn?.tendered_sum ?? null,
               // Test data travels through the same tables as a real bid, and every read that
               // reaches a human has to say which it is looking at.
-              is_fabricated: tenderReturn?.is_fabricated ?? false
+              is_fabricated: tenderReturn?.is_fabricated ?? false,
+              // Per FIRM, not per package: a thread is one conversation with one firm
+              // across this tender, so the same icon appears on each package that firm
+              // is pricing. That is the truth — the query was asked once.
+              query_count: commsBy.get(String(row.subcontractor_id))?.queries ?? 0,
+              outstanding_queries: commsBy.get(String(row.subcontractor_id))?.outstanding ?? 0,
+              comms_thread_id: commsBy.get(String(row.subcontractor_id))?.thread_id ?? null
             };
           })
       } as Row;
@@ -2459,7 +2542,7 @@ export class TenderPrepDatabase {
     // Test mode redirects the whole message to one inbox and drops the cc list, so exercising
     // this against a real package cannot reach a real subcontractor. The subject names who it
     // was meant for, since every test send lands in the same place.
-    const from = this.testEmailOverride?.from ?? ITT_FROM_ADDRESS;
+    const from = this.testEmailOverride?.from ?? await this.ittFromAddress(actor.organizationId);
     const subject = this.testEmailOverride
       ? `[TEST → ${[...to, ...cc].join(', ')}] ${input.subject}`
       : input.subject;
@@ -2639,7 +2722,7 @@ export class TenderPrepDatabase {
 
     let sent = 0, failed = 0, skippedNoEmail = 0;
     const detail: Array<{ subcontractorId: string; packages: string[]; status: string; error?: string }> = [];
-    const from = this.testEmailOverride?.from ?? ITT_FROM_ADDRESS;
+    const from = this.testEmailOverride?.from ?? await this.ittFromAddress(actor.organizationId);
 
     for (const [subcontractorId, packages] of byFirm) {
       const packageNamesForFirm = [...packages.keys()];
@@ -2784,7 +2867,7 @@ export class TenderPrepDatabase {
     let sent = 0, failed = 0, skippedNoEmail = 0;
     const detail: Array<{ subcontractorId: string; status: string; error?: string }> = [];
 
-    const from = this.testEmailOverride?.from ?? ITT_FROM_ADDRESS;
+    const from = this.testEmailOverride?.from ?? await this.ittFromAddress(actor.organizationId);
 
     for (const recipient of recipients) {
       const subcontractorId = String(recipient.subcontractor_id);
@@ -3038,6 +3121,924 @@ export class TenderPrepDatabase {
     if (link.submitted_at) throw conflict('This return has already been submitted and can no longer be edited.');
     await this.portalDb!.deleteLine(String(link.id), lineId);
     return this.getPortalPackage(token, accessEmail);
+  }
+
+  // ── Subcontractor queries (RFIs) ──────────────────────────────────────────
+  //
+  // BuildFlow issue #34. The store is the `comms` schema and lives behind commsDb;
+  // everything about WHO may read or write is decided here, exactly as it is for the
+  // pricing portal above.
+
+  /**
+   * The address this organisation sends ITTs from.
+   *
+   * Read unqualified-except-for-`public` from BuildFlow's own configuration table, so a
+   * change on their Configuration page takes effect on the next send with no deploy and
+   * no second copy. Falls back to the literal every ITT used before it was configurable —
+   * an organisation that has never opened that page must keep sending exactly as it did.
+   */
+  private async ittFromAddress(organizationId: string): Promise<string> {
+    const [row] = await this.db.query<Row>(
+      `SELECT itt_from_address FROM public.itt_comms_config
+        WHERE organization_id = $1 AND project_id IS NULL`,
+      [organizationId]
+    );
+    return row?.itt_from_address ? String(row.itt_from_address) : ITT_FROM_ADDRESS;
+  }
+
+  /**
+   * The project a workflow belongs to, for naming it in an email.
+   *
+   * Read off `workflows.step_data.takeoff`, where the launch message was stashed whole —
+   * `IttEmailLetterContext` does not carry it, and re-deriving it from BuildFlow would be
+   * an HTTP call for a string this row already holds. Null is fine: the emails say "the
+   * project" rather than refusing to send.
+   */
+  private async projectNameForWorkflow(workflowId: string): Promise<string | null> {
+    const [row] = await this.db.query<Row>(
+      `SELECT step_data -> 'takeoff' ->> 'projectName' AS project_name FROM workflows WHERE id = $1`,
+      [workflowId]
+    );
+    return row?.project_name != null ? String(row.project_name) : null;
+  }
+
+  /**
+   * Where a notification about this conversation should send its reader.
+   *
+   * Stored on the notification at write time, so it says where the event MEANT rather
+   * than where that tender has got to by the time anyone clicks.
+   *
+   * A thread attributed to a tender opens that tender's Communications modal, on the firm
+   * in question — which is the ITT Dispatch step, exactly as the issue asks. A thread
+   * with no workflow has no such page: nobody could work out which tender it belongs to,
+   * so it opens the cross-tender timeline instead, which is the only place an untriaged
+   * conversation is reachable at all.
+   */
+  private async commsDeepLink(workflowId: string | null, threadId: string): Promise<string> {
+    if (workflowId) {
+      const [row] = await this.db.query<Row>(
+        `SELECT package_id FROM workflows WHERE id = $1`, [workflowId]
+      );
+      if (row?.package_id) {
+        return `/packages/${String(row.package_id)}/tender-prep?thread=${threadId}`;
+      }
+    }
+    return `/communications?thread=${threadId}`;
+  }
+
+  /** The organisation a workflow belongs to. Needed because `comms` carries no
+   *  cross-schema foreign keys, so it stores the id rather than joining for it. */
+  private async organizationForWorkflow(workflowId: string): Promise<string> {
+    const [row] = await this.db.query<Row>(`SELECT organization_id FROM workflows WHERE id = $1`, [workflowId]);
+    if (!row) throw notFound('This tender no longer exists.');
+    return String(row.organization_id);
+  }
+
+  /**
+   * A subcontractor raising a query from their own pricing-portal link.
+   *
+   * The THREAD is keyed on the firm — the portal link's recipient — while the MESSAGE
+   * records whoever actually typed it. That distinction is the point of the form asking
+   * for a name and email at all: the person raising a query is routinely a colleague of
+   * the estimator the ITT was addressed to, and filing their query under their own
+   * address would give one firm several unrelated conversations.
+   *
+   * The package IS known here, because the link is per (package x firm), so the message
+   * carries `shortlist_entry_id` and the form needs no package selector.
+   *
+   * Attachments are stored BEFORE the message is recorded, and a storage failure aborts
+   * the whole thing. The other order would leave a row promising a file that does not
+   * exist, which nobody could diagnose months later.
+   */
+  async raisePortalRfi(token: string, accessEmail: string | null, input: {
+    authorName: string; authorEmail: string; subject: string | null; body: string;
+    attachments: Array<{ filename: string; content: Uint8Array<ArrayBuffer> }>;
+  }): Promise<{ thread: Row; messages: Row[] }> {
+    if (!this.commsDb) throw notFound('Queries are not available for this tender.');
+    const link = await this.resolvePortalToken(token, accessEmail);
+    const workflowId = String(link.workflow_id);
+    const organizationId = await this.organizationForWorkflow(workflowId);
+
+    const stored = await this.storeCommsAttachments(organizationId, input.attachments);
+
+    const thread = await this.commsDb.findOrCreateThread({
+      organizationId,
+      workflowId,
+      counterpartyKind: 'subcontractor',
+      counterpartyEmail: String(link.recipient_email),
+      counterpartyName: link.tenderer_name != null ? String(link.tenderer_name) : null,
+      subcontractorId: link.subcontractor_id != null ? String(link.subcontractor_id) : null,
+      subject: input.subject
+    });
+
+    await this.commsDb.recordMessage({
+      threadId: String(thread.id),
+      organizationId,
+      workflowId,
+      shortlistEntryId: String(link.shortlist_entry_id),
+      direction: 'inbound',
+      channel: 'portal',
+      kind: 'subcontractor_rfi',
+      authorName: input.authorName,
+      authorEmail: input.authorEmail,
+      subject: input.subject,
+      bodyText: input.body,
+      attachments: stored,
+      // The firm is the thread's counterparty; the person is whoever filled the form in.
+      // Both are named, because "Acme Drylining" is what a buyer recognises and
+      // "Sam Patel" is who they reply to.
+      notify: {
+        kind: 'subcontractor_rfi',
+        title: `${thread.counterparty_name ?? thread.counterparty_email} raised a query`,
+        body: input.subject ?? firstLine(input.body),
+        deepLinkPath: await this.commsDeepLink(workflowId, String(thread.id)),
+        subcontractorId: link.subcontractor_id != null ? String(link.subcontractor_id) : null
+      }
+    });
+
+    return this.commsDb.getThread(String(thread.id));
+  }
+
+  /** What a subcontractor sees of their own conversation — one thread, never a list, and
+   *  only the one their link belongs to. */
+  async getPortalThread(token: string, accessEmail: string | null): Promise<{ thread: Row; messages: Row[] } | null> {
+    if (!this.commsDb) return null;
+    const link = await this.resolvePortalToken(token, accessEmail);
+    const thread = await this.commsDb.threadForCounterparty({
+      workflowId: String(link.workflow_id),
+      counterpartyKind: 'subcontractor',
+      counterpartyEmail: String(link.recipient_email)
+    });
+    if (!thread) return null;
+    return this.commsDb.getThread(String(thread.id));
+  }
+
+  /** Every query raised on this tender, across firms — the list the forward selects from. */
+  async listCommsQueries(actor: Actor, workflowId: string): Promise<Row[]> {
+    if (!this.commsDb) return [];
+    await this.assertWorkflowAccess(actor, workflowId);
+    return this.commsDb.listQueriesForWorkflow(workflowId);
+  }
+
+  /** Client answers on this tender, and whether each has been passed back yet. */
+  async listClientAnswers(actor: Actor, workflowId: string): Promise<Row[]> {
+    if (!this.commsDb) return [];
+    await this.assertWorkflowAccess(actor, workflowId);
+    return this.commsDb.listClientAnswersForWorkflow(workflowId);
+  }
+
+  /** Every conversation on one tender, for the Communications modal on ITT Dispatch. */
+  async listCommsThreads(actor: Actor, workflowId: string): Promise<Row[]> {
+    if (!this.commsDb) return [];
+    await this.assertWorkflowAccess(actor, workflowId);
+    return this.commsDb.listThreadsForWorkflow(workflowId);
+  }
+
+  /**
+   * One conversation in full.
+   *
+   * Authorised through the thread's WORKFLOW where it has one, so this inherits exactly
+   * the same rule as every other read on this tender. A thread with no workflow is an
+   * untriaged inbound message that could not be attributed to a tender at all; there is
+   * no workflow to check, so it falls back to the organisation — which is the only
+   * boundary such a message actually has.
+   */
+  async getCommsThread(actor: Actor, threadId: string): Promise<{ thread: Row; messages: Row[] }> {
+    if (!this.commsDb) throw notFound('Queries are not available.');
+    const result = await this.commsDb.getThread(threadId);
+    if (result.thread.workflow_id) {
+      await this.assertWorkflowAccess(actor, String(result.thread.workflow_id));
+    } else if (String(result.thread.organization_id) !== actor.organizationId) {
+      throw notFound('This conversation no longer exists.');
+    }
+    return result;
+  }
+
+  // ── Notifications, and the cross-tender timeline ──────────────────────────
+
+  /**
+   * What the bell shows: this organisation's communications events, newest first, each
+   * carrying whether THIS reader has seen it.
+   *
+   * Scoped by the actor's own organisation and never by a parameter — a notification list
+   * is the one read where "show me another organisation's" has no legitimate caller, and
+   * every id it hands out is a thread somebody can then open.
+   *
+   * Degrades to an empty list rather than throwing when comms is not configured, exactly
+   * as `listCommsThreads` does: a shell that renders a bell on every page must not be able
+   * to break every page.
+   */
+  async listNotifications(actor: Actor, options: { limit?: number; unreadOnly?: boolean } = {}): Promise<Row> {
+    if (!this.commsDb) return { items: [], unread: 0 };
+    const [items, unread] = await Promise.all([
+      this.commsDb.listNotifications({
+        organizationId: actor.organizationId, userId: actor.userId,
+        limit: options.limit, unreadOnly: options.unreadOnly
+      }),
+      this.commsDb.unreadNotificationCount(actor.organizationId, actor.userId)
+    ]);
+    return { items, unread };
+  }
+
+  /** Marks notifications read for this reader. An empty list means everything — which is
+   *  what "mark all as read" sends, rather than the client enumerating 200 ids. */
+  async markNotificationsRead(actor: Actor, notificationIds: string[]): Promise<Row> {
+    if (!this.commsDb) return { marked: 0, unread: 0 };
+    const marked = await this.commsDb.markNotificationsRead({
+      organizationId: actor.organizationId, userId: actor.userId,
+      notificationIds: notificationIds.length > 0 ? notificationIds : null
+    });
+    return { marked, unread: await this.commsDb.unreadNotificationCount(actor.organizationId, actor.userId) };
+  }
+
+  /**
+   * Every conversation this organisation has, across every tender — the timeline behind
+   * the bell, and the only view in which "filter by tender" is a question with more than
+   * one answer.
+   *
+   * The tender name is resolved HERE rather than in `comms`, which holds no cross-schema
+   * foreign keys by design. A thread whose workflow has since been deleted keeps its id
+   * and reads as an unknown tender rather than vanishing: the conversation happened.
+   */
+  async commsTimeline(actor: Actor): Promise<Row> {
+    if (!this.commsDb) return { threads: [], tenders: [] };
+    const threads = await this.commsDb.listThreadsForOrganisation(actor.organizationId);
+    const workflowIds = [...new Set(threads
+      .map((thread) => (thread.workflow_id != null ? String(thread.workflow_id) : null))
+      .filter((id): id is string => id != null))];
+    const workflows = workflowIds.length === 0 ? [] : await this.db.query<Row>(
+      // Package name first, project name second: the rest of this app labels a workflow
+      // by its package (PackagesListPage, the dashboard picker), and the project is what
+      // a workflow started before the take-off landed has instead. Either is a name
+      // somebody recognises; the id is not, so it is the last resort and lives in the UI.
+      `SELECT id::text AS id, package_id::text AS package_id,
+              COALESCE(step_data -> 'takeoff' ->> 'packageName',
+                       step_data -> 'takeoff' ->> 'projectName') AS package_name
+         FROM workflows WHERE id = ANY($1::uuid[]) AND organization_id = $2`,
+      [workflowIds, actor.organizationId]
+    );
+    const byId = new Map(workflows.map((row) => [String(row.id), row]));
+    return {
+      threads: threads.map((thread) => {
+        const workflow = thread.workflow_id != null ? byId.get(String(thread.workflow_id)) : undefined;
+        return {
+          ...thread,
+          package_id: workflow?.package_id ?? null,
+          tender_name: workflow?.package_name ?? null
+        };
+      }),
+      // The filter's options, derived from the threads that exist rather than from every
+      // tender: a filter offering fifty tenders with no conversation on them is a list to
+      // scroll past, not a filter.
+      tenders: [...byId.values()].map((workflow) => ({
+        workflow_id: workflow.id, package_id: workflow.package_id, name: workflow.package_name
+      }))
+    };
+  }
+
+  // ── The Client's own reply page ───────────────────────────────────────────
+
+  /**
+   * Resolves a Client's reply token to its link, binding it to a verified identity.
+   *
+   * A structural copy of `resolvePortalToken`, and deliberately so: it is the same problem
+   * with a different counterparty. The URL token says WHICH forward; the verified Access
+   * email says WHO is asking; both have to agree. A same-domain match is accepted because
+   * a colleague answering on the Client's behalf is an ordinary event, but never for a
+   * public domain, where two addresses are unrelated strangers.
+   */
+  private async resolveClientToken(token: string, accessEmail: string | null): Promise<Row> {
+    if (!this.commsDb) throw notFound('This link is no longer valid.');
+    const link = await this.commsDb.clientLinkByToken(token);
+    if (!link) throw notFound('This link has expired or is no longer valid.');
+    if (accessEmail) {
+      const linkEmail = String(link.recipient_email).toLowerCase();
+      const linkDomain = String(link.recipient_domain).toLowerCase();
+      const matches = accessEmail === linkEmail
+        || (!isPublicEmailDomain(linkDomain) && domainOf(accessEmail) === linkDomain);
+      if (!matches) {
+        await this.commsDb.recordClientDenial(String(link.id), accessEmail);
+        throw forbidden('This link was not issued to your address. If you believe this is a mistake, ask whoever sent it to resend it to you directly.');
+      }
+    }
+    await this.commsDb.recordClientOpen(String(link.id), accessEmail);
+    return link;
+  }
+
+  /** What the Client sees: the queries this forward put to them, and anything already
+   *  said. Never the rest of the tender. */
+  async getClientReplyPage(token: string, accessEmail: string | null): Promise<Row> {
+    const link = await this.resolveClientToken(token, accessEmail);
+    const queries = await this.commsDb!.forwardedQueries(String(link.forward_message_id));
+    const { messages } = await this.commsDb!.getThread(String(link.thread_id));
+    const projectName = link.workflow_id != null
+      ? await this.projectNameForWorkflow(String(link.workflow_id)) : null;
+    return {
+      project_name: projectName,
+      recipient_email: link.recipient_email,
+      // The firm is deliberately NOT named to the Client. They are answering a question
+      // about the works; which subcontractor asked is commercially theirs, not the
+      // Client's, and naming it would leak the shortlist.
+      queries: queries.map((query) => ({
+        id: query.id,
+        subject: query.subject,
+        body_text: query.body_text,
+        raised_at: query.occurred_at
+      })),
+      messages: messages.filter((message) => message.kind !== 'subcontractor_rfi')
+    };
+  }
+
+  /** The Client answering in the app rather than by email. Recorded exactly as an emailed
+   *  answer would be, so the relay downstream cannot tell them apart. */
+  async submitClientReply(token: string, accessEmail: string | null, input: {
+    body: string;
+  }): Promise<Row> {
+    const link = await this.resolveClientToken(token, accessEmail);
+    const message = await this.commsDb!.recordMessage({
+      threadId: String(link.thread_id),
+      organizationId: String(link.organization_id),
+      workflowId: link.workflow_id != null ? String(link.workflow_id) : null,
+      shortlistEntryId: null,
+      direction: 'inbound', channel: 'portal', kind: 'client_reply',
+      authorName: null, authorEmail: accessEmail ?? String(link.recipient_email),
+      subject: null, bodyText: input.body,
+      inReplyToMessageId: String(link.forward_message_id),
+      // In-app, so the identity is the Access one rather than anything a mail header
+      // claimed. Recorded as such so a reviewer can tell the two apart later.
+      attributionMethod: 'reply_token',
+      notify: {
+        kind: 'client_reply',
+        title: 'The client answered your queries',
+        body: firstLine(input.body),
+        deepLinkPath: await this.commsDeepLink(
+          link.workflow_id != null ? String(link.workflow_id) : null, String(link.thread_id))
+      }
+    });
+    await this.commsDb!.setThreadStatus(String(link.thread_id), 'answered');
+    return { recorded: message != null };
+  }
+
+  // ── Inbound email ─────────────────────────────────────────────────────────
+
+  /**
+   * Files a message the Cloudflare Email Worker forwarded here.
+   *
+   * Attribution is tried in a fixed order, strongest first, and the route that answered is
+   * recorded on the message so a misrouting is diagnosable rather than mysterious:
+   *
+   *   1. a reply token (plus-address, then subject marker) -> the Client's own forward;
+   *   2. In-Reply-To / References against a message we actually sent;
+   *   3. the ITT comms address -> the organisation, then the sender -> a portal recipient.
+   *
+   * A message that matches none of these is still FILED, in an untriaged thread. Dropping
+   * a customer's email because we could not work out who they were is never the right
+   * answer — and `workflow_id IS NULL` is exactly what makes it findable later.
+   *
+   * Returns `duplicate` rather than throwing when the message has been seen: an Email
+   * Worker delivers at least once by design, so that is normal traffic.
+   */
+  async ingestInboundEmail(payload: InboundEmail, idempotencyKey: string): Promise<Row> {
+    if (!this.commsDb) throw notFound('Inbound email is not available.');
+    const verified = isVerified(payload);
+    const sender = payload.from.address.trim().toLowerCase();
+
+    const resolved = await this.resolveInbound(payload, verified);
+    const occurredAt = payload.date ? new Date(payload.date) : null;
+
+    const stored = await this.storeInboundAttachments(resolved.organizationId, payload);
+
+    const message = await this.commsDb.recordMessage({
+      threadId: resolved.threadId,
+      organizationId: resolved.organizationId,
+      workflowId: resolved.workflowId,
+      shortlistEntryId: resolved.shortlistEntryId,
+      direction: 'inbound', channel: 'email', kind: resolved.kind,
+      authorName: payload.from.name ?? null,
+      authorEmail: sender,
+      subject: payload.subject ?? null,
+      bodyText: payload.textBody ?? null,
+      occurredAt: occurredAt && !Number.isNaN(occurredAt.getTime()) ? occurredAt : null,
+      idempotencyKey,
+      attributionMethod: resolved.method,
+      dkimResult: payload.auth.dkim ?? null,
+      spfResult: payload.auth.spf ?? null,
+      dmarcResult: payload.auth.dmarc ?? null,
+      externalMessageId: payload.messageId ?? null,
+      externalInReplyTo: payload.headers.inReplyTo ?? null,
+      externalReferences: payload.headers.references,
+      inReplyToMessageId: resolved.inReplyToMessageId,
+      rawObjectKey: stored.rawObjectKey,
+      attachmentsTruncated: payload.attachmentsTruncated,
+      attachments: stored.attachments,
+      // A message nobody could attribute gets its OWN notification kind rather than
+      // being announced as a query on a tender it was never placed on. It is the one
+      // most worth a human's attention and the one a buyer is least likely to find by
+      // looking — the bell is the only route to it.
+      notify: resolved.workflowId == null
+        ? {
+            kind: 'unattributed_email',
+            title: `Unattributed email from ${payload.from.name ?? sender}`,
+            body: payload.subject ?? firstLine(payload.textBody ?? null),
+            deepLinkPath: await this.commsDeepLink(null, resolved.threadId)
+          }
+        : {
+            kind: resolved.kind === 'client_reply' ? 'client_reply' : 'subcontractor_rfi',
+            title: resolved.kind === 'client_reply'
+              ? 'The client answered your queries'
+              : `${payload.from.name ?? sender} raised a query`,
+            body: payload.subject ?? firstLine(payload.textBody ?? null),
+            deepLinkPath: await this.commsDeepLink(resolved.workflowId, resolved.threadId)
+          }
+    });
+
+    if (!message) return { status: 'duplicate', thread_id: resolved.threadId, attributed: resolved.workflowId != null };
+    if (resolved.kind === 'client_reply') await this.commsDb.setThreadStatus(resolved.threadId, 'answered');
+
+    return {
+      status: 'recorded',
+      message_id: message.id,
+      thread_id: resolved.threadId,
+      attributed: resolved.workflowId != null,
+      attribution_method: resolved.method
+    };
+  }
+
+  /** Which thread an inbound message belongs to, and how we decided. */
+  private async resolveInbound(payload: InboundEmail, verified: boolean): Promise<{
+    organizationId: string; workflowId: string | null; threadId: string;
+    shortlistEntryId: string | null; kind: 'subcontractor_rfi' | 'client_reply';
+    method: AttributionMethod | null; inReplyToMessageId: string | null;
+  }> {
+    const commsDb = this.commsDb!;
+    const sender = payload.from.address.trim().toLowerCase();
+
+    // 1. A reply token. Strongest, and the only route that identifies a Client answer
+    //    outright — but ONLY on a DKIM-verified message: the whole value of a token is
+    //    that it is unguessable, and a forged message quoting one back is not evidence.
+    const tokenMatch = findReplyToken(payload);
+    if (tokenMatch && verified) {
+      const link = await commsDb.clientLinkByToken(tokenMatch.token);
+      if (link) {
+        return {
+          organizationId: String(link.organization_id),
+          workflowId: link.workflow_id != null ? String(link.workflow_id) : null,
+          threadId: String(link.thread_id), shortlistEntryId: null, kind: 'client_reply',
+          method: tokenMatch.method, inReplyToMessageId: String(link.forward_message_id)
+        };
+      }
+    }
+
+    // 2. What it says it answers, matched against what we actually sent.
+    if (verified) {
+      const answered = await commsDb.messageByExternalIds(referencedMessageIds(payload));
+      if (answered) {
+        return {
+          organizationId: String(answered.organization_id),
+          workflowId: answered.workflow_id != null ? String(answered.workflow_id) : null,
+          threadId: String(answered.thread_id),
+          shortlistEntryId: answered.shortlist_entry_id != null ? String(answered.shortlist_entry_id) : null,
+          kind: answered.kind === 'client_forward' ? 'client_reply' : 'subcontractor_rfi',
+          method: 'in_reply_to',
+          inReplyToMessageId: String(answered.id)
+        };
+      }
+    }
+
+    // 3. The address it arrived on names the organisation; the sender names the firm.
+    const organizationId = await this.organizationForInboundAddress(payload.recipient);
+    if (!organizationId) {
+      throw new AppError(
+        422,
+        `No organisation is configured to receive mail at ${payload.recipient}.`,
+        'UNKNOWN_RECIPIENT'
+      );
+    }
+
+    const firm = await this.portalRecipientFor(organizationId, sender);
+    const thread = await commsDb.findOrCreateThread({
+      organizationId,
+      workflowId: firm?.workflowId ?? null,
+      counterpartyKind: 'subcontractor',
+      counterpartyEmail: sender,
+      counterpartyName: payload.from.name ?? firm?.tendererName ?? null,
+      subcontractorId: firm?.subcontractorId ?? null,
+      subject: payload.subject ?? null
+    });
+    return {
+      organizationId, workflowId: firm?.workflowId ?? null, threadId: String(thread.id),
+      shortlistEntryId: firm?.shortlistEntryId ?? null, kind: 'subcontractor_rfi',
+      method: firm?.method ?? null, inReplyToMessageId: null
+    };
+  }
+
+  /** The organisation that receives mail at this address. Matched on the ITT comms
+   *  address, which is per-organisation; the Client reply address is shared, so a message
+   *  arriving there is attributed by its token rather than by the mailbox. */
+  private async organizationForInboundAddress(recipient: string): Promise<string | null> {
+    const address = recipient.trim().toLowerCase();
+    // Strips any plus-suffix, so `<org>-ittcomms+anything@` still resolves.
+    const [local, domain] = address.split('@');
+    const bare = domain ? `${local.split('+')[0]}@${domain}` : address;
+    const [row] = await this.db.query<Row>(
+      `SELECT organization_id FROM public.itt_comms_config
+        WHERE LOWER(itt_comms_address) = $1 AND project_id IS NULL
+        LIMIT 1`,
+      [bare]
+    );
+    return row?.organization_id != null ? String(row.organization_id) : null;
+  }
+
+  /**
+   * The firm behind a sender address, from the portal links already issued.
+   *
+   * Exact address first, then a non-public domain. Never a public domain: two people at
+   * gmail.com are unrelated strangers, and filing one's query under the other's tender is
+   * both wrong and a disclosure. Most recently dispatched wins where a firm is live on
+   * several tenders — and that ambiguity is real, which is why the method is recorded.
+   */
+  private async portalRecipientFor(organizationId: string, sender: string): Promise<{
+    workflowId: string; shortlistEntryId: string; subcontractorId: string | null;
+    tendererName: string | null; method: AttributionMethod;
+  } | null> {
+    const domain = domainOf(sender);
+    const [row] = await this.db.query<Row>(
+      `SELECT l.workflow_id, l.shortlist_entry_id, l.subcontractor_id, l.tenderer_name,
+              (LOWER(l.recipient_email) = $2) AS exact
+         FROM pricing_portal_links l
+         JOIN workflows w ON w.id = l.workflow_id
+        WHERE w.organization_id = $1
+          AND (LOWER(l.recipient_email) = $2 OR ($3 <> '' AND LOWER(l.recipient_domain) = $3))
+        ORDER BY exact DESC, l.created_at DESC
+        LIMIT 1`,
+      [organizationId, sender, isPublicEmailDomain(domain) ? '' : domain]
+    );
+    if (!row) return null;
+    return {
+      workflowId: String(row.workflow_id),
+      shortlistEntryId: String(row.shortlist_entry_id),
+      subcontractorId: row.subcontractor_id != null ? String(row.subcontractor_id) : null,
+      tendererName: row.tenderer_name != null ? String(row.tenderer_name) : null,
+      method: row.exact === true ? 'sender_email' : 'sender_domain'
+    };
+  }
+
+  /**
+   * Puts an inbound message's files, and the raw .eml, into BuildFlow's object store.
+   *
+   * Lenient where the portal path is strict, and the difference is deliberate: a portal
+   * query can be refused and retyped, while an email has already been sent and there is
+   * nobody to tell. So a file that will not store is dropped with the message marked
+   * truncated rather than losing the message with it. The archival .eml is best-effort
+   * for the same reason.
+   */
+  private async storeInboundAttachments(organizationId: string, payload: InboundEmail): Promise<{
+    attachments: CommsAttachmentInput[]; rawObjectKey: string | null;
+  }> {
+    if (!this.commsAttachments) return { attachments: [], rawObjectKey: null };
+    const attachments: CommsAttachmentInput[] = [];
+    for (const attachment of payload.attachments) {
+      const id = randomUUID();
+      try {
+        const result = await this.commsAttachments.store({
+          organizationId, attachmentId: id, filename: attachment.filename,
+          content: Uint8Array.from(Buffer.from(attachment.contentBase64, 'base64'))
+        });
+        attachments.push({
+          id, filename: attachment.filename, contentType: result.contentType,
+          byteSize: result.byteSize, sha256: result.sha256, objectKey: result.objectKey,
+          shareUrl: result.url, shareToken: result.token, shareExpiresAt: result.expiresAt
+        });
+      } catch {
+        // Swallowed on purpose — see the doc comment. The message still lands.
+      }
+    }
+    let rawObjectKey: string | null = null;
+    if (payload.rawBase64) {
+      try {
+        const result = await this.commsAttachments.store({
+          organizationId, attachmentId: randomUUID(), filename: 'message.eml',
+          content: Uint8Array.from(Buffer.from(payload.rawBase64, 'base64'))
+        });
+        rawObjectKey = result.objectKey;
+      } catch {
+        // The archive is a convenience; the message is the record.
+      }
+    }
+    return { attachments, rawObjectKey };
+  }
+
+  // ── Forwarding queries to the Client, and relaying the answer back ────────
+
+  /**
+   * Several subcontractor queries put to the Client as ONE message.
+   *
+   * One message rather than one per query, because that is what the issue asks for and
+   * what a Client can actually answer: six separate emails get one reply between them and
+   * nobody can tell which question it covered. `comms.forward_items` records which queries
+   * this forward carried, which is what later answers exactly that.
+   *
+   * ORDER MATTERS AND IS NOT INCIDENTAL. The Access include list is reconciled BEFORE the
+   * email leaves, the same rule confirmAndSendItt follows: a Client link minted after the
+   * email has gone is refused at the edge with no signal anywhere in this application.
+   */
+  async forwardQueriesToClient(actor: Actor, workflowId: string, input: {
+    messageIds: string[]; clientEmail: string; clientName: string | null; note: string | null;
+  }): Promise<Row> {
+    if (!this.commsDb) throw notFound('Queries are not available for this tender.');
+    await this.assertWorkflowAccess(actor, workflowId);
+
+    const sources = await this.commsDb.messagesByIds(input.messageIds);
+    if (sources.length === 0) throw conflict('Select at least one query to forward.');
+    // Every selected query must belong to THIS tender. Without the check a caller could
+    // forward another organisation's queries by id — the ids are the only thing the
+    // request carries, and assertWorkflowAccess has only vouched for the workflow.
+    const foreign = sources.filter((message) => String(message.workflow_id) !== workflowId);
+    if (foreign.length > 0) throw conflict('Those queries do not all belong to this tender.');
+
+    const organizationId = await this.organizationForWorkflow(workflowId);
+    const config = await this.commsConfig(organizationId);
+    const context = await this.letterContextFor(actor, workflowId).catch(() => null);
+    const projectName = await this.projectNameForWorkflow(workflowId);
+
+    const thread = await this.commsDb.findOrCreateThread({
+      organizationId, workflowId, counterpartyKind: 'client',
+      counterpartyEmail: input.clientEmail, counterpartyName: input.clientName,
+      subcontractorId: null, subject: null
+    });
+
+    const forward = await this.commsDb.recordMessage({
+      threadId: String(thread.id), organizationId, workflowId, shortlistEntryId: null,
+      direction: 'outbound', channel: 'email', kind: 'client_forward',
+      authorName: context?.estimatorName ?? actor.email ?? null,
+      authorEmail: context?.estimatorEmail ?? actor.email ?? null,
+      subject: null, bodyText: input.note,
+      createdBy: actor.userId
+    });
+    if (!forward) throw conflict('That forward has already been sent.');
+    await this.commsDb.recordForwardItems(String(forward.id), sources.map((m) => String(m.id)));
+
+    // A public/free domain never gets a link, the same rule mintPortalLinksFor applies to
+    // a subcontractor: a domain-wide Access include for gmail.com would admit strangers.
+    const domain = domainOf(input.clientEmail);
+    const blockedReason = !this.accessAdmin ? 'access_unconfigured'
+      : isPublicEmailDomain(domain) ? 'public_email_domain'
+      : null;
+    const link = await this.commsDb.mintClientReplyLink({
+      forwardMessageId: String(forward.id), threadId: String(thread.id), organizationId,
+      workflowId, recipientEmail: input.clientEmail,
+      ttlDays: this.clientLinkTtlDays, blockedReason
+    });
+
+    // The reply token is the forward's own id when no link could be issued — the subject
+    // marker and the plus-address still work, so an emailed answer finds its way home even
+    // where the in-app route is closed.
+    const replyToken = link.token != null ? String(link.token) : String(forward.id);
+    const replyUrl = link.token != null && this.portalBaseUrl
+      ? `${this.portalBaseUrl.replace(/\/$/, '')}/client/${link.token}`
+      : null;
+
+    if (this.accessAdmin && link.token != null) {
+      // Unioned at the CALL SITE rather than inside either method, so each stays honest
+      // about its own table. Miss this and the link 403s at the edge, silently.
+      const recipients = [
+        ...(this.portalDb ? await this.portalDb.liveRecipients() : []),
+        ...await this.commsDb.liveClientRecipients()
+      ];
+      await this.accessAdmin.syncFor(recipients).catch(() => undefined);
+    }
+
+    const email = renderRfiForwardEmail(
+      sources.map((message) => ({
+        firmName: message.counterparty_name != null ? String(message.counterparty_name) : String(message.counterparty_email),
+        authorName: message.author_name != null ? String(message.author_name) : null,
+        authorEmail: message.author_email != null ? String(message.author_email) : null,
+        packageName: null,
+        subject: message.subject != null ? String(message.subject) : null,
+        body: message.body_text != null ? String(message.body_text) : '',
+        raisedAt: message.occurred_at as Date,
+        attachmentCount: Number(message.attachment_count ?? 0)
+      })),
+      {
+        projectName,
+        tenderReference: null,
+        estimatorName: context?.estimatorName ?? null,
+        estimatorEmail: context?.estimatorEmail ?? null,
+        organizationName: context?.organizationName ?? null,
+        replyToken, replyUrl
+      }
+    );
+
+    const sent = await this.sendCommsEmail({
+      organizationId,
+      to: this.testEmailOverride?.to ?? input.clientEmail,
+      replyTo: replyAddressFor(config.clientReplyAddress, replyToken),
+      email
+    });
+    await this.commsDb.setExternalMessageId(String(forward.id), sent.externalMessageId);
+    await this.commsDb.setThreadStatus(String(thread.id), 'awaiting_client');
+
+    // A forward that did not send is the one failure here nobody sees. The caller is
+    // told in its response, but that response is gone the moment the page is closed,
+    // while the thread now says "awaiting client" of an employer who was never asked.
+    // Raised AFTER the send rather than with the message, because whether it sent is not
+    // knowable inside the transaction that recorded it.
+    if (!sent.ok) {
+      await this.commsDb.recordNotification({
+        kind: 'forward_failed',
+        organizationId,
+        workflowId,
+        threadId: String(thread.id),
+        messageId: String(forward.id),
+        title: `Queries to ${input.clientEmail} did not send`,
+        body: sent.error ?? 'The email was recorded but the provider rejected it.',
+        deepLinkPath: await this.commsDeepLink(workflowId, String(thread.id))
+      });
+    }
+
+    return {
+      forward_message_id: forward.id, thread_id: thread.id,
+      forwarded: sources.length, sent: sent.ok, error: sent.error,
+      link_blocked_reason: link.blocked_reason, reply_url: replyUrl
+    };
+  }
+
+  /**
+   * The Client's answer passed back to the firms whose queries it covered.
+   *
+   * The recipients are DERIVED from `comms.forward_items` rather than chosen: the answer
+   * belongs to the firms that asked, and letting a caller pick would let it reach a
+   * competitor pricing the same package.
+   */
+  async relayClientAnswer(actor: Actor, clientMessageId: string, input: {
+    note: string | null;
+  }): Promise<Row> {
+    if (!this.commsDb) throw notFound('Queries are not available.');
+    const [clientMessage] = await this.commsDb.messagesByIds([clientMessageId]);
+    if (!clientMessage) throw notFound('That response no longer exists.');
+    if (clientMessage.kind !== 'client_reply') throw conflict('Only a client response can be relayed.');
+    const workflowId = clientMessage.workflow_id != null ? String(clientMessage.workflow_id) : null;
+    if (!workflowId) throw conflict('That response is not attached to a tender yet.');
+    await this.assertWorkflowAccess(actor, workflowId);
+
+    const organizationId = await this.organizationForWorkflow(workflowId);
+    const config = await this.commsConfig(organizationId);
+    const context = await this.letterContextFor(actor, workflowId).catch(() => null);
+    const projectName = await this.projectNameForWorkflow(workflowId);
+
+    // Which forward this answers, and therefore which queries it covers.
+    const forwardId = clientMessage.in_reply_to_message_id != null
+      ? String(clientMessage.in_reply_to_message_id) : null;
+    const queries = forwardId ? await this.commsDb.forwardedQueries(forwardId) : [];
+    if (queries.length === 0) {
+      throw conflict('That response is not linked to any query, so there is nobody to relay it to.');
+    }
+
+    const answer = clientMessage.body_text != null ? String(clientMessage.body_text) : '';
+    const results: Array<{ thread_id: string; to: string; status: string; error?: string }> = [];
+
+    for (const query of queries) {
+      const threadId = String(query.source_thread_id);
+      const to = String(query.counterparty_email);
+      const relay = await this.commsDb.recordMessage({
+        threadId, organizationId, workflowId,
+        shortlistEntryId: query.shortlist_entry_id != null ? String(query.shortlist_entry_id) : null,
+        direction: 'outbound', channel: 'email', kind: 'relay_to_subcontractor',
+        authorName: context?.estimatorName ?? null,
+        authorEmail: context?.estimatorEmail ?? null,
+        subject: query.subject != null ? `Re: ${String(query.subject)}` : null,
+        bodyText: [answer, input.note].filter(Boolean).join('\n\n'),
+        createdBy: actor.userId
+      });
+      if (!relay) continue;
+
+      const email = renderClientAnswerRelayEmail({
+        projectName,
+        packageName: null,
+        originalQuery: query.body_text != null ? String(query.body_text) : '',
+        originalSubject: query.subject != null ? String(query.subject) : null,
+        clientAnswer: answer,
+        answeredOn: clientMessage.occurred_at as Date,
+        estimatorName: context?.estimatorName ?? null,
+        organizationName: context?.organizationName ?? null,
+        portalUrl: null,
+        replyToken: String(relay.id)
+      });
+      const sent = await this.sendCommsEmail({
+        organizationId,
+        to: this.testEmailOverride?.to ?? to,
+        replyTo: config.ittCommsAddress,
+        email
+      });
+      await this.commsDb.setExternalMessageId(String(relay.id), sent.externalMessageId);
+      await this.commsDb.setThreadStatus(threadId, 'answered');
+      results.push({ thread_id: threadId, to, status: sent.ok ? 'sent' : 'failed', error: sent.error });
+    }
+
+    return { relayed: results.length, recipients: results };
+  }
+
+  /** The addresses this organisation uses, with the built-in defaults where it has saved
+   *  nothing. One read, shared by every comms path. */
+  private async commsConfig(organizationId: string): Promise<{
+    ittFromAddress: string; ittCommsAddress: string; clientReplyAddress: string;
+    clientContactName: string | null; clientContactEmail: string | null;
+  }> {
+    const [row] = await this.db.query<Row>(
+      `SELECT * FROM public.itt_comms_config WHERE organization_id = $1 AND project_id IS NULL`,
+      [organizationId]
+    );
+    return {
+      ittFromAddress: row?.itt_from_address ? String(row.itt_from_address) : ITT_FROM_ADDRESS,
+      ittCommsAddress: row?.itt_comms_address ? String(row.itt_comms_address) : ITT_FROM_ADDRESS,
+      clientReplyAddress: row?.client_reply_address ? String(row.client_reply_address) : DEFAULT_CLIENT_REPLY_ADDRESS,
+      clientContactName: row?.client_contact_name != null ? String(row.client_contact_name) : null,
+      clientContactEmail: row?.client_contact_email != null ? String(row.client_contact_email) : null
+    };
+  }
+
+  /** The Client contact this organisation configured, for pre-filling the forward form. */
+  async commsDefaults(actor: Actor, workflowId: string): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    const config = await this.commsConfig(await this.organizationForWorkflow(workflowId));
+    return {
+      client_contact_name: config.clientContactName,
+      client_contact_email: config.clientContactEmail,
+      itt_comms_address: config.ittCommsAddress
+    };
+  }
+
+  /**
+   * Sends one comms email, and never throws.
+   *
+   * A send that fails must not lose the message that was already recorded — the
+   * conversation is the record, and an email is a delivery of it. The failure is returned
+   * so the caller can show it, the same way confirmAndSendItt reports a failed ITT.
+   */
+  private async sendCommsEmail(input: {
+    organizationId: string; to: string; replyTo: string;
+    email: { subject: string; html: string; text: string };
+  }): Promise<{ ok: boolean; error?: string; externalMessageId: string | null }> {
+    if (!this.emailService) return { ok: false, error: 'Email is not configured', externalMessageId: null };
+    const config = await this.commsConfig(input.organizationId);
+    try {
+      const result = await this.emailService.send({
+        from: this.testEmailOverride?.from ?? config.ittFromAddress,
+        to: input.to,
+        replyTo: input.replyTo,
+        subject: input.email.subject,
+        html: input.email.html,
+        text: input.email.text
+      }) as { id?: string } | undefined;
+      return { ok: true, externalMessageId: result?.id ?? null };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : 'Send failed',
+        externalMessageId: null
+      };
+    }
+  }
+
+  /**
+   * Puts each attachment in BuildFlow's object store and returns what to record.
+   *
+   * The attachment id is minted HERE, before the upload, because it is what the object
+   * key is built from — never the filename, which on an inbound email is chosen by
+   * whoever sent it.
+   *
+   * Throws if storage is unavailable, and the caller lets that fail the whole message.
+   * Unlike the ITT's document links, which degrade to an email without them, a query with
+   * its drawing silently missing is worse than a query that visibly failed to send.
+   */
+  private async storeCommsAttachments(
+    organizationId: string, attachments: Array<{ filename: string; content: Uint8Array<ArrayBuffer> }>
+  ): Promise<CommsAttachmentInput[]> {
+    if (attachments.length === 0) return [];
+    if (!this.commsAttachments) {
+      throw conflict('Attachments cannot be accepted at the moment. Send your query without one, or email it.');
+    }
+    const stored: CommsAttachmentInput[] = [];
+    for (const attachment of attachments) {
+      const id = randomUUID();
+      const result = await this.commsAttachments.store({
+        organizationId, attachmentId: id, filename: attachment.filename, content: attachment.content
+      });
+      stored.push({
+        id,
+        filename: attachment.filename,
+        contentType: result.contentType,
+        byteSize: result.byteSize,
+        sha256: result.sha256,
+        objectKey: result.objectKey,
+        // Stored verbatim. BUILDFLOW_COMMS_ATTACHMENTS_API.md: embed `url`, never
+        // construct it — the base we hold is the internal one, unreachable from a browser.
+        shareUrl: result.url,
+        shareToken: result.token,
+        shareExpiresAt: result.expiresAt
+      });
+    }
+    return stored;
   }
 
   // ── Step 3: Comparative ───────────────────────────────────────────────────

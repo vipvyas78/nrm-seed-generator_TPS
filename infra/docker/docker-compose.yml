@@ -47,9 +47,21 @@ services:
       # TPS reads the SCMS module's schema directly for Step 4 shortlist candidates —
       # same database, no HTTP hop to bff-scms.
       SCMS_SCHEMA: ${SCMS_SCHEMA:-scms}
+      # The bearer BuildFlow's own BFF presents on /internal/notifications, so the same
+      # tender-communications bell can appear in both shells. Must match BuildFlow's
+      # TPS_NOTIFICATIONS_TOKEN; unset, those routes do not exist and BuildFlow shows no
+      # bell. Only a bearer, because this route is reached over the shared network and is
+      # not published by nginx - unlike /internal/email/inbound, which also signs.
+      BUILDFLOW_NOTIFICATIONS_TOKEN: ${BUILDFLOW_NOTIFICATIONS_TOKEN:-buildflow-tps-notifications-dev-token}
       LOG_LEVEL: info
     depends_on:
       - migrate-tps
+    # The `comms` schema is migrated by a DIFFERENT compose project
+    # (novamerx-comms-worker), and a depends_on cannot reach across projects - the same
+    # limitation this file already notes for postgres. So server.ts ASSERTS the schema
+    # before serving and this restarts until the comms job has run. Start order is
+    # parent -> comms -> tps.
+    restart: on-failure
     networks:
       - parent
 
