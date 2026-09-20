@@ -50,6 +50,12 @@ services:
       LOG_LEVEL: info
     depends_on:
       - migrate-tps
+    # The `comms` schema is migrated by a DIFFERENT compose project
+    # (novamerx-comms-worker), and a depends_on cannot reach across projects - the same
+    # limitation this file already notes for postgres. So server.ts ASSERTS the schema
+    # before serving and this restarts until the comms job has run. Start order is
+    # parent -> comms -> tps.
+    restart: on-failure
     networks:
       - parent
 

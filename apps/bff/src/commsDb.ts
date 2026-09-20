@@ -9,10 +9,14 @@ import { notFound } from './errors.js';
  * `pricingPortalDb.ts`, `boqReadDb.ts` and `scmsReadDb.ts` already keep from
  * `tenderPrepDb.ts` — which is 3,100 lines and does not need a sixth subject.
  *
- * IT IS ALSO THE SCHEMA BOUNDARY. `comms` is its own module (see migration 022): it is
- * fed by a Cloudflare Email Worker in its own repository and carries no cross-schema
- * foreign keys, so it can move without unpicking anything. Keeping every `comms.` table
- * name inside this one file is what makes that boundary greppable rather than aspirational.
+ * IT IS ALSO THE SCHEMA BOUNDARY, AND THIS FILE IS THE DML HALF OF A SPLIT OWNERSHIP.
+ * The `comms` DDL lives in the `novamerx-comms-worker` repository, which owns every
+ * CREATE and contains no code that reads or writes these tables. TPS owns every SELECT,
+ * INSERT and UPDATE. That is lopsided: a breaking change made there is invisible there.
+ *
+ * So this file staying the ONLY non-test file in TPS that names a `comms.` table is not a
+ * tidiness preference — it keeps the blast radius of a schema change to one file, and
+ * `commsBoundary.test.ts` asserts it rather than trusting this comment.
  * The one deliberate exception is the per-firm RFI count on the tender dashboard, which
  * has to be a LATERAL join against a `tps` query to avoid a second round trip.
  *
@@ -82,13 +86,60 @@ export interface RecordMessageInput {
   attachmentsTruncated?: boolean;
 }
 
+/**
+ * The lowest `comms` migration this code is written against.
+ *
+ * The schema's DDL lives in the `novamerx-comms-worker` repository, which contains no code
+ * that reads or writes these tables — so a breaking change made there is invisible there.
+ * This constant is half of how TPS defends itself: `server.ts` checks it before serving,
+ * so a schema that is ABSENT and one that is BEHIND fail identically, at boot, with a
+ * message naming the repository — rather than as `column "x" does not exist` at 4pm.
+ *
+ * Bump it in the same change that starts depending on a newer migration.
+ */
+export const REQUIRED_COMMS_MIGRATION = '001_comms_schema.sql';
+
+/**
+ * Refuses to continue unless the comms schema is present and at least at the migration
+ * this code needs.
+ *
+ * Deliberately a hard failure rather than a degradation. Subcontractor queries are part of
+ * ITT Dispatch now; a TPS that boots without them would serve a tender page whose
+ * Communications control throws on click, which is a worse failure than not starting. In
+ * compose, `bff-tps` restarts until the comms migration job has run — the same pattern
+ * already used for Postgres, and the reason ordering needs no cross-project `depends_on`.
+ */
+export async function assertCommsSchema(db: Database): Promise<void> {
+  const advice = 'Run `pnpm migrate` in the novamerx-comms-worker repository. Start order is parent -> comms -> tps.';
+  let rows: Array<{ name: string }>;
+  try {
+    rows = await db.query<{ name: string }>(
+      `SELECT name FROM comms.schema_migrations ORDER BY name DESC LIMIT 1`
+    );
+  } catch (error) {
+    throw new Error(
+      `The \`comms\` schema is missing or unreadable, so subcontractor queries cannot work. ${advice}`
+      + ` (${error instanceof Error ? error.message : 'unknown error'})`
+    );
+  }
+  const latest = rows[0]?.name;
+  // String comparison is sound because the filenames are zero-padded and ordered by
+  // construction — the same assumption every migration runner in this suite makes.
+  if (!latest || latest < REQUIRED_COMMS_MIGRATION) {
+    throw new Error(
+      `The \`comms\` schema is at ${latest ?? '(nothing applied)'} but this build needs `
+      + `${REQUIRED_COMMS_MIGRATION}. ${advice}`
+    );
+  }
+}
+
 export class CommsDatabase {
   constructor(private readonly db: Database) {}
 
   /**
    * The thread for one counterparty on one tender, created on first contact.
    *
-   * ON CONFLICT against the two PARTIAL unique indexes 022 declares, so a firm writing
+   * ON CONFLICT against the two PARTIAL unique indexes 001 declares, so a firm writing
    * twice in the same second gets one thread rather than two. Which index applies turns
    * on whether the message could be attributed to a workflow at all, so the statement is
    * written twice rather than once with a coalesce: the untriaged index is keyed on
@@ -135,7 +186,7 @@ export class CommsDatabase {
    * `occurred_at` is CLAMPED to now. A sender's own timestamp can be days or years out —
    * a wrongly-set clock, a forged header — and an uncorrected one would pin the message to
    * the top of the timeline permanently. `received_at` keeps the true arrival time beside
-   * it, and 022's CHECK makes the clamp a guarantee of the database rather than an
+   * it, and 001's CHECK makes the clamp a guarantee of the database rather than an
    * intention of this function.
    *
    * Returns null when `idempotencyKey` names a message already stored. That is a normal

@@ -20,7 +20,40 @@ The TPS services join the parent's external Docker network `buildflow` and share
 
 The parent platform owns the `buildflow` database and its `public` schema. TPS keeps every one of its objects in its own **`tps` schema**, including its own `tps.schema_migrations` ledger — it never writes to the parent's `public.bf_schema_migrations`. The BFF connects with `search_path=tps,public`, so the parent's `bf_*` identity tables stay reachable and are referenced explicitly as `public.bf_*`.
 
-TPS also **creates and migrates a second schema, `comms`** (migration `022`), which holds subcontractor and Client correspondence: threads, messages, attachments, forwards and notifications. It is a separate module rather than more `tps.` tables because it is fed by a Cloudflare Email Worker living in its own repository (`novamerx-comms-worker`) and read by two different front ends. It carries **no cross-schema foreign keys** — `workflow_id`, `shortlist_entry_id`, `organization_id` and `subcontractor_id` are bare UUIDs, the same rule TPS already follows for its own links out — so the store can move repositories without unpicking anything. `search_path` is deliberately **not** widened to include it: every reference is written `comms.`-qualified, the same way `public.bf_*` and `scms.*` are, and `apps/bff/src/commsDb.ts` is the only file that names a `comms.` table. Its migration is applied by TPS's runner and recorded in `tps.schema_migrations`, because a Cloudflare Worker cannot reach a private Postgres — it POSTs over HTTPS and holds no connection string.
+TPS **reads and writes a second schema, `comms`**, which holds subcontractor and Client
+correspondence: threads, messages, attachments, forwards and notifications. **TPS does not
+own it.** The DDL and its own `comms.schema_migrations` ledger live in
+[`novamerx-comms-worker`](https://github.com/vipvyas78/novamerx-comms-worker), alongside the
+Cloudflare Email Worker that feeds it.
+
+**The split is deliberately lopsided: that repository owns every `CREATE`, this one owns
+every `SELECT`, `INSERT` and `UPDATE`.** Because the owning repository holds no code that
+touches these tables, a breaking change there is invisible there — so changes to `comms`
+are **additive only**, renames and drops are two-phase, and this repository defends itself
+three ways:
+
+* `apps/bff/src/commsDb.ts` declares `REQUIRED_COMMS_MIGRATION`, and `server.ts` refuses to
+  start against a database behind it;
+* `comms-schema.integration.test.ts` asserts the exact columns, indexes and constraints this
+  code depends on;
+* `commsBoundary.test.ts` asserts `commsDb.ts` is still the only non-test file that *queries*
+  a `comms.` table, keeping the blast radius of a schema change to one file.
+
+The schema carries **no cross-schema foreign keys** — `workflow_id`, `shortlist_entry_id`,
+`organization_id` and `subcontractor_id` are bare UUIDs, the same rule TPS follows for its
+own links out — which is what made the extraction a move rather than a rewrite. `search_path`
+stays `tps,public` and is deliberately **not** widened: every reference is written
+`comms.`-qualified, exactly as `public.bf_*` and `scms.*` are.
+
+It was migration `022` here until the extraction. **`022` is retired and must not be
+reused** — TPS's next migration is `023`. The orphan row left in `tps.schema_migrations` is
+kept on purpose: it is a true record that the migration was once applied to that database,
+and deleting it would not un-apply it.
+
+**Start order is parent → comms → tps.** A `depends_on` cannot reach a service in another
+compose project, so the ordering is guaranteed by the boot assertion plus
+`restart: on-failure` on `bff-tps`, not by any compose file. Getting it wrong costs a
+restart loop and a log line naming the repository and the command.
 
 Attachment **bytes** are not stored here at all. TPS has no object storage and no S3 client; a file goes to BuildFlow through `POST /internal/comms/attachments` and comes back as a durable link, because the primitive that serves a file to someone who is not a BuildFlow user lives where the bucket is. See `BUILDFLOW_COMMS_ATTACHMENTS_API.md` in the parent repo.
 

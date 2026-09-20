@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "CANONICAL signature test vectors for POST /internal/email/inbound.",
+    "",
+    "This file is copied byte-identically into the TPS repository at",
+    "apps/bff/src/fixtures/inbound-signature-vectors.json, and both test suites iterate it.",
+    "The Worker signs with WebCrypto and TPS verifies with node:crypto; they share no code",
+    "and never will. A fixed expectation is what stops them drifting, because it is an",
+    "ABSOLUTE constant rather than a comparison: change the algorithm, key handling,",
+    "encoding or digest on either side and that side's own CI fails, with the other",
+    "repository absent.",
+    "",
+    "Generated from TPS's own signInboundRequest - the verifier is the authority here, not",
+    "this repository's signer.",
+    "",
+    "'ascii' also happens to pin hex padding: its digest begins 04, a byte below 0x10, so a",
+    "naive toString(16) without padStart produces a 63-character signature and fails here.",
+    "",
+    "'non-ascii' pins UTF-8 on both sides. TextEncoder is UTF-8 and so is node's default",
+    "string encoding, but nothing else proves they agree - and a UK construction subject",
+    "line reaches an em dash and a pound sign on day one."
+  ],
+  "secret": "tps-inbound-email-signing-secret-fixture-v1",
+  "timestamp": "1700000000",
+  "cases": [
+    {
+      "name": "ascii",
+      "body": "{\"messageId\":\"<fixture@novamerx.test>\",\"recipient\":\"novamerx-ittcomms@novamerx.ai\",\"from\":{\"address\":\"sam@acme.test\",\"name\":\"Sam Colleague\"},\"to\":[\"novamerx-ittcomms@novamerx.ai\"],\"cc\":[],\"subject\":\"Ceiling grid query\",\"textBody\":\"Is the suspended ceiling grid included?\",\"attachmentsTruncated\":false}",
+      "expected": "v1=044e14e0d4006f4e58f3a764f78400c6fce388c7a94cdf51dcbbd93024ae2dd5"
+    },
+    {
+      "name": "non-ascii",
+      "body": "{\"subject\":\"Ceiling grid — £1,200 query\",\"textBody\":\"naïve café ✓\"}",
+      "expected": "v1=a83790fa6e51163bf29df909763767256a9fb712ff1ea11440373fac6d940335"
+    }
+  ]
+}

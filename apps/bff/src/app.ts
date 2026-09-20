@@ -103,8 +103,8 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   // every recipient as blocked ('access_unconfigured') and the ITT sends exactly as it
   // did before this feature existed. See config.ts for what each variable gates.
   const portalDb = new PricingPortalDatabase(db);
-  // The RFI message store (schema `comms`, migration 022). Unconditional: it needs only
-  // the database, exactly as portalDb does.
+  // The RFI message store. The `comms` schema is owned by novamerx-comms-worker; this is
+  // the read/write half. Unconditional: it needs only the database, as portalDb does.
   const commsDb = new CommsDatabase(db);
   // Gated on the SAME pair as the other four BuildFlow clients, so a half-configured
   // deployment is not a thing that exists. Without it a query can still be raised, just

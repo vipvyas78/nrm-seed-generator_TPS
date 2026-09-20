@@ -1,11 +1,11 @@
 /**
- * The subcontractor-query store (schema `comms`, migration 022) — real PostgreSQL.
+ * The subcontractor-query store (schema `comms`) — real PostgreSQL.
  *
  *   pnpm --filter @tps/bff exec vitest run src/comms.integration.test.ts
  *
  * What is worth exercising against a live database, and cannot be exercised anywhere else:
  *
- *  - the thread upsert infers the RIGHT partial unique index. 022 declares two, and which
+ *  - the thread upsert infers the RIGHT partial unique index. 001 declares two, and which
  *    one applies turns on whether the message could be attributed to a tender. Inferring
  *    the wrong one either fails outright or — far worse — matches across tenders;
  *  - a NULL workflow_id really does behave as "distinct" to Postgres, which is why the
@@ -156,7 +156,7 @@ describe('the communications store', () => {
 
   it('clamps a sender claiming a time in the future', async () => {
     // An uncorrected future Date: header pins a message to the top of the timeline for
-    // ever. The CHECK in 022 is what makes this a guarantee rather than an intention.
+    // ever. The CHECK in 001 is what makes this a guarantee rather than an intention.
     const thread = await comms.findOrCreateThread({
       organizationId, workflowId, counterpartyKind: 'subcontractor',
       counterpartyEmail: `future@${randomUUID().slice(0, 8)}.test`, counterpartyName: null,
