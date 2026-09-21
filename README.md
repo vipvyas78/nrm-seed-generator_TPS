@@ -90,6 +90,111 @@ somebody's to chase.
 
 Links out of TPS (`package_id`, `organization_id`, `created_by`, and `subcontractor_id` → `scms.subcontractors`) are bare UUIDs with no cross-schema foreign keys, by design.
 
+### ITT reminders
+
+Once an ITT has gone out, a firm that has not confirmed interest is chased at a configurable
+fraction of its tender window (default ¼), and a firm that accepted but has not submitted is
+chased at another (default ½). An estimator can also send either by hand. Added for BuildFlow
+issue #36.
+
+```
+novamerx-scheduled-tasks   (a container in dev, a Cloudflare Worker from staging; cron 30 0 * * *)
+  │  bearer + HMAC over the body         contract: TPS_SCHEDULED_TASKS_API.md
+  ├─ POST /internal/scheduled/itt-replies/pending     unread subcontractor emails
+  ├─   (scheduler classifies each with a model)
+  ├─ POST /internal/scheduled/itt-replies/verdicts    → itt_dispatch.response, flagged for review
+  └─ POST /internal/scheduled/itt-reminders/run       → every reminder that has fallen due
+```
+
+**The scheduler is a timer and a model call.** It holds no database connection and no mail
+credential; every read, send and mark is made here, in `ittRemindersDb.ts`. The split inside TPS
+follows the ITT email's own: the due-rule is pure (`ittReminders.ts`, tested as a table with no
+database), the wording is pure (`reminderEmail.ts`), and the wording itself is **BuildFlow
+configuration** — `public.itt_reminder_templates`, and the timing on `public.itt_comms_config`
+(migration `089` there), edited under Configuration → Tender communications and → ITT attachment
+templates. TPS only reads them.
+
+**The rule is in whole UTC days, from `asOf`, never from the tick.** A window runs from the day
+the ITT was sent to the return date in force (the workflow's explicit date, else the date stamped
+at first dispatch). A cron that fires late, or a day the scheduler was down, gives the same answer
+on the next run. No return date means no reminder, and the run *reports* how many packages that
+skipped (`skipped.no_deadline`) rather than staying silent.
+
+**Each automatic reminder is sent once, guaranteed by the database.** A row in `tps.itt_reminders`
+is *claimed* before the email leaves, under a partial unique index on `(entry, kind, is_test)`
+for automatic sends, so two runs racing cannot both send. A failed send is recorded and re-taken
+on the next run; a claim that never resolved is left alone and reported (`stuckPending`), because
+retrying it could send twice. Manual sends are deliberately outside the index — an estimator
+chasing a firm a second time has decided to.
+
+**The estimator's button picks the email, and the server decides which.** Confirm-interest until
+the firm has accepted, submit-tender once it has; refused for a firm that declined or has
+already returned a price. The label on the tender dashboard and the message that goes cannot
+disagree, because both come from `manualReminderKind`.
+
+**The reminder is on the contractor timeline** as a `comms` message of kind `itt_reminder`,
+recorded *before* it is sent because the message's own id is the reply token in the subject. If
+the send fails the entry is removed again: the timeline is what was sent.
+
+#### Reading a firm's emailed reply
+
+A subcontractor has no way to confirm interest in the app, so without something that closes the
+loop every firm would be chased for ever. They reply by email (which already lands in `comms`),
+the scheduler runs the reply past a model, and TPS writes the verdict as the Accept/Decline mark
+**flagged for review** (`itt_dispatch.response_source = 'email_llm'`). What may be written is
+narrow, and every refusal points the safe way:
+
+* only `will_tender` / `decline`, and only at or above the organisation's confidence floor
+  (default 0.80). `considering` and `unclear` change nothing and the reminders carry on;
+* only when the email pins down **one** package. A firm pricing three packages that writes "yes,
+  we'll tender" has not said which; guessing marks the wrong ones. An email that replies to one
+  of our reminders is pinned by that reminder; an unprompted one only when the firm has a single
+  unanswered package;
+* **never over a mark a person set.** `response_source NULL` predates the column and is treated
+  as manual. Confirming an email-derived mark on the dashboard makes it manual, after which no
+  later email can change it;
+* an email-derived mark *may* be changed by a later email from the same firm — people change
+  their minds.
+
+Every message read is recorded in `tps.itt_reply_classifications`, applied or not, so nothing is
+sent to the model twice. It lives in `tps`, not on `comms.messages`, because TPS may not alter
+the `comms` schema. The bell entry (`itt_response_detected`) leaves `message_id` NULL on purpose:
+that column is `UNIQUE`, the inbound message may already carry its own notification, and
+`ON CONFLICT DO NOTHING` would swallow this one silently.
+
+#### Security: these routes are reachable from the internet
+
+`infra/docker/nginx-web.conf` ends in a catch-all `location /tps-api/`, which forwards **every**
+path to this process. The comment on `/internal/notifications` above — "not published by nginx" —
+is therefore wrong: every `/internal/*` route is reachable through the tunnel, and a bare bearer
+is not enough for any that can do harm. `/internal/scheduled/*` uses the `/internal/email/inbound`
+scheme: bearer **and** an HMAC over the body with the timestamp inside it, refused more than five
+minutes out in either direction. It has its **own** secret pair (`SCHEDULED_TASKS_TOKEN`,
+`SCHEDULED_TASKS_SIGNING_SECRET`), registered only when both are set, refusing to boot with one.
+Tightening the catch-all is a separate change and is not needed for this one to be safe.
+
+#### Simulating a timeline
+
+`asOf` on the run route is honoured **only** when `TEST_EMAIL_FLAG=Y`; elsewhere it is ignored,
+so no caller can move the clock that decides who is emailed. To walk a tender through its
+timeline into a test inbox:
+
+```bash
+# .env: TEST_EMAIL_FLAG=Y, TEST_FROM_EMAIL_ACCOUNT=…, TEST_TO_EMAIL_ACCOUNT=vipvyas@novamerx.ai
+pnpm --filter @tps/bff send-test-reminders -- --as-of 2026-10-08 --as-of 2026-10-15
+pnpm --filter @tps/bff send-test-reminders -- --reset      # wind it all back
+```
+
+Reminders sent this way are recorded `is_test`: they cannot use up a real firm's once-only
+reminder, carry a `[TEST]` marker on the timeline, and `--reset` removes them and their timeline
+entries without ever touching a real one. Reminders must be switched on for the organisation
+(Configuration → Tender communications) or nothing is considered.
+
+**Migrations.** `023_itt_reminders.sql` here (`022` is retired), and `002_itt_reminder_kinds.sql`
+in `novamerx-comms-worker`, which widens two `comms` CHECKs. `REQUIRED_COMMS_MIGRATION` is now
+`002_…`, so **comms migrates before TPS deploys**: `bff-tps` refuses to boot against a `comms`
+schema behind it.
+
 ### Reading the SCMS schema
 
 Step 1 (Tender Launch Pack) sources its shortlist candidates by querying the SCMS module's `scms` schema **directly** in the shared database, rather than calling the SCMS BFF over HTTP — same database, no extra hop, and no CORS/network change needed.

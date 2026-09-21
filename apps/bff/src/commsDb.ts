@@ -50,7 +50,8 @@ export type AttributionMethod =
   | 'reply_token' | 'subject_marker' | 'in_reply_to' | 'sender_email' | 'sender_domain' | 'manual';
 
 export type NotificationKind =
-  | 'subcontractor_rfi' | 'client_reply' | 'forward_failed' | 'unattributed_email';
+  | 'subcontractor_rfi' | 'client_reply' | 'forward_failed' | 'unattributed_email'
+  | 'itt_response_detected';
 
 /**
  * What the bell says, decided by the caller rather than derived here.
@@ -71,7 +72,8 @@ export interface NotificationInput {
 }
 
 export type MessageKind =
-  | 'subcontractor_rfi' | 'client_forward' | 'client_reply' | 'relay_to_subcontractor' | 'note';
+  | 'subcontractor_rfi' | 'client_forward' | 'client_reply' | 'relay_to_subcontractor' | 'note'
+  | 'itt_reminder';
 
 export interface RecordMessageInput {
   threadId: string;
@@ -125,7 +127,7 @@ export interface RecordMessageInput {
  *
  * Bump it in the same change that starts depending on a newer migration.
  */
-export const REQUIRED_COMMS_MIGRATION = '001_comms_schema.sql';
+export const REQUIRED_COMMS_MIGRATION = '002_itt_reminder_kinds.sql';
 
 /**
  * Refuses to continue unless the comms schema is present and at least at the migration
@@ -295,6 +297,74 @@ export class CommsDatabase {
       );
       return message;
     });
+  }
+
+  /** The message stored under an idempotency key, if any. Lets a caller that recorded a
+   *  message BEFORE knowing its id (a reminder, whose id is the reply token) find it again. */
+  async messageIdByIdempotencyKey(key: string): Promise<string | null> {
+    const rows = await this.db.query<{ id: string }>(
+      `SELECT id::text AS id FROM comms.messages WHERE idempotency_key = $1`, [key]
+    );
+    return rows[0]?.id ?? null;
+  }
+
+  async threadsByIds(ids: string[]): Promise<Row[]> {
+    if (ids.length === 0) return [];
+    return this.db.query(`SELECT * FROM comms.threads WHERE id = ANY($1::uuid[])`, [ids]);
+  }
+
+  /**
+   * Removes one message, and with it (by cascade) its attachments and any notification.
+   *
+   * Exists for ONE caller: a reminder is recorded BEFORE it is sent, because the message's own
+   * id is the reply token that goes in the subject. If the send then fails, the timeline must
+   * not say a reminder reached a subcontractor that never received one - the comms timeline is
+   * "what was sent", and the failure is recorded on tps.itt_reminders instead. Deliberately
+   * not used for anything that arrived from outside: an inbound message is never discarded.
+   */
+  async discardMessage(messageId: string): Promise<void> {
+    await this.db.query(`DELETE FROM comms.messages WHERE id = $1`, [messageId]);
+  }
+
+  /**
+   * Inbound emails from subcontractors that have not yet been read for an accept / decline.
+   *
+   * Only emails on a thread attributed to a tender AND a firm - anything else has nobody to
+   * mark. `reply_entry_id` is the package the email answers WHEN it is a reply to one of our
+   * own messages (an outbound reminder carries the shortlist entry it was about), which is the
+   * only precise way to know which package a firm is talking about: an email itself carries a
+   * sender and nothing else. NULL means the firm wrote unprompted.
+   *
+   * `already_read` is passed in as a list of message ids rather than joined against
+   * tps.itt_reply_classifications, so this file names no table but its own schema's.
+   * Bounded by age and count: a mailbox that grows for ever must not become a nightly
+   * full scan, and an email older than the window is not a live answer to a live tender.
+   */
+  async inboundEmailsSince(input: {
+    since: Date; limit: number; excludeMessageIds: string[];
+    /** Narrow to one tender. Used by tests against a shared database, and handy for debugging. */
+    workflowId?: string;
+  }): Promise<Row[]> {
+    return this.db.query(
+      `SELECT m.id AS message_id, m.thread_id, m.organization_id, m.workflow_id,
+              m.subject, m.body_text, m.occurred_at,
+              t.subcontractor_id, t.counterparty_name, t.counterparty_email,
+              parent.shortlist_entry_id AS reply_entry_id
+         FROM comms.messages m
+         JOIN comms.threads t ON t.id = m.thread_id
+         LEFT JOIN comms.messages parent ON parent.id = m.in_reply_to_message_id
+        WHERE m.direction = 'inbound'
+          AND m.channel = 'email'
+          AND t.counterparty_kind = 'subcontractor'
+          AND t.subcontractor_id IS NOT NULL
+          AND m.workflow_id IS NOT NULL
+          AND m.occurred_at >= $1
+          AND NOT (m.id = ANY($3::uuid[]))
+          AND ($4::uuid IS NULL OR m.workflow_id = $4::uuid)
+        ORDER BY m.occurred_at ASC
+        LIMIT $2`,
+      [input.since, input.limit, input.excludeMessageIds, input.workflowId ?? null]
+    );
   }
 
   /**

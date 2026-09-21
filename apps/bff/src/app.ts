@@ -21,7 +21,8 @@ import { DropboxDocumentLinkProvider } from './documentLinkProvider.js';
 import { EmailService } from './emailService.js';
 import { PricingPortalDatabase } from './pricingPortalDb.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
-import { TenderPrepDatabase } from './tenderPrepDb.js';
+import { ITT_FROM_ADDRESS, TenderPrepDatabase } from './tenderPrepDb.js';
+import { IttRemindersDatabase } from './ittRemindersDb.js';
 import { TENDER_RETURN_MAX, TENDER_RETURN_UNITS } from './tenderReturnPeriod.js';
 import type { Actor } from './types.js';
 
@@ -137,6 +138,12 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, documentBundles,
     emailService, testEmailOverride, portalDb, accessAdmin, portalBaseUrl, config.PORTAL_LINK_TTL_DAYS,
     mepBoq, commsDb, commsAttachments, config.CLIENT_LINK_TTL_DAYS
+  );
+
+  // ITT reminders and the reading of a firm's emailed reply. Its own module rather than more
+  // methods on tpDb, which is already four thousand lines; it shares the same collaborators.
+  const reminders = new IttRemindersDatabase(
+    db, scmsDb, commsDb, emailService, testEmailOverride, portalBaseUrl, ITT_FROM_ADDRESS
   );
 
   app.decorate('tps', { config, db, tpDb, scmsDb });
@@ -362,6 +369,83 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
         // was not stored.
         const result = await tpDb.ingestInboundEmail(payload, key);
         return reply.status(result.status === 'duplicate' ? 200 : 202).send(result);
+      });
+    });
+  }
+
+  // ── Scheduled tasks, from novamerx-scheduled-tasks ─────────────────────────────
+  //
+  // The daily job that reads subcontractors' replies for an accept / decline and sends the
+  // ITT reminders that have fallen due. The scheduler holds no database connection and no
+  // mail credential: it is a timer and a model call, and everything that changes anything
+  // happens here.
+  //
+  // SIGNED, NOT JUST BEARER. infra/docker/nginx-web.conf forwards every /tps-api/ path to
+  // this process, so unlike the comment on the notifications routes below claims for
+  // itself, an /internal/* route IS reachable from the internet. A leaked bearer alone would
+  // let anyone email every subcontractor on every tender, or mark a firm as having
+  // declined. Same scheme as /internal/email/inbound: bearer AND an HMAC over the body with
+  // the timestamp inside it, refused more than five minutes out in EITHER direction.
+  //
+  // Registered only when both secrets are set. Unset, the routes do not exist and the
+  // feature is manual-only, which is a far better failure than an open route.
+  if (config.SCHEDULED_TASKS_TOKEN && config.SCHEDULED_TASKS_SIGNING_SECRET) {
+    const scheduledToken = config.SCHEDULED_TASKS_TOKEN;
+    const scheduledSecret = config.SCHEDULED_TASKS_SIGNING_SECRET;
+    await app.register(async (scheduled) => {
+      // Encapsulated so keeping the raw body costs THESE routes alone. The signature covers
+      // the bytes that arrived, so the exact string has to survive parsing.
+      scheduled.addContentTypeParser<string>(
+        'application/json', { parseAs: 'string', bodyLimit: 1024 * 1024 },
+        (request, rawBody, done) => {
+          (request as FastifyRequest & { rawBody?: string }).rawBody = rawBody;
+          try {
+            done(null, rawBody.trim() === '' ? {} : JSON.parse(rawBody));
+          } catch {
+            done(new AppError(422, 'Body is not valid JSON', 'VALIDATION_FAILED'));
+          }
+        }
+      );
+      const authenticate = (request: FastifyRequest): void => {
+        if (request.headers.authorization !== `Bearer ${scheduledToken}`) {
+          throw new AppError(401, 'Invalid scheduled-tasks token', 'UNAUTHENTICATED');
+        }
+        const verification = verifyInboundSignature({
+          secret: scheduledSecret,
+          signatureHeader: request.headers['x-tps-signature'] as string | undefined,
+          timestampHeader: request.headers['x-tps-timestamp'] as string | undefined,
+          rawBody: (request as FastifyRequest & { rawBody?: string }).rawBody ?? ''
+        });
+        if (!verification.ok) throw new AppError(401, `Signature ${verification.reason}`, 'BAD_SIGNATURE');
+      };
+
+      scheduled.post('/internal/scheduled/itt-replies/pending', async (request) => {
+        authenticate(request);
+        return { replies: await reminders.pendingReplies() };
+      });
+
+      scheduled.post('/internal/scheduled/itt-replies/verdicts', async (request) => {
+        authenticate(request);
+        const input = body(request, z.object({
+          verdicts: z.array(z.object({
+            messageId: uuid,
+            verdict: z.enum(['will_tender', 'decline', 'considering', 'unclear']),
+            confidence: z.number().min(0).max(1),
+            evidence: z.string().max(2000).nullable().default(null),
+            model: z.string().max(100).nullable().default(null)
+          })).max(100)
+        }));
+        return { outcomes: await reminders.applyVerdicts(input.verdicts) };
+      });
+
+      scheduled.post('/internal/scheduled/itt-reminders/run', async (request) => {
+        authenticate(request);
+        const input = body(request, z.object({ asOf: z.string().datetime().optional() }));
+        // `asOf` is honoured ONLY in test mode. It is how a four-week timeline is simulated
+        // in an afternoon; on a live deployment it is ignored, so no caller can move the
+        // clock that decides who gets emailed.
+        const asOf = reminders.isTestMode && input.asOf ? new Date(input.asOf) : new Date();
+        return reminders.runDue(asOf);
       });
     });
   }
@@ -775,6 +859,24 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     protectedApi.post('/api/tender-prep/:workflowId/itts/send-all', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));
       return tpDb.sendIttsForWorkflow(requireActor(request), workflowId);
+    });
+
+    // ── ITT reminders, by hand ─────────────────────────────────────────────────
+    // What "Send reminder" would send for this firm, so the button can say so before it is
+    // clicked. The SERVER decides which email: confirm-interest until the firm has accepted,
+    // submit-tender once it has.
+    protectedApi.get('/api/tender-prep/itt/:dispatchId/reminder', async (request) => {
+      const { dispatchId } = params(request, z.object({ dispatchId: uuid }));
+      return reminders.previewManual(requireActor(request), dispatchId);
+    });
+    protectedApi.post('/api/tender-prep/itt/:dispatchId/reminder', async (request) => {
+      const { dispatchId } = params(request, z.object({ dispatchId: uuid }));
+      return reminders.sendManual(requireActor(request), dispatchId);
+    });
+    // Reminders already sent for this tender, for the history beside each firm.
+    protectedApi.get('/api/tender-prep/:workflowId/itt-reminders', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return reminders.listForWorkflow(requireActor(request), workflowId);
     });
 
     protectedApi.patch('/api/tender-prep/itt/:dispatchId', async (request) => {

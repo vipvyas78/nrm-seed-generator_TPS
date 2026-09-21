@@ -22,6 +22,7 @@ import type { PortalLineDraftInput, PortalLineInput, PricingPortalDatabase } fro
 import type { ScmsReadDatabase } from './scmsReadDb.js';
 import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js';
 import { deriveReturnDate, isTenderReturnUnit } from './tenderReturnPeriod.js';
+import { manualReminderKind, type IttResponse } from './ittReminders.js';
 import type { Actor } from './types.js';
 
 /**
@@ -38,7 +39,7 @@ import type { Actor } from './types.js';
  * unavoidable — the two processes share a database, not a module — and it is safe because
  * it is a FALLBACK on both sides rather than a value either of them writes.
  */
-const ITT_FROM_ADDRESS = 'tenders@novamerx.ai';
+export const ITT_FROM_ADDRESS = 'tenders@novamerx.ai';
 
 /** Where a Client's answer comes back to when the organisation has configured nothing.
  *  Duplicated from BuildFlow's ittComms.ts for the same reason ITT_FROM_ADDRESS is: the
@@ -1875,9 +1876,11 @@ export class TenderPrepDatabase {
 
     const dispatches = await this.db.query<{
       package_name: string; subcontractor_id: string; response: string | null; dispatched_at: string | null;
+      entry_id: string; dispatch_id: string | null; response_source: string | null; email_status: string | null;
     }>(
       `SELECT sl.package_name, se.subcontractor_id::text AS subcontractor_id,
-              d.response, d.dispatched_at
+              d.response, d.dispatched_at,
+              se.id::text AS entry_id, d.id::text AS dispatch_id, d.response_source, d.email_status
          FROM shortlists sl
          JOIN shortlist_entries se ON se.shortlist_id = sl.id
          LEFT JOIN itt_dispatch d ON d.shortlist_entry_id = se.id
@@ -1891,6 +1894,25 @@ export class TenderPrepDatabase {
          FROM tender_returns WHERE workflow_id = $1 AND subcontractor_id IS NOT NULL`,
       [workflowId]
     );
+
+    // Reminders already sent, per invitation, so ITT Dispatch can show the history beside the
+    // "Send reminder" button. 'sent' only: a failed or still-pending attempt reached nobody.
+    const reminderRows = await this.db.query<{
+      shortlist_entry_id: string; n: string; last_sent_at: string; last_kind: string;
+    }>(
+      `SELECT r.shortlist_entry_id::text AS shortlist_entry_id, count(*)::text AS n,
+              max(r.sent_at) AS last_sent_at,
+              (array_agg(r.kind ORDER BY r.sent_at DESC))[1] AS last_kind
+         FROM itt_reminders r
+         JOIN shortlist_entries se ON se.id = r.shortlist_entry_id
+         JOIN shortlists sl ON sl.id = se.shortlist_id
+        WHERE sl.workflow_id = $1 AND r.email_status = 'sent' AND r.is_test = $2
+        GROUP BY r.shortlist_entry_id`,
+      // In test mode the dashboard shows the test reminders, and only those, so a simulated
+      // run is visible where it was made and a real one is never confused with it.
+      [workflowId, Boolean(this.testEmailOverride)]
+    );
+    const remindersBy = new Map(reminderRows.map((row) => [row.shortlist_entry_id, row]));
 
     // Which firms have asked for clarification, so the dashboard can put the icon the
     // issue asks for against them. Its own round trip rather than a join into the query
@@ -1972,6 +1994,18 @@ export class TenderPrepDatabase {
               // are both "not accepted", and only one of them is a firm declining.
               accepted: dispatch?.response === 'will_tender',
               declined: dispatch?.response === 'decline',
+              // What "Send reminder" would send, decided by the same pure rule the server
+              // applies when the button is clicked - so the label can never promise one email
+              // and deliver the other. Null (with no button) for a firm that declined or has
+              // already returned a price, and for one whose invitation never went out.
+              dispatch_id: dispatch?.dispatch_id ?? null,
+              response_source: dispatch?.response_source ?? null,
+              reminder_kind: dispatch?.dispatch_id && dispatch.email_status === 'sent'
+                ? (manualReminderKind((dispatch.response as IttResponse) ?? null, Boolean(tenderReturn)).kind)
+                : null,
+              reminders_sent: Number(remindersBy.get(dispatch?.entry_id ?? '')?.n ?? 0),
+              last_reminder_at: remindersBy.get(dispatch?.entry_id ?? '')?.last_sent_at ?? null,
+              last_reminder_kind: remindersBy.get(dispatch?.entry_id ?? '')?.last_kind ?? null,
               tendered_sum: tenderReturn?.tendered_sum ?? null,
               // Test data travels through the same tables as a real bid, and every read that
               // reaches a human has to say which it is looking at.
@@ -2969,7 +3003,12 @@ export class TenderPrepDatabase {
     );
     await this.assertWorkflowAccess(actor, String(shortlist.workflow_id));
     return this.db.one(
-      `UPDATE itt_dispatch SET response = $1, responded_at = NOW() WHERE id = $2 RETURNING *`,
+      // A person setting the mark is what 'manual' means, and it is what stops the email
+      // classifier ever overwriting it. Confirming a mark the classifier read (the "read from
+      // their email, confirm" button) goes through here too, and correctly becomes manual.
+      `UPDATE itt_dispatch SET response = $1, responded_at = NOW(), response_source = 'manual',
+              response_message_id = NULL, response_confidence = NULL
+        WHERE id = $2 RETURNING *`,
       [response, dispatchId]
     );
   }
