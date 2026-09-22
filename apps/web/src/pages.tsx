@@ -240,7 +240,7 @@ function TakeoffSummary({ takeoff, packageId }: { takeoff: TakeoffCompletion; pa
 //
 // The client's agreed package breakdown, in their own order, one row per package. The
 // suggested firms sit inside the row rather than exploding it, so the numbering stays 1..N
-// and reads as the project breakdown it is.
+// and reads as the tender breakdown it is.
 
 /**
  * One package. Selection is held locally until saved, so management can work down the
@@ -493,7 +493,7 @@ function Step1TenderLaunchPack({ workflowId }: { workflowId: string }) {
       </p>
       <p className="muted" style={{ fontSize: '0.8rem', marginTop: 8 }}>
         Which packages are required is decided by the work packages the take-off resolved and
-        the project&rsquo;s scope, against the NRM1 work-package configuration.
+        the tender&rsquo;s scope, against the NRM1 work-package configuration.
       </p>
     </div>;
   }
@@ -587,7 +587,7 @@ function IttPackView({ pack, workflowId, packageName }: { pack: IttPack; workflo
 
     <div className="info-row">
       <div className="info-item"><span className="info-label">ITT reference</span>
-        <code>ITT-{String(t.projectName ?? 'PROJECT').toUpperCase()}-{pack.display_ref}</code></div>
+        <code>ITT-{String(t.tenderName ?? 'TENDER').toUpperCase()}-{pack.display_ref}</code></div>
       <div className="info-item"><span className="info-label">Route of procurement</span>{pack.route_of_procurement}</div>
       <div className="info-item"><span className="info-label">Take-off</span><code>{String(t.takeoffId ?? '—')}</code></div>
       <div className="info-item"><span className="info-label">BoQ</span><code>{pack.boq_id ?? '—'}</code></div>

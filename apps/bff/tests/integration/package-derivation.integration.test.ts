@@ -31,17 +31,15 @@ function message(overrides: Partial<TakeoffTendered> = {}): TakeoffTendered {
     packageId: randomUUID(),
     organizationId: randomUUID(),
     requestedBy: randomUUID(),
-    projectId: randomUUID(),
-    projectName: 'Reading',
     packageName: 'Main Works',
     packageVersionId: randomUUID(),
     versionNumber: 1,
     revision: 1,
-    tenderId: null,
-    tenderName: null,
+    tenderId: randomUUID(),
+    tenderName: 'Reading',
     tenderReference: null,
     itemCount: 525,
-    projectScope: 'works',
+    tenderScope: 'works',
     workPackages: [{ wpCode: 'WP-DRYLINE', itemCount: 14 }],
     tenderedAt: new Date().toISOString(),
     ...overrides
@@ -58,8 +56,29 @@ describe('the tendered message', () => {
     expect(parsed.workPackages).toEqual([]);
   });
 
-  it('accepts a null project scope', () => {
-    expect(takeoffTenderedMessage.parse({ ...message(), projectScope: null }).projectScope).toBeNull();
+  it('accepts a null tender scope', () => {
+    expect(takeoffTenderedMessage.parse({ ...message(), tenderScope: null }).tenderScope).toBeNull();
+  });
+
+  it('strips the legacy project spellings rather than storing them', () => {
+    // The schema is a plain z.object, so zod STRIPS what it does not declare -- and
+    // queues.ts parses before tenderPrepDb stores the result. That is what makes
+    // BuildFlow's removal of its legacy aliases a no-op here, and it is also why a key
+    // BuildFlow adds is unusable until it is declared (issue #13).
+    const parsed = takeoffTenderedMessage.parse({
+      ...message(), projectId: randomUUID(), projectName: 'Reading', projectScope: 'design_and_build'
+    }) as Record<string, unknown>;
+    expect(parsed.projectId).toBeUndefined();
+    expect(parsed.projectName).toBeUndefined();
+    expect(parsed.projectScope).toBeUndefined();
+    expect(parsed.tenderScope).toBe('works');
+  });
+
+  it('refuses a message with no tender', () => {
+    // bf_takeoff_packages.tender_id is NOT NULL since BuildFlow migration 091, so a
+    // missing tender is a malformed message -- not a package that simply has none.
+    const { tenderId: _dropped, ...withoutTender } = message();
+    expect(() => takeoffTenderedMessage.parse(withoutTender)).toThrow();
   });
 
   it('still ignores fields BuildFlow adds later', () => {
@@ -67,7 +86,7 @@ describe('the tendered message', () => {
   });
 });
 
-describe('deriving a project package list', () => {
+describe('deriving a tender package list', () => {
   if (!DATABASE_URL) {
     it.skip('skipped - DATABASE_URL not set', () => {});
     return;
@@ -80,7 +99,7 @@ describe('deriving a project package list', () => {
   };
 
   const cleanup = async (db: Database, msg: TakeoffTendered) => {
-    await db.query(`DELETE FROM package_config WHERE project_id = $1`, [msg.projectId]);
+    await db.query(`DELETE FROM package_config WHERE project_id = $1`, [msg.tenderId]);
     await db.query(`DELETE FROM route_options WHERE organization_id = $1`, [msg.organizationId]);
     await db.close();
   };
@@ -95,12 +114,12 @@ describe('deriving a project package list', () => {
       expect(result.selected).toBeGreaterThan(0);
       expect(result.byCondition.All).toBeGreaterThan(0);
       expect(result.byCondition.Manual).toBeGreaterThan(0);
-      // projectScope is 'works', so no D&B package may be selected.
+      // tenderScope is 'works', so no D&B package may be selected.
       expect(result.byCondition['D&B']).toBeUndefined();
 
       const rows = await db.query<{ wp_code: string; wp_scope_condition: string; name: string; trade_terms: string[] }>(
         `SELECT wp_code, wp_scope_condition, name, trade_terms FROM package_config
-          WHERE project_id = $1 AND is_active`, [msg.projectId]);
+          WHERE project_id = $1 AND is_active`, [msg.tenderId]);
       const byCode = new Map(rows.map((row) => [row.wp_code, row]));
 
       // Measured, and its condition is TOQ — in, and named from the vocabulary.
@@ -122,8 +141,8 @@ describe('deriving a project package list', () => {
 
   it('admits the D&B package only on a design-and-build appointment', async () => {
     const { db, tpDb } = connect();
-    const works = message({ projectScope: 'works' });
-    const dnb = message({ projectScope: 'design_and_build', projectId: works.projectId, organizationId: works.organizationId });
+    const works = message({ tenderScope: 'works' });
+    const dnb = message({ tenderScope: 'design_and_build', tenderId: works.tenderId, organizationId: works.organizationId });
     const actor = { userId: works.requestedBy, organizationId: works.organizationId, subject: 'test' };
     try {
       const first = await tpDb.buildPackagesFromTakeoff(actor, works);
@@ -135,7 +154,7 @@ describe('deriving a project package list', () => {
 
       const [row] = await db.query<{ route_of_procurement: string }>(
         `SELECT route_of_procurement FROM package_config
-          WHERE project_id = $1 AND wp_scope_condition = 'D&B'`, [dnb.projectId]);
+          WHERE project_id = $1 AND wp_scope_condition = 'D&B'`, [dnb.tenderId]);
       expect(row.route_of_procurement).toBe('Design, Supply and install');
     } finally {
       await cleanup(db, works);
@@ -146,13 +165,13 @@ describe('deriving a project package list', () => {
     // package_bill_lines and attendance_items cascade off package_config.id. A delete here
     // is how 890 lines of authored survey schedule were lost once already.
     const { db, tpDb } = connect();
-    const dnb = message({ projectScope: 'design_and_build' });
-    const works = message({ projectScope: 'works', projectId: dnb.projectId, organizationId: dnb.organizationId });
+    const dnb = message({ tenderScope: 'design_and_build' });
+    const works = message({ tenderScope: 'works', tenderId: dnb.tenderId, organizationId: dnb.organizationId });
     const actor = { userId: dnb.requestedBy, organizationId: dnb.organizationId, subject: 'test' };
     try {
       await tpDb.buildPackagesFromTakeoff(actor, dnb);
       const [dnbRow] = await db.query<{ id: string }>(
-        `SELECT id FROM package_config WHERE project_id = $1 AND wp_scope_condition = 'D&B'`, [dnb.projectId]);
+        `SELECT id FROM package_config WHERE project_id = $1 AND wp_scope_condition = 'D&B'`, [dnb.tenderId]);
       expect(dnbRow).toBeTruthy();
 
       const result = await tpDb.buildPackagesFromTakeoff(actor, works);
@@ -175,15 +194,15 @@ describe('deriving a project package list', () => {
       await tpDb.buildPackagesFromTakeoff(actor, msg);
       await db.query(
         `UPDATE package_config SET route_of_procurement = 'Full scope to completion'
-          WHERE project_id = $1 AND wp_code = 'WP-DRYLINE'`, [msg.projectId]);
+          WHERE project_id = $1 AND wp_code = 'WP-DRYLINE'`, [msg.tenderId]);
 
       await tpDb.buildPackagesFromTakeoff(actor, message({
-        projectId: msg.projectId, organizationId: msg.organizationId
+        tenderId: msg.tenderId, organizationId: msg.organizationId
       }));
 
       const [row] = await db.query<{ route_of_procurement: string }>(
         `SELECT route_of_procurement FROM package_config WHERE project_id = $1 AND wp_code = 'WP-DRYLINE'`,
-        [msg.projectId]);
+        [msg.tenderId]);
       // route_of_procurement is deliberately absent from the DO UPDATE set: the derivation
       // proposes a route, it does not overrule the person who tendered the package.
       expect(row.route_of_procurement).toBe('Full scope to completion');
@@ -197,9 +216,9 @@ describe('deriving a project package list', () => {
     const msg = message();
     try {
       await handleTakeoffTendered({ data: msg }, tpDb);
-      const first = await db.query(`SELECT wp_code FROM package_config WHERE project_id = $1`, [msg.projectId]);
+      const first = await db.query(`SELECT wp_code FROM package_config WHERE project_id = $1`, [msg.tenderId]);
       await handleTakeoffTendered({ data: msg }, tpDb);
-      const second = await db.query(`SELECT wp_code FROM package_config WHERE project_id = $1`, [msg.projectId]);
+      const second = await db.query(`SELECT wp_code FROM package_config WHERE project_id = $1`, [msg.tenderId]);
       expect(second).toHaveLength(first.length);
     } finally {
       await cleanup(db, msg);

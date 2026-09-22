@@ -570,7 +570,7 @@ function RfiReview({ workflowId }: { workflowId: string }) {
  *  PackagesListPage already uses for its own table. */
 function workflowLabel(workflow: TenderPrepWorkflow): string {
   const takeoff = workflow.step_data?.takeoff;
-  const name = takeoff?.projectName ?? takeoff?.tenderName ?? workflow.package_id;
+  const name = takeoff?.tenderName ?? workflow.package_id;
   return takeoff?.packageName ? `${name} — ${takeoff.packageName}` : String(name);
 }
 

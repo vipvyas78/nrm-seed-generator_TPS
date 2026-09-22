@@ -141,7 +141,7 @@ export interface IttEmailPortalStatus {
 }
 
 export interface IttEmailOptions {
-  projectName: string;
+  tenderName: string;
   /** Everything the tender pack contains, as one zip. The safety net beside each package pack. */
   completeBundleUrl: string | null;
   letterContext: IttEmailLetterContext;
@@ -457,11 +457,11 @@ export function renderIttEmail(
   recipient: IttEmailRecipient,
   options: IttEmailOptions
 ): { subject: string; html: string; text: string } {
-  const { projectName, completeBundleUrl, letterContext } = options;
+  const { tenderName, completeBundleUrl, letterContext } = options;
   const many = packages.length > 1;
   const subject = many
-    ? `Invitation to Tender — ${packages.length} packages — ${projectName}`
-    : `Invitation to Tender — ${packages[0]?.packageName ?? 'Tender'} — ${projectName}`;
+    ? `Invitation to Tender — ${packages.length} packages — ${tenderName}`
+    : `Invitation to Tender — ${packages[0]?.packageName ?? 'Tender'} — ${tenderName}`;
   const greeting = recipient.name ? `Dear ${recipient.name},` : 'Dear Sir/Madam,';
   const packageList = packages.map((p) => `${p.packageName} (ref ${p.displayRef})`);
   const workPackageLine = many ? 'Multiple packages — see below' : (packages[0]?.packageName ?? 'Tender');
@@ -497,14 +497,14 @@ export function renderIttEmail(
     ? `\nCOMPLETE TENDER DOCUMENT SET\nEverything issued with this tender, as a single download. Your package pack${many ? 's' : ''} above ${many ? 'are' : 'is'} a narrowed selection of it.\n - ${completeBundleUrl}\n`
     : '';
 
-  const text = `Our Ref: ${projectName} / ${workPackageLine}
+  const text = `Our Ref: ${tenderName} / ${workPackageLine}
 
 ${recipient.name ?? ''}${recipient.address ? `\n${recipient.address}` : ''}
 
 Date: ${today}
 FAO: ${recipient.name ?? 'Sir/Madam'}
 
-INVITATION TO TENDER: ${projectName}
+INVITATION TO TENDER: ${tenderName}
 SITE ADDRESS: ${letterContext.siteAddress ?? 'To be confirmed'}
 WORK PACKAGE: ${workPackageLine}
 
@@ -534,12 +534,12 @@ On behalf of ${letterContext.organizationName}
 
   const html = `
 <div style="font-family: Arial, Helvetica, sans-serif; max-width: 640px; margin: 0 auto; color: #1a1a1a;">
-  <p style="margin-bottom: 2px;"><em>Our Ref: ${esc(projectName)} / ${esc(workPackageLine)}</em></p>
+  <p style="margin-bottom: 2px;"><em>Our Ref: ${esc(tenderName)} / ${esc(workPackageLine)}</em></p>
   <p style="margin: 12px 0 2px;">${recipient.name ? esc(recipient.name) : ''}${recipient.address ? `<br>${esc(recipient.address)}` : ''}</p>
   <p style="margin: 12px 0 2px;">Date: ${esc(today)}</p>
   <p style="margin: 2px 0 12px;">FAO: ${esc(recipient.name ?? 'Sir/Madam')}</p>
 
-  <h1 style="font-size: 18px; margin-bottom: 2px;">Invitation to Tender: ${esc(projectName)}</h1>
+  <h1 style="font-size: 18px; margin-bottom: 2px;">Invitation to Tender: ${esc(tenderName)}</h1>
   <p style="font-weight: bold; margin: 2px 0;">Site Address: ${esc(letterContext.siteAddress ?? 'To be confirmed')}</p>
   <p style="font-weight: bold; margin: 2px 0 16px;">Work Package: ${esc(workPackageLine)}</p>
 
@@ -557,7 +557,7 @@ On behalf of ${letterContext.organizationName}
   <p style="font-size: 13px; color: #555;">The below information forms the basis of the ITT and are our Employer's Contractor's Requirements which will be included within the Sub-Contract. Your price should reflect this and any omissions should be clarified clearly within your submission.</p>
 
   <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
-    <tr><td style="padding: 4px 0; color: #555; vertical-align: top;">Project</td><td style="padding: 4px 0;">${esc(projectName)}</td></tr>
+    <tr><td style="padding: 4px 0; color: #555; vertical-align: top;">Tender</td><td style="padding: 4px 0;">${esc(tenderName)}</td></tr>
     <tr><td style="padding: 4px 0; color: #555; vertical-align: top;">Package${many ? 's' : ''}</td><td style="padding: 4px 0;">${packageList.map(esc).join('<br>')}</td></tr>
   </table>
   <pre style="font-family: inherit; white-space: pre-wrap; font-size: 13px; color: #333;">${esc(sections)}</pre>

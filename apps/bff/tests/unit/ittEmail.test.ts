@@ -46,7 +46,7 @@ const letterContext = {
   clarificationsCloseDate: '20/12/2026', siteVisitPermitted: true,
   estimatorName: 'Alex Estimator', estimatorEmail: 'estimator@example.com', organizationName: 'Novamerx Ltd'
 };
-const opts = { projectName: 'Riverside House', completeBundleUrl: null, letterContext };
+const opts = { tenderName: 'Riverside House', completeBundleUrl: null, letterContext };
 const jo = { name: 'Jo Bloggs', email: 'jo@example.com', address: '2 Contractor Way, Buildchester, BC3 4CD' };
 
 describe('renderIttEmail', () => {
@@ -169,7 +169,7 @@ describe('renderIttEmail', () => {
 
     it('points at the complete set when a package has no pack of its own', () => {
       // Says the pack is missing rather than staying silent, and names where to go instead.
-      const withComplete = { projectName: 'Riverside House', completeBundleUrl: 'https://buildflow.example/bundles/all', letterContext };
+      const withComplete = { tenderName: 'Riverside House', completeBundleUrl: 'https://buildflow.example/bundles/all', letterContext };
       const { html, text } = renderIttEmail([pack], jo, withComplete);
       for (const bodyText of [html, text]) {
         expect(bodyText).toContain('No document pack has been produced for this package');
@@ -184,7 +184,7 @@ describe('renderIttEmail', () => {
     });
 
     it('offers the complete tender document set once, not once per package', () => {
-      const withComplete = { projectName: 'Riverside House', completeBundleUrl: 'https://buildflow.example/bundles/all', letterContext };
+      const withComplete = { tenderName: 'Riverside House', completeBundleUrl: 'https://buildflow.example/bundles/all', letterContext };
       const { html, text } = renderIttEmail([pack, secondPack], jo, withComplete);
       expect(html.match(/bundles\/all/g)).toHaveLength(1);
       expect(html).toContain('Complete tender document set');

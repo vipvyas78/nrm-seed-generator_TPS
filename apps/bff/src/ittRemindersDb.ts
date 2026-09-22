@@ -349,7 +349,7 @@ export class IttRemindersDatabase {
 
   private async contextFor(entry: EntryRow, contact: Row | null, asOf: Date): Promise<ReminderContext> {
     const [workflow] = await this.db.query<Row>(
-      `SELECT w.step_data -> 'takeoff' ->> 'projectName' AS project_name,
+      `SELECT w.step_data -> 'takeoff' ->> 'tenderName' AS tender_name,
               ld.estimator_name, o.name AS organization_name
          FROM workflows w
          LEFT JOIN itt_letter_details ld ON ld.workflow_id = w.id
@@ -362,7 +362,7 @@ export class IttRemindersDatabase {
       firmName: contact?.name ? String(contact.name) : 'your firm',
       contactName: contact?.contact_name ? String(contact.contact_name) : null,
       packageName: entry.package_name,
-      projectName: workflow?.project_name != null ? String(workflow.project_name) : null,
+      tenderName: workflow?.tender_name != null ? String(workflow.tender_name) : null,
       tenderReturnDeadline: entry.deadline
         ? new Date(`${entry.deadline}T00:00:00Z`).toLocaleDateString('en-GB', { timeZone: 'UTC' })
         // A manual reminder can go for a package with no return date; say so rather than

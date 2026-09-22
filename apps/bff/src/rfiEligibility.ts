@@ -55,7 +55,7 @@ function nameAppearsIn(name: string, messageTokens: Set<string>): boolean {
 }
 
 export interface OtherWorkflow {
-  projectName: string | null;
+  tenderName: string | null;
   tenderReference: string | null;
 }
 
@@ -76,13 +76,13 @@ export function suspectsCrossTenderMisattribution(input: {
   otherLiveWorkflows: OtherWorkflow[];
 }): boolean {
   const tokens = significantTokens(input.messageText);
-  const attributedNames = [input.attributedWorkflow.projectName, input.attributedWorkflow.tenderReference]
+  const attributedNames = [input.attributedWorkflow.tenderName, input.attributedWorkflow.tenderReference]
     .filter((n): n is string => Boolean(n));
   const attributedNamePresent = attributedNames.some((name) => nameAppearsIn(name, tokens));
   if (attributedNamePresent) return false; // the attributed tender is named too — not suspicious
 
   return input.otherLiveWorkflows.some((other) => {
-    const names = [other.projectName, other.tenderReference].filter((n): n is string => Boolean(n));
+    const names = [other.tenderName, other.tenderReference].filter((n): n is string => Boolean(n));
     return names.some((name) => nameAppearsIn(name, tokens));
   });
 }

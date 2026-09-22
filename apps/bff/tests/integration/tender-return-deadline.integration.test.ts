@@ -36,7 +36,7 @@ describe('the tender return period', () => {
   /** A workflow and one configured package for it, which is all a shortlist needs. */
   const fixture = async (db: Database) => {
     const organizationId = randomUUID();
-    const projectId = randomUUID();
+    const tenderId = randomUUID();
     const packageId = randomUUID();
     const userId = randomUUID();
     const packageName = `Return period test ${randomUUID().slice(0, 8)}`;
@@ -44,22 +44,22 @@ describe('the tender return period', () => {
     const [workflow] = await db.query<{ id: string }>(
       `INSERT INTO workflows (package_id, organization_id, created_by, step_data)
        VALUES ($1,$2,$3,$4) RETURNING id`,
-      [packageId, organizationId, userId, JSON.stringify({ takeoff: { projectId } })]
+      [packageId, organizationId, userId, JSON.stringify({ takeoff: { tenderId } })]
     );
     await db.query(
       `INSERT INTO package_config (organization_id, project_id, seq, name, route_of_procurement)
        VALUES ($1,$2,1,$3,'Supply and install')`,
-      [organizationId, projectId, packageName]
+      [organizationId, tenderId, packageName]
     );
     return {
-      workflowId: String(workflow.id), packageName, projectId, organizationId,
+      workflowId: String(workflow.id), packageName, tenderId, organizationId,
       actor: { userId, organizationId, subject: 'test' }
     };
   };
 
-  const cleanup = async (db: Database, f: { workflowId: string; projectId: string; organizationId: string }) => {
+  const cleanup = async (db: Database, f: { workflowId: string; tenderId: string; organizationId: string }) => {
     await db.query(`DELETE FROM workflows WHERE id = $1`, [f.workflowId]); // cascades to shortlists
-    await db.query(`DELETE FROM package_config WHERE project_id = $1`, [f.projectId]);
+    await db.query(`DELETE FROM package_config WHERE project_id = $1`, [f.tenderId]);
     await db.query(`DELETE FROM route_options WHERE organization_id = $1`, [f.organizationId]);
     await db.close();
   };

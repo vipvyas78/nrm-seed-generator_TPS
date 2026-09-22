@@ -19,11 +19,11 @@ if (!CLOUDFLARE_ACCOUNT_ID || !CLOUDFLARE_EMAIL_TOKEN) {
   process.exit(1);
 }
 
-const subject = 'Invitation to Tender — Drylining Package — [Project Name]';
+const subject = 'Invitation to Tender — Drylining Package — [Tender Name]';
 
 const text = `INVITATION TO TENDER
 
-Project:      [Project Name]
+Tender:       [Tender Name]
 Package:      Drylining
 Route:        Subcontract — Design & Build
 Tender return: [Return Date], 12:00 noon
@@ -52,7 +52,7 @@ A site visit can be arranged on request — contact the person below to book a s
 
 RETURN INSTRUCTIONS
 Please return your priced bill of quantities and completed return form by email to the
-address this invitation was sent from, quoting the project reference in the subject line.
+address this invitation was sent from, quoting the tender reference in the subject line.
 
 QUERIES
 All technical and commercial queries should be raised in writing before the return date.
@@ -67,10 +67,10 @@ details above are placeholders.
 const html = `
 <div style="font-family: Arial, Helvetica, sans-serif; max-width: 640px; margin: 0 auto; color: #1a1a1a;">
   <h1 style="font-size: 20px; margin-bottom: 4px;">Invitation to Tender</h1>
-  <p style="color: #555; margin-top: 0;">Drylining Package — [Project Name]</p>
+  <p style="color: #555; margin-top: 0;">Drylining Package — [Tender Name]</p>
 
   <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
-    <tr><td style="padding: 4px 0; color: #555;">Project</td><td style="padding: 4px 0;">[Project Name]</td></tr>
+    <tr><td style="padding: 4px 0; color: #555;">Tender</td><td style="padding: 4px 0;">[Tender Name]</td></tr>
     <tr><td style="padding: 4px 0; color: #555;">Package</td><td style="padding: 4px 0;">Drylining</td></tr>
     <tr><td style="padding: 4px 0; color: #555;">Route</td><td style="padding: 4px 0;">Subcontract — Design &amp; Build</td></tr>
     <tr><td style="padding: 4px 0; color: #555;">Tender return</td><td style="padding: 4px 0;"><strong>[Return Date], 12:00 noon</strong></td></tr>
@@ -104,7 +104,7 @@ const html = `
 
   <h2 style="font-size: 15px;">Return instructions</h2>
   <p>Please return your priced bill of quantities and completed return form by email to the
-  address this invitation was sent from, quoting the project reference in the subject line.</p>
+  address this invitation was sent from, quoting the tender reference in the subject line.</p>
 
   <h2 style="font-size: 15px;">Queries</h2>
   <p>All technical and commercial queries should be raised in writing before the return date.</p>

@@ -73,7 +73,7 @@ const numeric = (value: number | null): number | null => {
  * Both call `groupScopeSections`, so the numbering cannot drift — a bill that refers to
  * "item 29" means the same clause in the email and in the attachment.
  */
-export async function scopeOfWorksPdf(pack: IttEmailPack, projectName: string): Promise<IttAttachment> {
+export async function scopeOfWorksPdf(pack: IttEmailPack, tenderName: string): Promise<IttAttachment> {
   const sections = groupScopeSections(pack.scopeItems);
   const doc = new PDFDocument({ size: 'A4', margin: 56, bufferPages: true });
   const chunks: Buffer[] = [];
@@ -84,7 +84,7 @@ export async function scopeOfWorksPdf(pack: IttEmailPack, projectName: string): 
   doc.moveDown(0.3);
   doc.font('Helvetica').fontSize(11).fillColor('#444')
     .text(`${pack.packageName} (ref ${pack.displayRef})`)
-    .text(projectName);
+    .text(tenderName);
   if (pack.routeOfProcurement) doc.text(`Route: ${pack.routeOfProcurement}`);
   doc.fillColor('#000').moveDown(1);
 
@@ -139,7 +139,7 @@ const styleHeader = (sheet: ExcelJS.Worksheet, columnCount: number): void => {
  * excluded with a reason, and this is the document that is returned. Total carries a formula
  * over the tenderer's own Rate, so a filled-in sheet totals itself.
  */
-export async function boqPricingWorkbook(pack: IttEmailPack, projectName: string): Promise<IttAttachment> {
+export async function boqPricingWorkbook(pack: IttEmailPack, tenderName: string): Promise<IttAttachment> {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'Novamerx Tender Prep';
   workbook.created = new Date();
@@ -201,7 +201,7 @@ export async function boqPricingWorkbook(pack: IttEmailPack, projectName: string
   const notes = workbook.addWorksheet('Notes');
   notes.columns = [{ header: 'Pricing this schedule', key: 'note', width: 100 }];
   [
-    `Project: ${projectName}`,
+    `Tender: ${tenderName}`,
     `Package: ${pack.packageName} (ref ${pack.displayRef})`,
     '',
     'Enter a rate against every line. The Total column calculates itself.',
@@ -312,15 +312,15 @@ export async function scheduleOfAttendancesPdf(
  */
 export async function ittAttachmentsFor(
   pack: IttEmailPack,
-  projectName: string,
+  tenderName: string,
   context: RenderContext,
   templates: Map<string, ResolvedAttachmentTemplate>,
   attendanceItems: AttendanceRow[]
 ): Promise<IttAttachment[]> {
   const built: IttAttachment[] = [];
   for (const code of pack.attachmentCodes) {
-    if (code === 'scope_of_works') { built.push(await scopeOfWorksPdf(pack, projectName)); continue; }
-    if (code === 'boq_pricing_workbook') { built.push(await boqPricingWorkbook(pack, projectName)); continue; }
+    if (code === 'scope_of_works') { built.push(await scopeOfWorksPdf(pack, tenderName)); continue; }
+    if (code === 'boq_pricing_workbook') { built.push(await boqPricingWorkbook(pack, tenderName)); continue; }
     if (code === 'schedule_of_attendances') { built.push(await scheduleOfAttendancesPdf(templates.get(code) ?? null, context, attendanceItems)); continue; }
     const template = templates.get(code);
     if (template) built.push(await blocksAttachmentPdf(template, context));

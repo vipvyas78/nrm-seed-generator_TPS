@@ -230,7 +230,7 @@ function clientPage(page: Page, over: Record<string, unknown> = {}) {
     return route.fulfill({
       status: 200, contentType: 'application/json',
       body: JSON.stringify({
-        project_name: 'Reading Riverside',
+        tender_name: 'Reading Riverside',
         recipient_email: 'jo@employer.test',
         queries: [
           { id: 'q-1', subject: 'Ceiling grid', body_text: 'Is the grid included?', raised_at: '2026-09-10T09:00:00.000Z' },

@@ -41,11 +41,11 @@ export function ClientReplyPage() {
 
   return <Shell>
     <div className="portal-header">
-      <h1>Tender queries{data.project_name ? ` — ${data.project_name}` : ''}</h1>
+      <h1>Tender queries{data.tender_name ? ` — ${data.tender_name}` : ''}</h1>
       <p className="muted">
         {data.queries.length === 1
-          ? 'One query has been raised by a subcontractor pricing this project.'
-          : `${data.queries.length} queries have been raised by subcontractors pricing this project.`}
+          ? 'One query has been raised by a subcontractor pricing this tender.'
+          : `${data.queries.length} queries have been raised by subcontractors pricing this tender.`}
       </p>
     </div>
 

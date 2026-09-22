@@ -27,7 +27,7 @@ export interface ForwardedQuery {
 }
 
 export interface ForwardEmailContext {
-  projectName: string | null;
+  tenderName: string | null;
   tenderReference: string | null;
   /** Who is asking, so the Client knows who to answer. */
   estimatorName: string | null;
@@ -79,14 +79,14 @@ function authorLine(query: ForwardedQuery): string {
 export function renderRfiForwardEmail(
   queries: ForwardedQuery[], context: ForwardEmailContext
 ): RenderedEmail {
-  const project = context.projectName ?? 'the project';
+  const tender = context.tenderName ?? 'the tender';
   const reference = context.tenderReference ? ` (${context.tenderReference})` : '';
   const count = queries.length;
-  const subject = `${count} tender ${count === 1 ? 'query' : 'queries'} — ${project}${reference} ${subjectMarker(context.replyToken)}`;
+  const subject = `${count} tender ${count === 1 ? 'query' : 'queries'} — ${tender}${reference} ${subjectMarker(context.replyToken)}`;
 
   const intro = count === 1
-    ? `We have received the following query from a subcontractor pricing ${project}${reference}, and would be grateful for your response.`
-    : `We have received the following ${count} queries from subcontractors pricing ${project}${reference}, and would be grateful for your responses.`;
+    ? `We have received the following query from a subcontractor pricing ${tender}${reference}, and would be grateful for your response.`
+    : `We have received the following ${count} queries from subcontractors pricing ${tender}${reference}, and would be grateful for your responses.`;
 
   const replyInstruction = context.replyUrl
     ? 'You can answer by replying to this email, or by opening the link below.'
@@ -140,7 +140,7 @@ export function renderRfiForwardEmail(
 }
 
 export interface RelayEmailContext {
-  projectName: string | null;
+  tenderName: string | null;
   packageName: string | null;
   /** The question this answers, quoted back so the recipient does not have to remember. */
   originalQuery: string;
@@ -164,13 +164,13 @@ export interface RelayEmailContext {
  * them to work out, and a tender query answered ambiguously is a variation later.
  */
 export function renderClientAnswerRelayEmail(context: RelayEmailContext): RenderedEmail {
-  const project = context.projectName ?? 'the project';
+  const tender = context.tenderName ?? 'the tender';
   const subjectCore = context.originalSubject
     ? `Re: ${context.originalSubject}`
-    : `Response to your tender query — ${project}`;
+    : `Response to your tender query — ${tender}`;
   const subject = `${subjectCore} ${subjectMarker(context.replyToken)}`;
 
-  const intro = `The client has responded to your query on ${project}${context.packageName ? ` (${context.packageName})` : ''}.`;
+  const intro = `The client has responded to your query on ${tender}${context.packageName ? ` (${context.packageName})` : ''}.`;
   const signoff = context.estimatorName
     ? `${context.estimatorName}${context.organizationName ? `\n${context.organizationName}` : ''}`
     : context.organizationName ?? '';
@@ -226,7 +226,7 @@ export interface RfiAnswer {
 }
 
 export interface RfiResponseEmailContext {
-  projectName: string | null;
+  tenderName: string | null;
   packageName: string | null;
   estimatorName: string | null;
   organizationName: string | null;
@@ -257,14 +257,14 @@ function citationLine(citation: RfiAnswerCitation): string {
 export function renderRfiResponseEmail(
   answers: RfiAnswer[], context: RfiResponseEmailContext
 ): RenderedEmail {
-  const project = context.projectName ?? 'the project';
+  const tender = context.tenderName ?? 'the tender';
   const packageSuffix = context.packageName ? ` (${context.packageName})` : '';
   const count = answers.length;
-  const subject = `Response to your ${count === 1 ? 'query' : 'queries'} — ${project} ${subjectMarker(context.replyToken)}`;
+  const subject = `Response to your ${count === 1 ? 'query' : 'queries'} — ${tender} ${subjectMarker(context.replyToken)}`;
 
   const intro = count === 1
-    ? `Here is the answer to your query on ${project}${packageSuffix}.`
-    : `Here are the answers to your ${count} queries on ${project}${packageSuffix}.`;
+    ? `Here is the answer to your query on ${tender}${packageSuffix}.`
+    : `Here are the answers to your ${count} queries on ${tender}${packageSuffix}.`;
 
   const signoff = context.estimatorName
     ? `${context.estimatorName}${context.organizationName ? `\n${context.organizationName}` : ''}`

@@ -350,7 +350,9 @@ BuildFlow markAnalysis('completed')
 
 **Steps 1–3 of the old 7-step wizard are gone.** Parsed Outputs, Employer RFIs and SoA RAG belong to the take-off module, so Tender Launch Pack is now step 1 — which means the consumer creates the workflow with the column's own `DEFAULT 1` and never sets a step.
 
-The message carries the tender, package, project and pipeline detail (`packageId` and `organizationId` are the only two the workflow cannot be created without), and is stashed whole on `workflows.step_data.takeoff`. `tenderId` is genuinely nullable — a package need not belong to a tender.
+The message carries the tender, package and pipeline detail (`packageId` and `organizationId` are the only two the workflow cannot be created without), and is stashed whole on `workflows.step_data.takeoff`. `tenderId` is required and non-nullable: BuildFlow migration 091 made `bf_takeoff_packages.tender_id` NOT NULL, so a message without one is malformed rather than a package that has no tender.
+
+The legacy `projectId` / `projectName` / `projectScope` spellings BuildFlow also emits are **not** declared in `takeoffCompletion.ts`, and the schema strips what it does not declare — so they never reach `step_data` and BuildFlow can drop them without touching this repo. The corollary is that a new key BuildFlow adds is unusable here until it is declared.
 
 The message is delivered **at least once**, and three things make that safe:
 
@@ -375,12 +377,12 @@ BuildFlow: reviewer approves/ignores every TOQ item, presses "Tender Take off"
   └─ bf_queue_outbox 'takeoff.tendered', same transaction as the release stamp
       └─ buildflow_takeoff_tender_queue                        (BullMQ, parent's Redis)
           └─ worker-tps → tpDb.buildPackagesFromTakeoff        (this repo)
-              └─ tps.package_config rows carrying wp_code, scoped to the project
+              └─ tps.package_config rows carrying wp_code, scoped to the tender
 ```
 
 Which packages are required comes from `public.nrm_sub_element_work_package.wp_scope_condition`:
 `All` always · `TOQ` only where the take-off measured work under that code · `D&B` only when
-`bf_projects.project_scope = 'design_and_build'` · `Manual` offered, badged, never
+`bf_tenders.tender_scope = 'design_and_build'` · `Manual` offered, badged, never
 auto-selected. A code maps to many NRM1 sub-elements and they need not agree, so the widest
 condition wins.
 

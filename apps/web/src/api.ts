@@ -15,9 +15,10 @@ export type TakeoffCompletion = {
   packageVersionId?: string | null;
   versionNumber?: number | null;
   revision?: number | null;
-  projectId?: string | null;
-  projectName?: string | null;
-  tenderId: string | null;
+  // Never null since BuildFlow migration 091 made bf_takeoff_packages.tender_id NOT NULL;
+  // the legacy projectId/projectName spellings are stripped by takeoffCompletion.ts and so
+  // never reach step_data at all (issue #13).
+  tenderId: string;
   tenderName: string | null;
   tenderReference: string | null;
   itemCount?: number | null;
@@ -703,7 +704,7 @@ export type CommsTimeline = {
 /** What the Client sees on their own reply page. The firm that asked is deliberately not
  *  named: which subcontractor raised a query is commercially ours, not theirs. */
 export type ClientReplyPage = {
-  project_name: string | null;
+  tender_name: string | null;
   recipient_email: string;
   queries: Array<{ id: string; subject: string | null; body_text: string | null; raised_at: string }>;
   messages: CommsMessage[];

@@ -26,7 +26,7 @@ export interface ReminderContext {
   firmName: string;
   contactName: string | null;
   packageName: string;
-  projectName: string | null;
+  tenderName: string | null;
   /** Already formatted for a reader (dd/mm/yyyy). */
   tenderReturnDeadline: string;
   /** Null when the package has no return date (a manual reminder can still go out). */
@@ -77,7 +77,11 @@ export function tokenValues(context: ReminderContext): Record<string, string> {
     // A greeting with no name reads better as "Dear Sir or Madam" than "Dear ,".
     contactName: context.contactName?.trim() || 'Sir or Madam',
     packageName: context.packageName,
-    projectName: context.projectName ?? 'the project',
+    // See buildRenderContext: `projectName` is the token key BuildFlow's REMINDER_TOKENS
+    // declares and its seeded reminder wording uses. Both are emitted; only BuildFlow can
+    // retire the old one.
+    projectName: context.tenderName ?? 'the tender',
+    tenderName: context.tenderName ?? 'the tender',
     tenderReturnDeadline: context.tenderReturnDeadline,
     // With no return date there is no honest number to print.
     daysRemaining: context.daysRemaining === null
