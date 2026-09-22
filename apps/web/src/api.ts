@@ -520,7 +520,8 @@ export type CommsMessage = {
   id: string;
   direction: 'inbound' | 'outbound';
   channel: 'portal' | 'email' | 'app';
-  kind: 'subcontractor_rfi' | 'client_forward' | 'client_reply' | 'relay_to_subcontractor' | 'note';
+  kind: 'subcontractor_rfi' | 'client_forward' | 'client_reply' | 'relay_to_subcontractor' | 'note'
+    | 'itt_reminder' | 'rfi_response';
   /** Who actually wrote it, which is routinely NOT the firm the ITT was addressed to. */
   author_name: string | null;
   author_email: string | null;
@@ -593,6 +594,80 @@ export type CommsDefaults = {
   itt_comms_address: string | null;
 };
 
+// ── The estimator's RFI review, approve and send (issue #48) ────────────────
+
+/** A source a drafted answer cites. `share_url` may be null — the document is named but
+ *  not (yet) linkable, and that is shown unlinked rather than hidden. */
+export type RfiCitation = {
+  passageId: string; documentId: string; filename: string;
+  headingPath: string | null; pageHint: number | null;
+  quotedText: string; shareUrl: string | null;
+};
+
+export type RfiDraft = {
+  id: string;
+  status: 'proposed' | 'insufficient_evidence' | 'rejected_ungrounded' | 'error';
+  answer_text: string | null;
+  confidence: number | null;
+  needs_client: boolean;
+  citations: RfiCitation[];
+  reject_reason: string | null;
+  drafted_at: string;
+};
+
+export type RfiQuestion = {
+  id: string; message_id: string; thread_id: string; seq: number;
+  source_kind: 'body' | 'attachment'; source_ref: string | null;
+  question_text: string;
+  asked_by_name: string | null; asked_by_email: string | null;
+  raised_at: string;
+  status: 'new' | 'drafted' | 'awaiting_review' | 'for_client' | 'approved'
+    | 'sent_to_client' | 'answered_by_client' | 'sent' | 'dismissed';
+  canonical_question_id: string | null;
+  /** What the estimator wrote instead of, or in place of, the app draft — the edit a
+   *  send-as-is leaves null and an edit-then-send fills in. */
+  estimator_answer_text: string | null;
+  package_name: string | null;
+  draft: RfiDraft | null;
+  sent: { sent_at: string; email_status: string; source: string } | null;
+  forwarded_to_client: boolean;
+};
+
+export type RfiFirmGroup = {
+  thread_id: string;
+  firm_name: string;
+  firm_email: string;
+  package_name: string | null;
+  questions: RfiQuestion[];
+};
+
+export type RfiBlockedMessage = {
+  message_id: string; thread_id: string; workflow_id: string | null;
+  state: 'blocked_ambiguous_tender' | 'blocked_cross_tender_suspected';
+  state_reason: string | null; last_attempt_at: string | null;
+  firm_name: string | null; firm_email: string;
+  subject: string | null; body_text: string | null; occurred_at: string;
+  attachment_count: number;
+  /** True when this message could not be attributed to ANY tender at all — it belongs to
+   *  no dashboard, and this tab is the only place it is reachable. */
+  unattributed: boolean;
+};
+
+export type RfiReviewCounts = { blocked: number; drafted: number; approved: number; for_client: number };
+
+export type RfiReview = {
+  counts: RfiReviewCounts;
+  blocked: RfiBlockedMessage[];
+  groups: RfiFirmGroup[];
+};
+
+export type RfiSendResult = {
+  sent: number;
+  responses: Array<{ thread_id: string; to: string; status: string; error?: string }>;
+};
+
+export type RfiClientForwardResult = ForwardResult & { questions_forwarded: number };
+
 /**
  * One thing that happened, and where to read it.
  *
@@ -602,7 +677,8 @@ export type CommsDefaults = {
  */
 export type AppNotification = {
   id: string;
-  kind: 'subcontractor_rfi' | 'client_reply' | 'forward_failed' | 'unattributed_email';
+  kind: 'subcontractor_rfi' | 'client_reply' | 'forward_failed' | 'unattributed_email'
+    | 'itt_response_detected' | 'rfi_review_required';
   title: string;
   body: string | null;
   deep_link_path: string;
@@ -802,6 +878,41 @@ export const api = {
     request<RelayResult>(`/api/comms/messages/${messageId}/relay`, {
       method: 'POST', body: JSON.stringify({ note })
     }),
+
+  // The estimator's RFI review, approve and send (issue #48). `view=counts` shares the
+  // one authorisation path with the full read rather than adding a fifth route, so the
+  // dashboard badge does not drag every citation and every blocked message body across
+  // the wire to render four integers.
+  getRfiReview: (workflowId: string, includeDismissed = false) =>
+    request<RfiReview>(`/api/tender-prep/${workflowId}/rfi${includeDismissed ? '?includeDismissed=true' : ''}`),
+  getRfiReviewCounts: (workflowId: string) =>
+    request<{ counts: RfiReviewCounts }>(`/api/tender-prep/${workflowId}/rfi?view=counts`).then((r) => r.counts),
+  // answerText present means edit-then-send: stored on the QUESTION, never written into
+  // the model's own draft ledger — see RfiDraft's own doc comment in this file.
+  approveRfiQuestion: (workflowId: string, questionId: string, answerText: string | null) =>
+    request<RfiQuestion>(`/api/tender-prep/${workflowId}/rfi/questions/${questionId}/approve`,
+      { method: 'POST', body: JSON.stringify({ answerText }) }),
+  askClientRfiQuestion: (workflowId: string, questionId: string) =>
+    request<RfiQuestion>(`/api/tender-prep/${workflowId}/rfi/questions/${questionId}/ask-client`, { method: 'POST' }),
+  dismissRfiQuestion: (workflowId: string, questionId: string) =>
+    request<RfiQuestion>(`/api/tender-prep/${workflowId}/rfi/questions/${questionId}/dismiss`, { method: 'POST' }),
+  // No recipient in the body: it is derived server-side from each question's own comms
+  // thread, the same rule relayClientAnswer above follows — a caller holding a question
+  // id cannot redirect the answer or rewrite it in flight.
+  sendRfiResponses: (workflowId: string, questionIds: string[]) =>
+    request<RfiSendResult>(`/api/tender-prep/${workflowId}/rfi/responses`,
+      { method: 'POST', body: JSON.stringify({ questionIds }) }),
+  forwardRfiQuestions: (workflowId: string, input: {
+    questionIds: string[]; clientEmail: string; clientName: string | null; note: string | null;
+  }) => request<RfiClientForwardResult>(`/api/tender-prep/${workflowId}/rfi/client-forward`, {
+    method: 'POST', body: JSON.stringify(input)
+  }),
+  // Filing a query under the tender it actually belongs to — the one place a human
+  // closes the eligibility gate's blocked_ambiguous_tender / blocked_cross_tender_
+  // suspected loop.
+  attributeCommsMessage: (messageId: string, workflowId: string) =>
+    request<{ message_id: string; workflow_id: string; thread_id: string; questions_discarded: number }>(
+      `/api/comms/messages/${messageId}/attribute`, { method: 'POST', body: JSON.stringify({ workflowId }) }),
 
   // The notification bell, in the shell rather than on any one tender — so it is
   // organisation-scoped and takes no workflow. `unread` comes back beside the items so

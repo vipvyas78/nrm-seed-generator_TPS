@@ -86,6 +86,9 @@ export function TenderPrepPage() {
   // is a conversation and the step is only where that conversation is read.
   const [searchParams] = useSearchParams();
   const deepLinkThreadId = searchParams.get('thread');
+  // Where the dashboard's "drafts waiting" badge lands (issue #48) — the same
+  // Communications modal, opened straight onto its fourth tab.
+  const openRfi = searchParams.get('rfi') === '1';
 
   // A completed take-off launches the workflow with nobody in the app, so the page has
   // to look for one it never started. Polling while none exists means a page left open
@@ -122,12 +125,12 @@ export function TenderPrepPage() {
   // Step 4 with a Communications modal over it would be the stranger thing to do.
   const stepNow = existing.data?.current_step;
   useEffect(() => {
-    if (!deepLinkThreadId || !workflowId || stepNow == null || stepNow === 2) return;
+    if ((!deepLinkThreadId && !openRfi) || !workflowId || stepNow == null || stepNow === 2) return;
     goToStep.mutate(2);
     // Keyed on the thread and the step alone. Including the mutation would re-run this
     // every time its own state changed, which is once per click of its own.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deepLinkThreadId, workflowId, stepNow]);
+  }, [deepLinkThreadId, openRfi, workflowId, stepNow]);
 
   if (existing.isLoading) return <Busy />;
 
@@ -190,7 +193,7 @@ export function TenderPrepPage() {
 
       {currentStep === 1 && takeoff && <TakeoffSummary takeoff={takeoff} packageId={packageId} />}
       {currentStep === 1 && <Step1TenderLaunchPack workflowId={workflowId} />}
-      {currentStep === 2 && <Step2IttDispatch workflowId={workflowId} initialThreadId={deepLinkThreadId} />}
+      {currentStep === 2 && <Step2IttDispatch workflowId={workflowId} initialThreadId={deepLinkThreadId} openRfi={openRfi} />}
       {currentStep === 3 && <Step3Comparative workflowId={workflowId} />}
       {currentStep === 4 && <Step4Submission workflowId={workflowId} />}
     </section>
@@ -1057,10 +1060,13 @@ function IttLetterDetailsPanel({ workflowId, anyDispatched }: { workflowId: stri
   </details>;
 }
 
-function Step2IttDispatch({ workflowId, initialThreadId }: {
+function Step2IttDispatch({ workflowId, initialThreadId, openRfi }: {
   workflowId: string;
   /** Set when a notification sent the reader here. Opens Communications on that firm. */
   initialThreadId?: string | null;
+  /** Set when the tender dashboard's "drafts waiting" badge sent the reader here. Opens
+   *  Communications straight onto the RFI review tab (issue #48). */
+  openRfi?: boolean;
 }) {
   const [open, setOpen] = useState<string | null>(null);
   const [draftOpen, setDraftOpen] = useState<string | null>(null);
@@ -1068,7 +1074,7 @@ function Step2IttDispatch({ workflowId, initialThreadId }: {
   // Per TENDER, not per package: a firm's queries are one conversation whichever package
   // they are invited to, and an email carries no package at all. So the control sits in
   // the header beside "Send all ITTs" rather than on a package row.
-  const [commsOpen, setCommsOpen] = useState(Boolean(initialThreadId));
+  const [commsOpen, setCommsOpen] = useState(Boolean(initialThreadId) || Boolean(openRfi));
   const [lastResult, setLastResult] = useState<ConfirmIttResult | null>(null);
   const [sendAllResult, setSendAllResult] = useState<SendAllIttsResult | null>(null);
   const queryClient = useQueryClient();
@@ -1249,6 +1255,7 @@ function Step2IttDispatch({ workflowId, initialThreadId }: {
 
     {commsOpen && <CommsModal
       workflowId={workflowId} initialThreadId={initialThreadId}
+      initialTab={openRfi ? 'rfi' : undefined}
       onClose={() => setCommsOpen(false)} />}
   </div>;
 }

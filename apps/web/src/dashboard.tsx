@@ -79,14 +79,36 @@ function DashboardTable({ rows, workflowId, packageId }: {
   rows: DashboardRow[]; workflowId: string; packageId: string;
 }) {
   const [approving, setApproving] = useState<DashboardRow>();
+  // Keyed under launch-table for the same reason the dashboard query itself is: it then
+  // refreshes for free alongside everything else scoped to this workflow.
+  const rfiCounts = useQuery({
+    queryKey: ['launch-table', workflowId, 'rfi-counts'], queryFn: () => api.getRfiReviewCounts(workflowId)
+  });
   if (rows.length === 0) return <p className="muted">This workflow has no packages yet.</p>;
   const tenderable = rows.filter((row) => !row.is_heading);
   const confirmed = tenderable.filter((row) => row.confirmed_at).length;
+  const drafted = rfiCounts.data?.drafted ?? 0;
+  // Excludes a blocked message with no workflow at all ("no tender matched this sender
+  // at all") — it belongs to no tender's dashboard, only to the Communications timeline
+  // and this tender's own review tab. The count here is therefore honestly partial,
+  // rather than papered over as complete.
+  const blocked = rfiCounts.data?.blocked ?? 0;
   return <>
     <p className="muted">
       {confirmed} of {tenderable.length} packages confirmed. A pending package has not been
       through the tender launch meeting — approve it to choose its firms.
     </p>
+    {(drafted > 0 || blocked > 0) && <p>
+      <Link className="button-link" to={`/packages/${packageId}/tender-prep?rfi=1`}>
+        {blocked > 0 && <span
+          className="badge badge-red" style={{ marginRight: 6 }}
+          title="Queries the app could not file under a tender with confidence. One naming no tender at all is on Communications instead, not counted here."
+        >{blocked} to file</span>}
+        {drafted > 0 && <span className="badge badge-amber">
+          {drafted} drafted {drafted === 1 ? 'answer' : 'answers'} to review
+        </span>}
+      </Link>
+    </p>}
     <div className="table-scroll">
       <table className="data-table dashboard-table">
         <thead><tr>

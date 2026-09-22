@@ -576,6 +576,35 @@ uvicorn api.main:app --reload --port 8200
 
 The web dev server runs on `http://localhost:5175`. It calls the BFF at `VITE_API_URL` (`http://localhost:3200`) directly over CORS — there is no Vite proxy — which is why `WEB_ORIGIN` on the BFF must match the dev server's origin.
 
+## Where the tests live
+
+Tests sit in a `tests/` folder per package, never beside the source they test — `src/` holds
+production code only.
+
+```
+apps/bff/
+  tests/unit/           no DB, no network — safe to run anywhere, and what CI's bff job runs
+  tests/integration/    needs a live DATABASE_URL — self-skips ("skipped - DATABASE_URL not
+                         set") when it is absent, so running the same command locally and in
+                         CI is never a surprise either way
+  tests/fixtures/       shared vectors read by both suites (e.g. inbound-signature-vectors.json)
+apps/web/
+  tests/unit/           vitest + jsdom + Testing Library — component-level, no browser
+  tests/e2e/            Playwright — a real Chromium, but no BFF and no Postgres: every
+                         /api/** call is fulfilled by page.route from a fixture in the spec
+                         (see playwright.config.ts's own header)
+```
+
+```bash
+pnpm --filter @tps/bff test:unit                 # apps/bff/tests/unit — CI-safe
+DATABASE_URL=postgresql://buildflow:buildflow@localhost:5433/buildflow \
+  pnpm --filter @tps/bff test:integration        # apps/bff/tests/integration
+pnpm --filter @tps/bff exec vitest run tests/integration/rfi-drafting.integration.test.ts
+
+pnpm --filter @tps/web test                      # apps/web/tests/unit
+pnpm --filter @tps/web test:e2e                  # apps/web/tests/e2e, headless
+```
+
 ---
 
 ## Docker network notes

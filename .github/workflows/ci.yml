@@ -1,9 +1,13 @@
-# CI - typecheck and unit tests for both Node packages.
+# CI - typecheck, unit tests and e2e for both Node packages.
 #
-# No secrets and no database. Every *.integration.test.ts guards on DATABASE_URL and
-# self-skips when it is absent, so what runs here is the unit suites alone - a real gate
-# that needs no infrastructure. There is no Python job: api/ has no tests and the repo
-# carries no ruff or mypy configuration.
+# Tests live under tests/unit (no DB, no browser), tests/integration (needs a live
+# DATABASE_URL) and, for the web package, tests/e2e (Playwright) - never in src/, which
+# holds production code only (issue #48's test relocation). The bff and web jobs below run
+# `pnpm … test`, which runs unit AND integration together; every *.integration.test.ts
+# guards on DATABASE_URL and self-skips when it is absent, so what actually executes here
+# is the unit suites alone - a real gate that needs no infrastructure, with the integration
+# skips still visible in the output rather than hidden by a separate invocation. There is no
+# Python job: api/ has no tests and the repo carries no ruff or mypy configuration.
 #
 # Among the unit suites, two are contracts rather than ordinary tests and are worth knowing
 # about before deleting anything that looks redundant:
@@ -17,6 +21,10 @@
 #                          `comms.` table. That schema's DDL lives in the other repository,
 #                          so the blast radius of a change there is however many files here
 #                          name it.
+#
+# The web-e2e job needs neither Postgres nor the BFF running - playwright.config.ts's own
+# header explains why: every /api/** call is fulfilled by page.route from a fixture in each
+# spec, so the whole suite is exercising the page's own behaviour, not a database.
 name: CI
 
 on:
@@ -74,3 +82,23 @@ jobs:
 
       - name: Unit tests
         run: pnpm --filter @tps/web test -- --reporter=verbose
+
+  web-e2e:
+    name: Web e2e (Playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        run: pnpm --filter @tps/web exec playwright install --with-deps chromium
+
+      - name: e2e tests
+        run: pnpm --filter @tps/web test:e2e

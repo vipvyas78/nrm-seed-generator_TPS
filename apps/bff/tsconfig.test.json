@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // No rootDir/outDir: this config exists to TYPE-CHECK, never to build. tsconfig.json
+    // (rootDir: src) is what `pnpm build` compiles — tests are deliberately outside its
+    // include, so a test file is never emitted into dist/. This file is what makes them
+    // still checked at all once they left src/ (issue #48's test relocation).
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}

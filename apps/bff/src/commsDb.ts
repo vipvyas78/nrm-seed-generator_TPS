@@ -486,6 +486,7 @@ export class CommsDatabase {
     if (ids.length === 0) return [];
     return this.db.query<Row>(
       `SELECT m.*, t.counterparty_name, t.counterparty_email, t.workflow_id AS thread_workflow_id,
+              t.subcontractor_id,
               (SELECT COUNT(*) FROM comms.attachments a WHERE a.message_id = m.id) AS attachment_count
          FROM comms.messages m
          JOIN comms.threads t ON t.id = m.thread_id
@@ -532,6 +533,31 @@ export class CommsDatabase {
         WHERE message_id = ANY($1::uuid[])
         ORDER BY message_id, seq`,
       [messageIds]
+    );
+  }
+
+  /**
+   * Blocked RFI messages (issue #48's review screen), hydrated for one organisation.
+   *
+   * The ids come from tps.rfi_message_reviews, which carries no organization_id at all —
+   * and a blocked_ambiguous_tender row routinely has no workflow_id either ("no tender
+   * matched this sender at all"), so a workflow can never be the boundary here. The
+   * organisation is the only fact comms holds that both rows share, so the filter is
+   * applied HERE, in the schema that actually holds it, rather than in TypeScript after
+   * another organisation's message has already been read off disk.
+   */
+  async rfiBlockedMessages(messageIds: string[], organizationId: string): Promise<Row[]> {
+    if (messageIds.length === 0) return [];
+    return this.db.query<Row>(
+      `SELECT m.id AS message_id, m.thread_id, m.workflow_id, m.subject, m.body_text,
+              m.occurred_at, m.author_name, m.author_email, m.channel, m.attribution_method,
+              t.counterparty_name, t.counterparty_email,
+              (SELECT COUNT(*) FROM comms.attachments a WHERE a.message_id = m.id) AS attachment_count
+         FROM comms.messages m
+         JOIN comms.threads t ON t.id = m.thread_id
+        WHERE m.id = ANY($1::uuid[]) AND m.organization_id = $2
+        ORDER BY m.occurred_at DESC`,
+      [messageIds, organizationId]
     );
   }
 
