@@ -1,7 +1,7 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { api, type DashboardCandidate, type DashboardRow } from './api';
+import { api, type DashboardCandidate, type DashboardRow, type ReminderKindName } from './api';
 import { Busy, ErrorMessage, PackageRow } from './pages';
 
 /**
@@ -95,6 +95,7 @@ function DashboardTable({ rows, workflowId, packageId }: {
           <th style={{ width: '2.5rem' }} title="Has asked for clarification">?</th>
           <th>Subcontractor</th><th>USP</th><th>Contact</th><th>Why</th>
           <th>Accepted</th><th>Declined</th><th>Return date</th><th className="num">Tender price</th>
+          <th>Reminder</th>
         </tr></thead>
         <tbody>
           {rows.map((row) => <PackageDashboardRows
@@ -151,7 +152,7 @@ function PackageDashboardRows({ row, onApprove, packageId }: {
       </>}
       {firm
         ? <FirmCells firm={firm} deadline={row.tender_return_deadline} packageId={packageId} />
-        : <td colSpan={9} className="muted">{row.is_heading ? 'Broken down below' : 'No firms selected yet'}</td>}
+        : <td colSpan={10} className="muted">{row.is_heading ? 'Broken down below' : 'No firms selected yet'}</td>}
     </tr>)}
   </>;
 }
@@ -185,7 +186,58 @@ function FirmCells({ firm, deadline, packageId }: {
     <td>{firm.declined ? '✓' : ''}</td>
     <td>{deadline ?? <span className="muted">—</span>}</td>
     <td className="num">{firm.tendered_sum ? Number(firm.tendered_sum).toLocaleString() : <span className="muted">—</span>}</td>
+    <ReminderCell firm={firm} />
   </>;
+}
+
+const REMINDER_LABEL: Record<ReminderKindName, string> = {
+  confirm_interest: 'Ask to confirm interest',
+  submit_tender: 'Remind to submit'
+};
+
+/**
+ * "Send reminder", and the history beside it.
+ *
+ * The button names which email will go. That is decided by the server from the firm's state
+ * (confirm interest until they accept, then submit tender), so the label is a promise the
+ * click keeps. No button at all for a firm that has declined or already returned a price, or
+ * whose invitation never went out: there is nothing to remind them of.
+ *
+ * A mark read off the firm's own email says so, with a confirm control. Confirming records it
+ * as a person's decision, after which no later email can change it.
+ */
+function ReminderCell({ firm }: { firm: DashboardCandidate }) {
+  const queryClient = useQueryClient();
+  const refresh = () => queryClient.invalidateQueries({ queryKey: ['launch-table'] });
+  const send = useMutation({
+    mutationFn: () => api.sendIttReminder(String(firm.dispatch_id)),
+    onSuccess: refresh
+  });
+  const confirmMark = useMutation({
+    mutationFn: () => api.recordIttResponse(String(firm.dispatch_id), firm.response ?? undefined),
+    onSuccess: refresh
+  });
+
+  const kind = firm.reminder_kind ?? null;
+  const sent = Number(firm.reminders_sent ?? 0);
+  return <td className="tiny">
+    {firm.response_source === 'email_llm' && firm.dispatch_id && <div>
+      <span className="muted">Marked from their email </span>
+      <button type="button" disabled={confirmMark.isPending} onClick={() => confirmMark.mutate()}
+        title="Record this as your own decision">Confirm</button>
+    </div>}
+    {kind && firm.dispatch_id && <button
+      type="button" disabled={send.isPending} onClick={() => send.mutate()}
+      title={`Emails ${firm.name} now`}
+    >{send.isPending ? 'Sending…' : REMINDER_LABEL[kind]}</button>}
+    {send.isSuccess && send.data.status !== 'sent' && <div className="error">Not sent: {send.data.error ?? send.data.status}</div>}
+    <ErrorMessage error={send.error ?? confirmMark.error} />
+    {sent > 0 && <div className="muted">
+      {sent} sent · last {firm.last_reminder_kind === 'submit_tender' ? 'submit' : 'confirm interest'}{' '}
+      {firm.last_reminder_at ? new Date(firm.last_reminder_at).toLocaleDateString('en-GB') : ''}
+    </div>}
+    {!kind && sent === 0 && !firm.response_source && <span className="muted">—</span>}
+  </td>;
 }
 
 /**

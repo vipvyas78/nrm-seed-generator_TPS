@@ -15,7 +15,8 @@
     "migrate": "tsx --env-file=../../.env src/migrate.ts",
     "worker": "tsx --env-file=../../.env src/worker.ts",
     "send-sample-itt": "tsx --env-file=../../.env src/sendSampleItt.ts",
-    "send-test-itt": "tsx --env-file=../../.env src/sendTestItt.ts"
+    "send-test-itt": "tsx --env-file=../../.env src/sendTestItt.ts",
+    "send-test-reminders": "tsx --env-file=../../.env src/sendTestReminders.ts"
   },
   "dependencies": {
     "@fastify/cors": "^11.0.0",

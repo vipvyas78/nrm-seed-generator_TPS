@@ -118,7 +118,19 @@ export type DashboardCandidate = Partial<LaunchCandidate> & {
   /** Of those, the ones nothing has put to the client yet. The state worth chasing. */
   outstanding_queries: number;
   comms_thread_id: string | null;
+  /** The invitation, for the reminder button and for confirming a mark read from email. */
+  dispatch_id?: string | null;
+  /** 'email_llm' = read off the firm's own reply by the classifier; anything else was a person. */
+  response_source?: 'manual' | 'email_llm' | null;
+  /** Which email "Send reminder" would send. Null = no button: the firm declined, has
+   *  returned a price, or was never sent its invitation. Decided by the server. */
+  reminder_kind?: ReminderKindName | null;
+  reminders_sent?: number;
+  last_reminder_at?: string | null;
+  last_reminder_kind?: ReminderKindName | null;
 };
+export type ReminderKindName = 'confirm_interest' | 'submit_tender';
+export type SendReminderResult = { kind: ReminderKindName; status: string; error?: string };
 
 /**
  * One dashboard row: a trade package, and only the firms the meeting actually picked.
@@ -747,6 +759,10 @@ export const api = {
     request<SendIttDraftResult>(`/api/tender-prep/${workflowId}/itts/${encodeURIComponent(packageName)}/draft/send`, {
       method: 'POST', body: JSON.stringify(input)
     }),
+  // Sends the reminder the firm's state calls for. The SERVER picks the email, so the label on
+  // the button and the message that goes cannot disagree.
+  sendIttReminder: (dispatchId: string) =>
+    request<SendReminderResult>(`/api/tender-prep/itt/${dispatchId}/reminder`, { method: 'POST' }),
   recordIttResponse: (dispatchId: string, response: IttDispatch['response']) =>
     request<IttDispatch>(`/api/tender-prep/itt/${dispatchId}`, { method: 'PATCH', body: JSON.stringify({ response }) }),
   getIttLetterDetails: (workflowId: string) =>

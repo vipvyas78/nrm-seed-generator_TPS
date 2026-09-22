@@ -90,6 +90,16 @@ const schema = z.object({
   // as well. See TPS_INBOUND_EMAIL_API.md.
   INBOUND_EMAIL_TOKEN: z.string().min(16).optional(),
   INBOUND_EMAIL_SIGNING_SECRET: z.string().min(32).optional(),
+  // The scheduled-tasks caller (novamerx-scheduled-tasks: ITT reminders and reading a firm's
+  // emailed reply). Its OWN pair of secrets, never INBOUND_EMAIL_*: that pair can forge a
+  // Client's answer to a tender query, this one can email subcontractors and mark them
+  // accepted or declined, and a leak of one should not be a leak of the other.
+  //
+  // Both, for the reason above: infra/docker/nginx-web.conf forwards every /tps-api/ path, so
+  // this route IS reachable from the internet, and a bearer alone is not enough. See
+  // TPS_SCHEDULED_TASKS_API.md.
+  SCHEDULED_TASKS_TOKEN: z.string().min(16).optional(),
+  SCHEDULED_TASKS_SIGNING_SECRET: z.string().min(32).optional(),
 
   // The bearer BuildFlow's own BFF presents on /internal/notifications, so the same bell
   // can appear in both shells. Unset, those routes do not exist and BuildFlow shows no
@@ -154,6 +164,12 @@ export function loadConfig(input: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(
       'INBOUND_EMAIL_TOKEN and INBOUND_EMAIL_SIGNING_SECRET must be set together. '
       + 'The inbound email route is reachable from the public internet and requires both.'
+    );
+  }
+  if (Boolean(config.SCHEDULED_TASKS_TOKEN) !== Boolean(config.SCHEDULED_TASKS_SIGNING_SECRET)) {
+    throw new Error(
+      'SCHEDULED_TASKS_TOKEN and SCHEDULED_TASKS_SIGNING_SECRET must be set together. '
+      + 'The scheduled-tasks routes are reachable from the public internet and require both.'
     );
   }
   return config;

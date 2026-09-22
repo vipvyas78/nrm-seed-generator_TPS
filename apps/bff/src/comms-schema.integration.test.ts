@@ -106,7 +106,7 @@ describe('the comms schema', () => {
       await client.query('DELETE FROM comms.schema_migrations');
       await expect(assertCommsSchema({
         query: async (sql: string, values?: unknown[]) => (await client.query(sql, values)).rows
-      } as unknown as Database)).rejects.toThrow(/needs 001_comms_schema\.sql|nothing applied/);
+      } as unknown as Database)).rejects.toThrow(/needs 002_itt_reminder_kinds\.sql|nothing applied/);
     } finally {
       await client.query('ROLLBACK');
       client.release();
@@ -163,6 +163,20 @@ describe('the comms schema', () => {
        ) AS exists`
     );
     expect(row?.exists).toBe(true);
+  });
+
+  it('accepts the two kinds the ITT reminders write', async () => {
+    // 002 WIDENED two CHECKs. This is the assertion that would notice a later migration in the
+    // owning repository narrowing them again - which would surface here as a reminder that
+    // fails to record, in front of a subcontractor, rather than at deploy.
+    const rows = await db.query<{ def: string }>(
+      `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+        WHERE contype = 'c' AND pg_get_constraintdef(oid) LIKE '%kind%'
+          AND conrelid IN ('comms.messages'::regclass, 'comms.notifications'::regclass)`
+    );
+    const all = rows.map((row) => row.def).join(' ');
+    expect(all).toContain('itt_reminder');
+    expect(all).toContain('itt_response_detected');
   });
 
   it('keeps notifications one-per-message', async () => {
