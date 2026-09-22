@@ -143,8 +143,8 @@ function rfiReview(page: Page) {
     }
     if (path.endsWith('/tender-prep/workflows')) {
       return json([
-        { id: WORKFLOW_ID, package_id: PACKAGE_ID, organization_id: 'org-1', current_step: 2, step_data: { takeoff: { projectName: 'Reading Riverside', packageName: 'Drylining' } }, created_at: '', updated_at: '' },
-        { id: OTHER_WORKFLOW_ID, package_id: 'pkg-2', organization_id: 'org-1', current_step: 2, step_data: { takeoff: { projectName: 'Croydon Depot', packageName: 'Curtain Walling' } }, created_at: '', updated_at: '' }
+        { id: WORKFLOW_ID, package_id: PACKAGE_ID, organization_id: 'org-1', current_step: 2, step_data: { takeoff: { tenderName: 'Reading Riverside', packageName: 'Drylining' } }, created_at: '', updated_at: '' },
+        { id: OTHER_WORKFLOW_ID, package_id: 'pkg-2', organization_id: 'org-1', current_step: 2, step_data: { takeoff: { tenderName: 'Croydon Depot', packageName: 'Curtain Walling' } }, created_at: '', updated_at: '' }
       ]);
     }
 

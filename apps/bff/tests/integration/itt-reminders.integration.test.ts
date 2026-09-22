@@ -80,7 +80,7 @@ describe('ITT reminders', () => {
     );
     const workflow = await db.one<{ id: string }>(
       `INSERT INTO workflows (package_id, organization_id, step_data)
-       VALUES ($1, $2, jsonb_build_object('takeoff', jsonb_build_object('projectName', 'Reading Gateway')))
+       VALUES ($1, $2, jsonb_build_object('takeoff', jsonb_build_object('tenderName', 'Reading Gateway')))
        RETURNING id`,
       [packageId, organizationId]
     );

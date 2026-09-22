@@ -36,7 +36,7 @@ describe('the tender dashboard', () => {
   it('pairs each firm with its own answer and its own price, once', async () => {
     const { db, tpDb } = connect();
     const organizationId = randomUUID();
-    const projectId = randomUUID();
+    const tenderId = randomUUID();
     const packageId = randomUUID();
     const actor: Actor = { userId: randomUUID(), organizationId, subject: 'buyer', email: 'buyer@example.test' };
     const accepted = randomUUID();
@@ -46,14 +46,14 @@ describe('the tender dashboard', () => {
     try {
       const workflow = await db.one<{ id: string }>(
         `INSERT INTO workflows (package_id, organization_id, step_data)
-         VALUES ($1, $2, jsonb_build_object('takeoff', jsonb_build_object('projectId', $3::text)))
+         VALUES ($1, $2, jsonb_build_object('takeoff', jsonb_build_object('tenderId', $3::text)))
          RETURNING id`,
-        [packageId, organizationId, projectId]
+        [packageId, organizationId, tenderId]
       );
       await db.query(
         `INSERT INTO package_config (organization_id, project_id, seq, name, route_of_procurement)
          VALUES ($1, $2, 1, $3, 'supply_and_install')`,
-        [organizationId, projectId, packageName]
+        [organizationId, tenderId, packageName]
       );
       const shortlist = await db.one<{ id: string }>(
         `INSERT INTO shortlists (workflow_id, package_name, package_seq, confirmed_at)
@@ -117,7 +117,7 @@ describe('the tender dashboard', () => {
     // out would hide the outstanding work behind an apparently complete table.
     const { db, tpDb } = connect();
     const organizationId = randomUUID();
-    const projectId = randomUUID();
+    const tenderId = randomUUID();
     const packageId = randomUUID();
     const actor: Actor = { userId: randomUUID(), organizationId, subject: 'buyer', email: 'buyer@example.test' };
     const packageName = `Roofing ${packageId.slice(0, 8)}`;
@@ -125,14 +125,14 @@ describe('the tender dashboard', () => {
     try {
       const workflow = await db.one<{ id: string }>(
         `INSERT INTO workflows (package_id, organization_id, step_data)
-         VALUES ($1, $2, jsonb_build_object('takeoff', jsonb_build_object('projectId', $3::text)))
+         VALUES ($1, $2, jsonb_build_object('takeoff', jsonb_build_object('tenderId', $3::text)))
          RETURNING id`,
-        [packageId, organizationId, projectId]
+        [packageId, organizationId, tenderId]
       );
       await db.query(
         `INSERT INTO package_config (organization_id, project_id, seq, name, route_of_procurement)
          VALUES ($1, $2, 1, $3, 'supply_and_install')`,
-        [organizationId, projectId, packageName]
+        [organizationId, tenderId, packageName]
       );
 
       const rows = await tpDb.dashboardRows(actor, workflow.id);

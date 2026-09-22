@@ -47,7 +47,7 @@ describe('inbound email', () => {
   // itt_comms_config carries a genuine foreign key — it lives in `public`, which the
   // parent owns and is entitled to enforce.
   const organizationId = randomUUID();
-  const projectId = randomUUID();
+  const tenderId = randomUUID();
   const actor: Actor = { userId: randomUUID(), organizationId, subject: 'buyer', email: 'buyer@novamerx.ai' };
   const commsAddress = `acme-${organizationId.slice(0, 8)}-ittcomms@novamerx.ai`;
   const firmEmail = `estimator@${organizationId.slice(0, 8)}.test`;
@@ -83,9 +83,9 @@ describe('inbound email', () => {
     );
     const workflow = await db.one<{ id: string }>(
       `INSERT INTO workflows (package_id, organization_id, step_data)
-       VALUES ($1, $2, jsonb_build_object('takeoff', jsonb_build_object('projectId', $3::text, 'projectName', 'Reading Riverside')))
+       VALUES ($1, $2, jsonb_build_object('takeoff', jsonb_build_object('tenderId', $3::text, 'tenderName', 'Reading Riverside')))
        RETURNING id`,
-      [randomUUID(), organizationId, projectId]
+      [randomUUID(), organizationId, tenderId]
     );
     workflowId = workflow.id;
     const shortlist = await db.one<{ id: string }>(

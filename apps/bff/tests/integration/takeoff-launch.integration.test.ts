@@ -30,8 +30,6 @@ function message(overrides: Partial<TakeoffCompletion> = {}): TakeoffCompletion 
     packageId: randomUUID(),
     organizationId: randomUUID(),
     requestedBy: randomUUID(),
-    projectId: randomUUID(),
-    projectName: 'Reading Phase 2',
     packageName: 'Internal Finishes',
     packageVersionId: randomUUID(),
     versionNumber: 3,
@@ -47,12 +45,17 @@ function message(overrides: Partial<TakeoffCompletion> = {}): TakeoffCompletion 
 }
 
 describe('takeoffCompletionMessage', () => {
-  it('accepts a package with no tender', () => {
-    // bf_takeoff_packages.tender_id is nullable, so the producer emits an explicit null.
-    const parsed = takeoffCompletionMessage.parse(
-      message({ tenderId: null, tenderName: null, tenderReference: null }));
-    expect(parsed.tenderId).toBeNull();
-    expect(parsed.packageId).toBeTruthy();
+  it('refuses a package with no tender', () => {
+    // bf_takeoff_packages.tender_id is NOT NULL since BuildFlow migration 091. This used to
+    // assert the opposite, on the premise that a package need not belong to a tender --
+    // true only while the tender was a vestigial label row (issue #13).
+    expect(() => takeoffCompletionMessage.parse({ ...message(), tenderId: null })).toThrow();
+  });
+
+  it('names a tender with no reference, which is a different fact', () => {
+    const parsed = takeoffCompletionMessage.parse(message({ tenderReference: null }));
+    expect(parsed.tenderId).toBeTruthy();
+    expect(parsed.tenderReference).toBeNull();
   });
 
   it('ignores fields BuildFlow adds later', () => {

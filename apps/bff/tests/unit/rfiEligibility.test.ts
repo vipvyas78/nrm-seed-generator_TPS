@@ -34,8 +34,8 @@ describe('isHeuristicAttribution', () => {
 });
 
 describe('suspectsCrossTenderMisattribution', () => {
-  const readingGateway = { projectName: 'Reading Gateway', tenderReference: 'RG-2026' };
-  const croydonDepot = { projectName: 'Croydon Depot', tenderReference: 'CD-2026' };
+  const readingGateway = { tenderName: 'Reading Gateway', tenderReference: 'RG-2026' };
+  const croydonDepot = { tenderName: 'Croydon Depot', tenderReference: 'CD-2026' };
 
   it('flags a message naming another live tender and not the attributed one', () => {
     const result = suspectsCrossTenderMisattribution({
@@ -66,8 +66,8 @@ describe('suspectsCrossTenderMisattribution', () => {
 
   it('requires the WHOLE name, not one shared word', () => {
     // "Riverside" alone must not flag "Reading Riverside" against "Riverside Depot".
-    const readingRiverside = { projectName: 'Reading Riverside', tenderReference: null };
-    const riversideDepot = { projectName: 'Riverside Depot', tenderReference: null };
+    const readingRiverside = { tenderName: 'Reading Riverside', tenderReference: null };
+    const riversideDepot = { tenderName: 'Riverside Depot', tenderReference: null };
     const result = suspectsCrossTenderMisattribution({
       messageText: 'Question about the riverside walkway access.',
       attributedWorkflow: readingRiverside,

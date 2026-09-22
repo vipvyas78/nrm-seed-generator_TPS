@@ -417,7 +417,7 @@ export class TenderPrepDatabase {
       attachmentCodes: await this.attachmentCodesFor({ name: input.packageName, wp_code: pkg.wp_code })
     };
 
-    const projectName = 'the project';
+    const tenderName = 'the tender';
     // No workflow exists yet for a preview, so there is no itt_letter_details row to
     // read — the letter context falls back to the confirming actor's own identity only.
     const letterContext: IttEmailLetterContext = {
@@ -428,13 +428,13 @@ export class TenderPrepDatabase {
     const recipient = { name: null as string | null, email: '', address: null as string | null };
     const { renderKinds, templates } = await this.resolvedTemplatesFor(actor, emailPack.attachmentCodes);
     void renderKinds;
-    const context = await this.buildRenderContext(actor, emailPack, projectName, letterContext, recipient);
+    const context = await this.buildRenderContext(actor, emailPack, tenderName, letterContext, recipient);
     const attendanceRows = await this.attendanceRowsFor(actor, pkg);
     return {
-      ...renderIttEmail([emailPack], recipient, { projectName, completeBundleUrl: null, letterContext }),
+      ...renderIttEmail([emailPack], recipient, { tenderName, completeBundleUrl: null, letterContext }),
       // The real attachments, byte for byte — so a preview can be opened and checked without
       // anything being sent. Returned unencoded; only the send path base64s them.
-      attachments: await ittAttachmentsFor(emailPack, projectName, context, templates, attendanceRows)
+      attachments: await ittAttachmentsFor(emailPack, tenderName, context, templates, attendanceRows)
     };
   }
 
@@ -1007,37 +1007,42 @@ export class TenderPrepDatabase {
   async letterContextFor(actor: Actor, workflowId: string): Promise<IttEmailLetterContext> {
     const details = await this.getIttLetterDetails(actor, workflowId);
     const orgName = await this.organizationName(actor);
-    const projectEstimator = (details?.estimator_name || details?.estimator_email) ? null : await this.defaultProjectEstimator(workflowId);
+    const tenderEstimator = (details?.estimator_name || details?.estimator_email) ? null : await this.defaultTenderEstimator(workflowId);
     return {
       siteAddress: (details?.site_address as string | null) ?? null,
       tenderReturnDeadline: this.formatDate(details?.tender_return_deadline),
       clarificationsCloseDate: this.formatDate(details?.clarifications_close_date),
       siteVisitPermitted: (details?.site_visit_permitted as boolean | null) ?? null,
-      estimatorName: (details?.estimator_name as string | null) ?? projectEstimator?.name ?? actor.displayName ?? null,
-      estimatorEmail: (details?.estimator_email as string | null) ?? projectEstimator?.email ?? actor.email ?? null,
+      estimatorName: (details?.estimator_name as string | null) ?? tenderEstimator?.name ?? actor.displayName ?? null,
+      estimatorEmail: (details?.estimator_email as string | null) ?? tenderEstimator?.email ?? actor.email ?? null,
       organizationName: orgName
     };
   }
 
   /**
-   * The project's DEFAULT signatory (issue #41, bf_project_estimators.seq = 1) —
+   * The tender's DEFAULT signatory (issue #41, bf_tender_estimators.seq = 1) —
    * the middle rung between a saved itt_letter_details row (a human deliberately
    * set one, for this workflow) and the confirming actor's own account (the last
-   * resort, always available). A project names its estimators once at creation;
+   * resort, always available). A tender names its estimators once at creation;
    * this is what lets every package under it default to that name without asking
    * again.
    *
-   * workflows carries no project_id column directly — it is only ever reachable
-   * through step_data.takeoff.projectId (the same trap db.ts's own comment on
+   * workflows carries no tender_id column directly — it is only ever reachable
+   * through step_data.takeoff.tenderId (the same trap db.ts's own comment on
    * bf_takeoff_package_versions warns about), so a workflow with no take-off
-   * launched yet (the ITT preview path) correctly resolves to no project estimator.
+   * launched yet (the ITT preview path) correctly resolves to no tender estimator.
+   *
+   * BuildFlow migration 091 renamed both halves of this join (bf_project_estimators
+   * .project_id -> bf_tender_estimators.tender_id) and left a compatibility view
+   * behind at the old name purely so this query kept working. Reading the real
+   * table is what lets that view be dropped — see parent issue #55.
    */
-  private async defaultProjectEstimator(workflowId: string): Promise<{ name: string; email: string } | null> {
+  private async defaultTenderEstimator(workflowId: string): Promise<{ name: string; email: string } | null> {
     const [row] = await this.db.query<Row>(
       `SELECT e.name, e.email
          FROM workflows w
-         JOIN public.bf_project_estimators e
-           ON e.project_id = (w.step_data -> 'takeoff' ->> 'projectId')::uuid
+         JOIN public.bf_tender_estimators e
+           ON e.tender_id = (w.step_data -> 'takeoff' ->> 'tenderId')::uuid
         WHERE w.id = $1
         ORDER BY e.seq
         LIMIT 1`,
@@ -1051,7 +1056,7 @@ export class TenderPrepDatabase {
    * against — system fields from send-time data, plus this org's custom variables
    * (itt_template_variables, also read cross-schema from the parent's public schema). */
   private async buildRenderContext(
-    actor: Actor, pack: IttEmailPack, projectName: string, letterContext: IttEmailLetterContext, recipient: { name: string | null; email: string; address: string | null }
+    actor: Actor, pack: IttEmailPack, tenderName: string, letterContext: IttEmailLetterContext, recipient: { name: string | null; email: string; address: string | null }
   ): Promise<RenderContext> {
     const customRows = await this.db.query<Row>(
       `SELECT DISTINCT ON (key) key, default_value FROM itt_template_variables
@@ -1060,7 +1065,14 @@ export class TenderPrepDatabase {
       [actor.organizationId]
     );
     const context: RenderContext = {
-      projectName,
+      // `projectName` is the TOKEN key, and it is a contract with BuildFlow's
+      // ittTemplateFields.ts, which validates every {{token}} on save and whose seeded
+      // wording still uses this spelling. Renaming it here would render a visible
+      // [[missing:projectName]] in a letter already sent to a subcontractor. `tenderName`
+      // is emitted alongside so BuildFlow can move its templates over whenever it likes;
+      // retiring the old key is a coordinated change, not this one.
+      projectName: tenderName,
+      tenderName,
       tradeName: pack.packageName,
       siteAddress: letterContext.siteAddress ?? '',
       recipientName: recipient.name ?? '',
@@ -1423,11 +1435,11 @@ export class TenderPrepDatabase {
    * Build this project's package list from a released take-off.
    *
    * The list used to be configuration — 144 rows loaded once from the client's spreadsheet,
-   * org-wide, identical for every project. It is now derived, from three facts the parent
+   * org-wide, identical for every tender. It is now derived, from three facts the parent
    * platform already holds:
    *
    *   what the take-off measured   message.workPackages, as at the moment of release
-   *   what the appointment covers  message.projectScope (bf_projects.project_scope)
+   *   what the appointment covers  message.tenderScope (bf_tenders.tender_scope)
    *   when a package is required   public.nrm_sub_element_work_package.wp_scope_condition
    *
    * ONE ROW PER CODE, AT THE WIDEST CONDITION IT CARRIES. A work package maps to many NRM1
@@ -1448,9 +1460,11 @@ export class TenderPrepDatabase {
   async buildPackagesFromTakeoff(
     actor: Actor, message: TakeoffTendered
   ): Promise<{ selected: number; deactivated: number; byCondition: Record<string, number> }> {
-    const projectId = message.projectId ?? null;
+    // package_config.project_id is TPS's OWN column and keeps its name; only the key it is
+    // sourced from moved (BuildFlow issue #53).
+    const projectId = message.tenderId;
     const measured = message.workPackages.map((entry) => entry.wpCode);
-    const isDnB = message.projectScope === 'design_and_build';
+    const isDnB = message.tenderScope === 'design_and_build';
     // Registered per organization because route_options is org-scoped. A reviewer changes it
     // in Step 1 either way; this only has to satisfy package_config_route_not_blank.
     const defaultRoute = isDnB ? 'Design, Supply and install' : 'Supply and install';
@@ -1732,10 +1746,10 @@ export class TenderPrepDatabase {
     actor: Actor, workflowId: string, perPackage: number, packageConfigId?: string
   ): Promise<Row[]> {
     await this.assertWorkflowAccess(actor, workflowId);
-    const workflow = await this.db.one<{ step_data: { takeoff?: { projectId?: string | null } } }>(
+    const workflow = await this.db.one<{ step_data: { takeoff?: { tenderId?: string | null } } }>(
       `SELECT step_data FROM workflows WHERE id = $1`, [workflowId]
     );
-    const projectId = workflow.step_data?.takeoff?.projectId ?? null;
+    const projectId = workflow.step_data?.takeoff?.tenderId ?? null;
     const all = await this.listPackageConfig(actor, projectId);
     // Narrowed BEFORE the loop below, which is the whole point: each package costs an SCMS
     // candidate search, so asking for one package costs one search rather than thirty-five.
@@ -1875,10 +1889,10 @@ export class TenderPrepDatabase {
    */
   async dashboardRows(actor: Actor, workflowId: string): Promise<Row[]> {
     await this.assertWorkflowAccess(actor, workflowId);
-    const workflow = await this.db.one<{ step_data: { takeoff?: { projectId?: string | null } } }>(
+    const workflow = await this.db.one<{ step_data: { takeoff?: { tenderId?: string | null } } }>(
       `SELECT step_data FROM workflows WHERE id = $1`, [workflowId]
     );
-    const packages = await this.listPackageConfig(actor, workflow.step_data?.takeoff?.projectId ?? null);
+    const packages = await this.listPackageConfig(actor, workflow.step_data?.takeoff?.tenderId ?? null);
 
     const shortlists = await this.db.query<{
       package_name: string; confirmed_at: string | null; board_override_notes: string | null;
@@ -2212,7 +2226,7 @@ export class TenderPrepDatabase {
     /** The workflow's explicit Step 2 date, raw, from explicitReturnDeadlineFor. Read once
      *  per send by the caller rather than re-queried for every package. */
     explicitReturnDeadline?: unknown
-  ): Promise<{ emailPack: IttEmailPack; recipients: Row[]; projectName: string; returnDeadlineToStamp: string | null }> {
+  ): Promise<{ emailPack: IttEmailPack; recipients: Row[]; tenderName: string; returnDeadlineToStamp: string | null }> {
     const pack = await this.getPackageItt(actor, workflowId, packageName);
     const notIgnored = (items: Row[]) => items.filter((i) => i.ignored !== true);
 
@@ -2298,7 +2312,7 @@ export class TenderPrepDatabase {
     return {
       emailPack,
       recipients: pack.recipients as Row[],
-      projectName: (takeoff?.projectName as string | undefined) ?? 'the project',
+      tenderName: (takeoff?.tenderName as string | undefined) ?? 'the tender',
       returnDeadlineToStamp: returnDeadline.toStamp
     };
   }
@@ -2414,16 +2428,16 @@ export class TenderPrepDatabase {
    * the whole message and the subcontractor receiving nothing.
    */
   private async attachmentsFor(
-    actor: Actor, packs: IttEmailPack[], projectName: string,
+    actor: Actor, packs: IttEmailPack[], tenderName: string,
     letterContext: IttEmailLetterContext, recipient: { name: string | null; email: string; address: string | null }
   ): Promise<EmailAttachment[]> {
     const built: EmailAttachment[] = [];
     for (const pack of packs) {
       const { templates } = await this.resolvedTemplatesFor(actor, pack.attachmentCodes);
-      const context = await this.buildRenderContext(actor, pack, projectName, letterContext, recipient);
+      const context = await this.buildRenderContext(actor, pack, tenderName, letterContext, recipient);
       const packageRow = await this.db.query<Row>(`SELECT id FROM package_config WHERE organization_id = $1 AND name = $2 LIMIT 1`, [actor.organizationId, pack.packageName]);
       const attendanceRows = packageRow[0] ? await this.attendanceRowsFor(actor, packageRow[0]) : [];
-      for (const file of await ittAttachmentsFor(pack, projectName, context, templates, attendanceRows)) {
+      for (const file of await ittAttachmentsFor(pack, tenderName, context, templates, attendanceRows)) {
         built.push({
           content: file.content.toString('base64'),
           filename: file.filename,
@@ -2457,11 +2471,11 @@ export class TenderPrepDatabase {
   async draftIttEmail(actor: Actor, workflowId: string, packageName: string): Promise<IttDraft> {
     await this.assertWorkflowAccess(actor, workflowId);
 
-    const { emailPack, projectName, completeBundleUrl, letterContext, attachments, attachmentsOmittedOversize, recipients } =
+    const { emailPack, tenderName, completeBundleUrl, letterContext, attachments, attachmentsOmittedOversize, recipients } =
       await this.buildIttDraft(actor, workflowId, packageName);
     const portalStatus = await this.draftPortalStatus(workflowId, packageName, emailPack, recipients);
     const rendered = renderIttEmail([emailPack], { name: null, email: '', address: null }, {
-      projectName, completeBundleUrl, letterContext,
+      tenderName, completeBundleUrl, letterContext,
       portalStatusByPackage: portalStatus ? { [packageName]: portalStatus } : undefined
     });
 
@@ -2489,7 +2503,7 @@ export class TenderPrepDatabase {
    */
   private async buildIttDraft(actor: Actor, workflowId: string, packageName: string): Promise<{
     emailPack: IttEmailPack;
-    projectName: string;
+    tenderName: string;
     completeBundleUrl: string | null;
     letterContext: IttEmailLetterContext;
     attachments: IttAttachment[];
@@ -2512,10 +2526,10 @@ export class TenderPrepDatabase {
     // is what actually travels) — so a package that would send without its attachments previews
     // without them too, rather than promising files the send would drop.
     const { templates } = await this.resolvedTemplatesFor(actor, assembled.emailPack.attachmentCodes);
-    const context = await this.buildRenderContext(actor, assembled.emailPack, assembled.projectName, letterContext, draftRecipient);
+    const context = await this.buildRenderContext(actor, assembled.emailPack, assembled.tenderName, letterContext, draftRecipient);
     const packageRow = await this.db.query<Row>(`SELECT id FROM package_config WHERE organization_id = $1 AND name = $2 LIMIT 1`, [actor.organizationId, packageName]);
     const attendanceRows = packageRow[0] ? await this.attendanceRowsFor(actor, packageRow[0]) : [];
-    const files = await ittAttachmentsFor(assembled.emailPack, assembled.projectName, context, templates, attendanceRows);
+    const files = await ittAttachmentsFor(assembled.emailPack, assembled.tenderName, context, templates, attendanceRows);
     const encodedBytes = files.reduce((sum, f) => sum + Math.ceil(f.content.length / 3) * 4, 0);
     const attachmentsOmittedOversize = encodedBytes > MAX_ATTACHMENT_BYTES;
 
@@ -2539,7 +2553,7 @@ export class TenderPrepDatabase {
 
     return {
       emailPack: assembled.emailPack,
-      projectName: assembled.projectName,
+      tenderName: assembled.tenderName,
       completeBundleUrl,
       letterContext,
       attachments: attachmentsOmittedOversize ? [] : files,
@@ -2573,11 +2587,11 @@ export class TenderPrepDatabase {
       throw conflict('Email is not configured in this environment, so this ITT cannot be sent from here.');
     }
 
-    const { emailPack, projectName, completeBundleUrl, letterContext, attachments, recipients, returnDeadlineToStamp } =
+    const { emailPack, tenderName, completeBundleUrl, letterContext, attachments, recipients, returnDeadlineToStamp } =
       await this.buildIttDraft(actor, workflowId, packageName);
     const portalStatus = await this.draftPortalStatus(workflowId, packageName, emailPack, recipients);
     const rendered = renderIttEmail([emailPack], { name: null, email: '', address: null }, {
-      projectName, completeBundleUrl, letterContext,
+      tenderName, completeBundleUrl, letterContext,
       portalStatusByPackage: portalStatus ? { [packageName]: portalStatus } : undefined
     });
 
@@ -2734,15 +2748,15 @@ export class TenderPrepDatabase {
     // configuration — is dropped rather than allowed to abort the send. One broken package
     // out of forty must not stop the other thirty-nine going out, which is the same reason
     // the send loop below isolates per-firm failures.
-    const assembled = new Map<string, { emailPack: IttEmailPack; projectName: string }>();
+    const assembled = new Map<string, { emailPack: IttEmailPack; tenderName: string }>();
     const unassembled: Array<{ packageName: string; error: string }> = [];
     const returnDeadlineStamps: Array<{ packageName: string; date: string }> = [];
     const requestedPackages = [...new Set(entries.map((e) => e.package_name))];
     for (const name of requestedPackages) {
       try {
-        const { emailPack, projectName, returnDeadlineToStamp } =
+        const { emailPack, tenderName, returnDeadlineToStamp } =
           await this.assemblePackageForEmail(actor, workflowId, name, bundles, explicitReturnDeadline);
-        assembled.set(name, { emailPack, projectName });
+        assembled.set(name, { emailPack, tenderName });
         if (returnDeadlineToStamp) returnDeadlineStamps.push({ packageName: name, date: returnDeadlineToStamp });
       } catch (error) {
         unassembled.push({ packageName: name, error: error instanceof Error ? error.message : 'Could not assemble this package' });
@@ -2752,7 +2766,7 @@ export class TenderPrepDatabase {
       throw conflict(`No package could be assembled for sending. First error: ${unassembled[0]?.error ?? 'unknown'}`);
     }
     const packageNames = [...assembled.keys()];
-    const projectName = assembled.get(packageNames[0])!.projectName;
+    const tenderName = assembled.get(packageNames[0])!.tenderName;
 
     // Nothing stops a firm appearing twice on one package's shortlist, so dedupe by package.
     // A firm left with no assembled package is simply not emailed — better than sending an
@@ -2836,14 +2850,14 @@ export class TenderPrepDatabase {
         const status = portalStatuses.get(`${shortlistEntryId}::${packageName}`);
         if (status) portalStatusByPackage[packageName] = status;
       }
-      const rendered = renderIttEmail(packs, recipient, { projectName, completeBundleUrl, letterContext, portalStatusByPackage });
+      const rendered = renderIttEmail(packs, recipient, { tenderName, completeBundleUrl, letterContext, portalStatusByPackage });
       const subject = this.testEmailOverride
         ? `[TEST → ${contact?.contact_name ? String(contact.contact_name) : 'unknown'} <${realEmail ?? 'no email on file'}>] ${rendered.subject}`
         : rendered.subject;
 
       try {
         if (!this.emailService) throw new Error('EmailService not configured in this environment');
-        const attachments = await this.attachmentsFor(actor, packs, projectName, letterContext, recipient);
+        const attachments = await this.attachmentsFor(actor, packs, tenderName, letterContext, recipient);
         const result = await this.emailService.send({
           from, to: email, subject, html: rendered.html, text: rendered.text, attachments
         });
@@ -2904,7 +2918,7 @@ export class TenderPrepDatabase {
     const letterContext = await this.letterContextFor(actor, workflowId);
     const explicitReturnDeadline = await this.explicitReturnDeadlineFor(workflowId);
     const assembled = await this.assemblePackageForEmail(actor, workflowId, packageName, bundles, explicitReturnDeadline);
-    const { emailPack, projectName } = assembled;
+    const { emailPack, tenderName } = assembled;
     const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
 
     const recipients = assembled.recipients;
@@ -2971,7 +2985,7 @@ export class TenderPrepDatabase {
       };
       const portalStatus = portalStatuses.get(`${shortlistEntryId}::${packageName}`);
       const rendered = renderIttEmail([emailPack], recipientInfo, {
-        projectName, completeBundleUrl, letterContext,
+        tenderName, completeBundleUrl, letterContext,
         portalStatusByPackage: portalStatus ? { [packageName]: portalStatus } : undefined
       });
       // Keeps test-inbox messages distinguishable across packages/recipients when every
@@ -2983,7 +2997,7 @@ export class TenderPrepDatabase {
       // The cover letter and forms carry this recipient's own name/address, so —
       // unlike the old scope/BoQ-only pair — attachments are rebuilt per recipient,
       // not hoisted above the loop.
-      const attachments = await this.attachmentsFor(actor, [emailPack], projectName, letterContext, recipientInfo);
+      const attachments = await this.attachmentsFor(actor, [emailPack], tenderName, letterContext, recipientInfo);
 
       try {
         if (this.emailService) {
@@ -3225,19 +3239,19 @@ export class TenderPrepDatabase {
   }
 
   /**
-   * The project a workflow belongs to, for naming it in an email.
+   * The tender a workflow belongs to, for naming it in an email.
    *
    * Read off `workflows.step_data.takeoff`, where the launch message was stashed whole —
    * `IttEmailLetterContext` does not carry it, and re-deriving it from BuildFlow would be
    * an HTTP call for a string this row already holds. Null is fine: the emails say "the
-   * project" rather than refusing to send.
+   * tender" rather than refusing to send.
    */
-  private async projectNameForWorkflow(workflowId: string): Promise<string | null> {
+  private async tenderNameForWorkflow(workflowId: string): Promise<string | null> {
     const [row] = await this.db.query<Row>(
-      `SELECT step_data -> 'takeoff' ->> 'projectName' AS project_name FROM workflows WHERE id = $1`,
+      `SELECT step_data -> 'takeoff' ->> 'tenderName' AS tender_name FROM workflows WHERE id = $1`,
       [workflowId]
     );
-    return row?.project_name != null ? String(row.project_name) : null;
+    return row?.tender_name != null ? String(row.tender_name) : null;
   }
 
   /**
@@ -3451,7 +3465,7 @@ export class TenderPrepDatabase {
       // somebody recognises; the id is not, so it is the last resort and lives in the UI.
       `SELECT id::text AS id, package_id::text AS package_id,
               COALESCE(step_data -> 'takeoff' ->> 'packageName',
-                       step_data -> 'takeoff' ->> 'projectName') AS package_name
+                       step_data -> 'takeoff' ->> 'tenderName') AS package_name
          FROM workflows WHERE id = ANY($1::uuid[]) AND organization_id = $2`,
       [workflowIds, actor.organizationId]
     );
@@ -3509,10 +3523,10 @@ export class TenderPrepDatabase {
     const link = await this.resolveClientToken(token, accessEmail);
     const queries = await this.commsDb!.forwardedQueries(String(link.forward_message_id));
     const { messages } = await this.commsDb!.getThread(String(link.thread_id));
-    const projectName = link.workflow_id != null
-      ? await this.projectNameForWorkflow(String(link.workflow_id)) : null;
+    const tenderName = link.workflow_id != null
+      ? await this.tenderNameForWorkflow(String(link.workflow_id)) : null;
     return {
-      project_name: projectName,
+      tender_name: tenderName,
       recipient_email: link.recipient_email,
       // The firm is deliberately NOT named to the Client. They are answering a question
       // about the works; which subcontractor asked is commercially theirs, not the
@@ -3833,7 +3847,7 @@ export class TenderPrepDatabase {
     const organizationId = await this.organizationForWorkflow(workflowId);
     const config = await this.commsConfig(organizationId);
     const context = await this.letterContextFor(actor, workflowId).catch(() => null);
-    const projectName = await this.projectNameForWorkflow(workflowId);
+    const tenderName = await this.tenderNameForWorkflow(workflowId);
 
     const thread = await this.commsDb.findOrCreateThread({
       organizationId, workflowId, counterpartyKind: 'client',
@@ -3883,7 +3897,7 @@ export class TenderPrepDatabase {
     }
 
     const email = renderRfiForwardEmail(input.items, {
-      projectName,
+      tenderName,
       tenderReference: null,
       estimatorName: context?.estimatorName ?? null,
       estimatorEmail: context?.estimatorEmail ?? null,
@@ -3987,7 +4001,7 @@ export class TenderPrepDatabase {
     const organizationId = await this.organizationForWorkflow(workflowId);
     const config = await this.commsConfig(organizationId);
     const context = await this.letterContextFor(actor, workflowId).catch(() => null);
-    const projectName = await this.projectNameForWorkflow(workflowId);
+    const tenderName = await this.tenderNameForWorkflow(workflowId);
 
     // Which forward this answers, and therefore which queries it covers.
     const forwardId = clientMessage.in_reply_to_message_id != null
@@ -4016,7 +4030,7 @@ export class TenderPrepDatabase {
       if (!relay) continue;
 
       const email = renderClientAnswerRelayEmail({
-        projectName,
+        tenderName,
         packageName: null,
         originalQuery: query.body_text != null ? String(query.body_text) : '',
         originalSubject: query.subject != null ? String(query.subject) : null,
@@ -4164,7 +4178,7 @@ export class TenderPrepDatabase {
     const organizationId = await this.organizationForWorkflow(workflowId);
     const config = await this.commsConfig(organizationId);
     const context = await this.letterContextFor(actor, workflowId).catch(() => null);
-    const projectName = await this.projectNameForWorkflow(workflowId);
+    const tenderName = await this.tenderNameForWorkflow(workflowId);
 
     const results: Array<{ thread_id: string; to: string; status: string; error?: string }> = [];
 
@@ -4213,7 +4227,7 @@ export class TenderPrepDatabase {
           citations: item.citations
         })),
         {
-          projectName, packageName: null,
+          tenderName, packageName: null,
           estimatorName: context?.estimatorName ?? null,
           organizationName: context?.organizationName ?? null,
           portalUrl: null,

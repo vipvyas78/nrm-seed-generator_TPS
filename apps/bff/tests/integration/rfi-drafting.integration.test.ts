@@ -77,13 +77,13 @@ describe('RFI collation and drafting', () => {
     return id;
   }
 
-  async function seedWorkflow(organizationId: string, projectName: string, tenderReference: string): Promise<string> {
+  async function seedWorkflow(organizationId: string, tenderName: string, tenderReference: string): Promise<string> {
     const packageId = randomUUID();
     const workflow = await db.one<{ id: string }>(
       `INSERT INTO workflows (package_id, organization_id, step_data)
-       VALUES ($1, $2, jsonb_build_object('takeoff', jsonb_build_object('projectName', $3::text, 'tenderReference', $4::text, 'tenderName', $3::text, 'packageName', 'Curtain Walling')))
+       VALUES ($1, $2, jsonb_build_object('takeoff', jsonb_build_object('tenderReference', $4::text, 'tenderName', $3::text, 'packageName', 'Curtain Walling')))
        RETURNING id`,
-      [packageId, organizationId, projectName, tenderReference]
+      [packageId, organizationId, tenderName, tenderReference]
     );
     cleanupIds.workflowId.push(workflow.id);
     return workflow.id;

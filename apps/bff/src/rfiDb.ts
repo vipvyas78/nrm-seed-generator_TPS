@@ -295,24 +295,24 @@ export class RfiDatabase {
 
   private async workflowNames(workflowId: string): Promise<OtherWorkflow | null> {
     const [row] = await this.db.query<Row>(
-      `SELECT step_data -> 'takeoff' ->> 'projectName' AS project_name,
+      `SELECT step_data -> 'takeoff' ->> 'tenderName' AS tender_name,
               step_data -> 'takeoff' ->> 'tenderReference' AS tender_reference
          FROM workflows WHERE id = $1`,
       [workflowId]
     );
     if (!row) return null;
-    return { projectName: row.project_name as string | null, tenderReference: row.tender_reference as string | null };
+    return { tenderName: row.tender_name as string | null, tenderReference: row.tender_reference as string | null };
   }
 
   private async otherLiveWorkflowNames(organizationId: string, excludeWorkflowId: string): Promise<OtherWorkflow[]> {
     const rows = await this.db.query<Row>(
-      `SELECT step_data -> 'takeoff' ->> 'projectName' AS project_name,
+      `SELECT step_data -> 'takeoff' ->> 'tenderName' AS tender_name,
               step_data -> 'takeoff' ->> 'tenderReference' AS tender_reference
          FROM workflows
         WHERE organization_id = $1 AND archived_at IS NULL AND id <> $2`,
       [organizationId, excludeWorkflowId]
     );
-    return rows.map((r) => ({ projectName: r.project_name as string | null, tenderReference: r.tender_reference as string | null }));
+    return rows.map((r) => ({ tenderName: r.tender_name as string | null, tenderReference: r.tender_reference as string | null }));
   }
 
   private async workflowContext(workflowId: string): Promise<{ tenderName: string | null; packageName: string | null } | null> {

@@ -116,13 +116,13 @@ describe('the estimator RFI review loop', () => {
     return id;
   }
 
-  async function seedWorkflow(organizationId: string, projectName: string): Promise<string> {
+  async function seedWorkflow(organizationId: string, tenderName: string): Promise<string> {
     const packageId = randomUUID();
     const workflow = await db.one<{ id: string }>(
       `INSERT INTO workflows (package_id, organization_id, step_data)
-       VALUES ($1, $2, jsonb_build_object('takeoff', jsonb_build_object('projectName', $3::text)))
+       VALUES ($1, $2, jsonb_build_object('takeoff', jsonb_build_object('tenderName', $3::text)))
        RETURNING id`,
-      [packageId, organizationId, projectName]
+      [packageId, organizationId, tenderName]
     );
     cleanupIds.workflowId.push(workflow.id);
     return workflow.id;

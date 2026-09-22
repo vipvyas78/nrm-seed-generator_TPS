@@ -22,7 +22,7 @@ function query(over: Partial<ForwardedQuery> = {}): ForwardedQuery {
 }
 
 const context = {
-  projectName: 'Reading Riverside', tenderReference: 'RR-2026',
+  tenderName: 'Reading Riverside', tenderReference: 'RR-2026',
   estimatorName: 'Alex Estimator', estimatorEmail: 'alex@novamerx.ai',
   organizationName: 'Novamerx Ltd', replyToken: TOKEN,
   replyUrl: 'https://dev.novamerx.ai/tps/client/tok'
@@ -109,7 +109,7 @@ describe('renderRfiForwardEmail', () => {
 
 describe('renderClientAnswerRelayEmail', () => {
   const relay = {
-    projectName: 'Reading Riverside', packageName: 'Drylining & Partitions',
+    tenderName: 'Reading Riverside', packageName: 'Drylining & Partitions',
     originalQuery: 'Is the suspended ceiling grid included?',
     originalSubject: 'Ceiling grid',
     clientAnswer: 'Yes — the grid and tiles are both in this package.',
@@ -174,7 +174,7 @@ describe('renderRfiResponseEmail', () => {
   }
 
   const context = {
-    projectName: 'Reading Riverside', packageName: 'Drylining & Partitions',
+    tenderName: 'Reading Riverside', packageName: 'Drylining & Partitions',
     estimatorName: 'Alex Estimator', organizationName: 'Novamerx Ltd',
     portalUrl: null as string | null, replyToken: TOKEN2
   };

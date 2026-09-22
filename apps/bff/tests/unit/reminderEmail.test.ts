@@ -21,7 +21,7 @@ const CONTEXT: ReminderContext = {
   firmName: 'Acme Glazing Ltd',
   contactName: 'Sam Colleague',
   packageName: 'Curtain Walling',
-  projectName: 'Reading Gateway',
+  tenderName: 'Reading Gateway',
   tenderReturnDeadline: '29/10/2026',
   daysRemaining: 21,
   portalUrl: 'https://dev.novamerx.ai/tps/respond/abc123',

@@ -11,13 +11,23 @@ import { z } from 'zod';
 export const TAKEOFF_COMPLETION_QUEUE = 'buildflow_takeoff_completion_queue';
 
 /**
- * `tenderId` and its siblings are `.nullable()`, not `.optional()`: a package need not
- * belong to a tender (bf_takeoff_packages.tender_id is nullable), and the producer emits
- * the key with a JSON null rather than omitting it — so "this package has no tender" and
- * "the producer sent a malformed message" stay distinguishable.
+ * `tenderId` is required and non-nullable. It used to be `.nullable()` on the premise that
+ * a package need not belong to a tender — true while `bf_takeoff_packages.tender_id` was a
+ * nullable sideways link to a vestigial label row. BuildFlow migration 091 dropped that row
+ * and made the column NOT NULL by construction, so a message without a tender is now a
+ * malformed message and should fail loudly here rather than carry a null into a join that
+ * silently matches nothing.
  *
- * Everything past `requestedBy` is context for the Tender Launch Pack step. Unknown keys
- * are ignored rather than rejected, so BuildFlow can add fields without a lockstep deploy.
+ * The legacy `projectId` / `projectName` / `projectScope` spellings are deliberately NOT
+ * declared. This schema is a plain z.object, so zod STRIPS what it does not declare, and
+ * `queues.ts` parses before `tenderPrepDb` stores the result — meaning an undeclared key
+ * never reaches `step_data.takeoff` at all. Leaving them out is therefore what makes
+ * BuildFlow's eventual removal of the legacy aliases a no-op here.
+ *
+ * That same stripping is why every key BuildFlow adds must be declared to be usable:
+ * "unknown keys are ignored" means ignored, not passed through.
+ *
+ * Everything past `requestedBy` is context for the Tender Launch Pack step.
  */
 export const takeoffCompletionMessage = z.object({
   takeoffId: z.string().min(1),
@@ -31,13 +41,11 @@ export const takeoffCompletionMessage = z.object({
   organizationId: z.string().uuid(),
   requestedBy: z.string().uuid(),
 
-  projectId: z.string().uuid().nullable().optional(),
-  projectName: z.string().nullable().optional(),
   packageName: z.string().nullable().optional(),
   packageVersionId: z.string().uuid().nullable().optional(),
   versionNumber: z.number().nullable().optional(),
   revision: z.number().nullable().optional(),
-  tenderId: z.string().uuid().nullable(),
+  tenderId: z.string().uuid(),
   tenderName: z.string().nullable(),
   tenderReference: z.string().nullable(),
   itemCount: z.number().nullable().optional(),
@@ -62,7 +70,7 @@ export const TAKEOFF_TENDER_QUEUE = 'buildflow_takeoff_tender_queue';
  * Extends the completion shape — same identity fields, so nothing about reading a message
  * changes — with the two facts the package rule needs.
  *
- * `projectScope` is `.nullable()`, not defaulted: a project that has never been given a
+ * `tenderScope` is `.nullable()`, not defaulted: a tender that has never been given a
  * scope selects the same packages as one explicitly scoped `works`, but they are different
  * facts and only one of them is worth telling a user about.
  *
@@ -71,7 +79,7 @@ export const TAKEOFF_TENDER_QUEUE = 'buildflow_takeoff_tender_queue';
  * takeoff_items later would silently answer for whatever has happened since.
  */
 export const takeoffTenderedMessage = takeoffCompletionMessage.extend({
-  projectScope: z.string().nullable().optional(),
+  tenderScope: z.string().nullable().optional(),
   workPackages: z.array(z.object({
     wpCode: z.string().min(1),
     itemCount: z.number()
