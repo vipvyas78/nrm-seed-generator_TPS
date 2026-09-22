@@ -13,13 +13,16 @@ import { BuildflowCommsAttachmentsClient } from './buildflowCommsAttachmentsClie
 import { Database } from './db.js';
 import { AppError } from './errors.js';
 import { BoqReadDatabase } from './boqReadDb.js';
+import { BuildflowAttachmentTextClient } from './buildflowAttachmentTextClient.js';
 import { BuildflowDocumentBundlesClient } from './buildflowDocumentBundlesClient.js';
 import { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
 import { BuildflowMepBoqClient } from './buildflowMepBoqClient.js';
 import { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
+import { BuildflowTenderPassagesClient } from './buildflowTenderPassagesClient.js';
 import { DropboxDocumentLinkProvider } from './documentLinkProvider.js';
 import { EmailService } from './emailService.js';
 import { PricingPortalDatabase } from './pricingPortalDb.js';
+import { RfiDatabase } from './rfiDb.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
 import { ITT_FROM_ADDRESS, TenderPrepDatabase } from './tenderPrepDb.js';
 import { IttRemindersDatabase } from './ittRemindersDb.js';
@@ -122,6 +125,15 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const commsAttachments = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
     ? new BuildflowCommsAttachmentsClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
     : undefined;
+  // Sixth and seventh BuildFlow clients (issue #41), same base URL and token pair.
+  // Both are best-effort — see each client's own header for why a failure here
+  // degrades the RFI rather than losing it.
+  const attachmentTextClient = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
+    ? new BuildflowAttachmentTextClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
+    : undefined;
+  const tenderPassagesClient = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
+    ? new BuildflowTenderPassagesClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
+    : undefined;
   // Falls back to WEB_ORIGIN so a portal link and the Cloudflare Access destination it must
   // match (cloudflareAccess.ts's `portalHost`) can never drift apart from each other just
   // because PORTAL_BASE_URL is unset — see tenderPrepDb.ts's use of this same value below.
@@ -145,6 +157,14 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const reminders = new IttRemindersDatabase(
     db, scmsDb, commsDb, emailService, testEmailOverride, portalBaseUrl, ITT_FROM_ADDRESS
   );
+  // RFI collation and drafting (issue #41). Needs both BuildFlow clients above —
+  // without them there is nowhere to read an attachment's text or a tender's
+  // documents from, so the /internal/scheduled/rfi/* routes below are registered
+  // only when this is defined, the same all-or-nothing rule the scheduled-secrets
+  // pair already follows.
+  const rfiDb = attachmentTextClient && tenderPassagesClient
+    ? new RfiDatabase(db, commsDb, attachmentTextClient, tenderPassagesClient)
+    : undefined;
 
   app.decorate('tps', { config, db, tpDb, scmsDb });
   await app.register(cors, { origin: config.WEB_ORIGIN, credentials: false });
@@ -447,6 +467,73 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
         const asOf = reminders.isTestMode && input.asOf ? new Date(input.asOf) : new Date();
         return reminders.runDue(asOf);
       });
+
+      // RFI drafting (issue #41), on its own frequent cron in the scheduled-tasks
+      // worker. Registered in this SAME scope — same auth, same raw-body parser —
+      // but only when rfiDb exists, i.e. both BuildFlow clients above are configured.
+      // A half-configured deployment (reminders working, RFI drafting not) is a real
+      // and acceptable state: unlike the token pair, these routes' own prerequisite
+      // is a second, independent pair of variables.
+      if (rfiDb) {
+        scheduled.post('/internal/scheduled/rfi/pending-extraction', async (request) => {
+          authenticate(request);
+          body(request, z.object({}).passthrough());
+          return rfiDb.pendingExtraction(25);
+        });
+
+        scheduled.post('/internal/scheduled/rfi/questions', async (request) => {
+          authenticate(request);
+          const input = body(request, z.object({
+            extractions: z.array(z.object({
+              messageId: uuid,
+              model: z.string().max(100).nullable().default(null),
+              droppedCount: z.number().int().min(0).default(0),
+              questions: z.array(z.object({
+                questionText: z.string().min(1).max(2000),
+                sourceKind: z.enum(['body', 'attachment']),
+                sourceAttachmentId: uuid.nullable().optional(),
+                sourceRef: z.string().max(120).nullable().optional(),
+                searchTerms: z.array(z.string().max(80)).max(6).default([])
+              })).max(60)
+            })).max(25)
+          }));
+          return rfiDb.recordQuestions(input.extractions);
+        });
+
+        scheduled.post('/internal/scheduled/rfi/pending-drafts', async (request) => {
+          authenticate(request);
+          body(request, z.object({}).passthrough());
+          return rfiDb.pendingDrafts(25);
+        });
+
+        scheduled.post('/internal/scheduled/rfi/drafts', async (request) => {
+          authenticate(request);
+          const input = body(request, z.object({
+            drafts: z.array(z.object({
+              questionId: uuid,
+              status: z.enum(['proposed', 'insufficient_evidence', 'rejected_ungrounded', 'error']),
+              answerText: z.string().max(4000).nullable().default(null),
+              confidence: z.number().min(0).max(1).nullable().default(null),
+              needsClient: z.boolean().default(false),
+              citations: z.array(z.object({
+                passageId: z.string().min(1),
+                documentId: z.string().min(1),
+                filename: z.string().min(1),
+                headingPath: z.string().nullable().default(null),
+                pageHint: z.number().int().nullable().default(null),
+                quotedText: z.string().max(600),
+                shareUrl: z.string().nullable().default(null)
+              })).max(6).default([]),
+              corpusSessionRef: z.string().nullable().default(null),
+              passagesOffered: z.number().int().min(0).default(0),
+              model: z.string().max(100).nullable().default(null),
+              promptVersion: z.string().max(40).nullable().default(null),
+              rejectReason: z.string().max(400).nullable().optional()
+            })).max(25)
+          }));
+          return rfiDb.recordDrafts(input.drafts);
+        });
+      }
     });
   }
 

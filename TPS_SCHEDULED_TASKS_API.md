@@ -206,3 +206,181 @@ repositories.
 
 Every route is safe to retry: reminders are claimed atomically before they are sent, and
 verdicts are recorded once per message.
+
+## 6. RFI drafting (issue #41)
+
+Four more routes, in the **same encapsulated scope** as the three above — same bearer, same
+signature, same raw-body capture — but with their **own, independent prerequisite**:
+`BUILDFLOW_BASE_URL` and `BUILDFLOW_DOCUMENT_LINKS_TOKEN` must also be configured, because
+these routes read a tender's document corpus and an RFI attachment's text through BuildFlow.
+A deployment can therefore have reminders working and RFI drafting not (or the reverse is
+never possible — RFI drafting needs the scheduled-tasks pair too). Absent either prerequisite,
+the four routes simply do not exist: a 404, never a 500.
+
+**Runs on its own, more frequent cron** in the scheduler — every 15 minutes, not once a day —
+because a subcontractor's RFI arriving mid-morning should have a draft waiting within the hour,
+not the following night. See `src/tasks/schedule.ts` in `novamerx-scheduled-tasks` for the
+constant, pinned against `wrangler.jsonc`'s second trigger by that repo's own test.
+
+**The order is load-bearing, the same way replies-before-reminders is above:**
+
+```
+1. POST /internal/scheduled/rfi/pending-extraction   unread RFI messages, body + attachment text
+2.   (scheduler) split each message into individual questions, grounded verbatim in the source
+3. POST /internal/scheduled/rfi/questions            write the questions back
+4. POST /internal/scheduled/rfi/pending-drafts        questions awaiting a draft, WITH retrieved
+                                                       passages from that tender's own documents
+5.   (scheduler) draft an answer, citing only the supplied passages
+6. POST /internal/scheduled/rfi/drafts               write the drafts back
+```
+
+**Retrieval happens on the TPS side, inside step 4, not by the scheduler calling BuildFlow
+directly.** The scheduler holds no route to BuildFlow at all — only `TPS_BASE_URL` and its own
+two secrets — so `pending-drafts` inlines every passage a question might need into its own
+response. This is the one structural difference from the reminder routes' shape, and it is
+deliberate: the worker stays "a timer and a model call" exactly as this document's own opening
+line demands, for BOTH tasks it now performs.
+
+### 6.1 `rfi/pending-extraction`
+
+Request: `{}`
+
+```json
+{
+  "messages": [
+    {
+      "messageId": "8b0c…",
+      "workflowId": "3f2a…",
+      "tenderName": "Reading Gateway",
+      "packageName": "Curtain Walling",
+      "firmName": "Acme Glazing Ltd",
+      "bodyText": "Please could you confirm: 1) will the ironmongery be supplied...",
+      "attachments": [
+        { "attachmentId": "9c1d…", "filename": "RFI schedule.xlsx", "text": "Sheet1!A1: Will you supply the ironmongery?\nSheet1!A2: ..." }
+      ]
+    }
+  ]
+}
+```
+
+- **Only messages that pass the no-tender-mixup gate are returned.** A message TPS could not
+  attribute deterministically to exactly one live tender is recorded as `blocked_ambiguous_tender`
+  or `blocked_cross_tender_suspected` and never offered — see CLAUDE.md's account of the
+  eligibility gate. The scheduler never sees, and never has to reason about, which tender an
+  email belongs to.
+- `attachments` includes only files BuildFlow could actually read (`.xlsx`/`.docx`, up to
+  200,000 characters, truncated beyond that). A `.pdf` or any other unreadable attachment is
+  simply absent — the message is still offered if its body text alone is non-empty, and the
+  attachment is flagged to the estimator separately.
+- Up to 25 messages per call.
+
+### 6.2 `rfi/questions`
+
+Request:
+
+```json
+{
+  "extractions": [
+    {
+      "messageId": "8b0c…",
+      "model": "claude-opus-5",
+      "droppedCount": 1,
+      "questions": [
+        { "questionText": "Will you supply the ironmongery?", "sourceKind": "attachment", "sourceAttachmentId": "9c1d…", "sourceRef": "Sheet1!A1", "searchTerms": ["ironmongery"] }
+      ]
+    }
+  ]
+}
+```
+
+- **`questionText` must be found, verbatim (after case/whitespace/quote normalising), in the
+  source text TPS supplied for that message.** This is the `groundEvidence` doctrine
+  (`classify.ts`'s own doctrine, generalised): a question the model could not point at in the
+  actual source is not extracted. `droppedCount` reports how many the scheduler's own grounding
+  check discarded — TPS does not re-verify this, and trusts the count for
+  `rfi_message_reviews.questions_dropped`, which is why it is a required field, not an
+  afterthought.
+- `sourceRef` is what makes a drafted question checkable against the firm's own file — an
+  `.xlsx` cell reference or a `.docx` paragraph number, exactly as BuildFlow's extraction emits
+  it.
+- `searchTerms` (optional, up to 6) feed straight into the passage retrieval in step 4 — verbatim
+  terms from the question's own source, never invented, the same grounding rule.
+- Response: `{ "outcomes": [{ "messageId": "8b0c…", "accepted": 3, "reason": "applied" }] }` —
+  `accepted` is how many questions were written; `reason` is `applied`, `no_questions`, or
+  `unknown_message`.
+
+### 6.3 `rfi/pending-drafts`
+
+Request: `{}`
+
+```json
+{
+  "questions": [
+    {
+      "questionId": "a1b2…",
+      "questionText": "Will you supply the ironmongery?",
+      "tenderName": "Reading Gateway",
+      "packageName": "Curtain Walling",
+      "passages": [
+        {
+          "passageId": "p1", "documentId": "d1", "filename": "2G-specification.pdf",
+          "docType": "specification", "headingPath": "2G Internal doors > 2G.310 Ironmongery",
+          "pageHint": 41, "text": "Ironmongery to all internal doors shall be supplied and fitted by the Contractor...",
+          "snippet": "…ironmongery to all internal doors shall be supplied…",
+          "rank": 0.62, "shareUrl": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+- **`passages` is the WHOLE of what a drafted answer may be grounded in.** The model must never
+  cite a document it was not shown here — see §6.4's citation rule, which is how that is
+  enforced on the way back in.
+- `shareUrl` links to the source document where BuildFlow could resolve one; `null` means the
+  document is named but not (yet) linkable, shown unlinked rather than hidden.
+- Up to 25 questions per call, batched by tender internally so one BuildFlow retrieval call
+  serves every question on the same tender.
+
+### 6.4 `rfi/drafts`
+
+Request:
+
+```json
+{
+  "drafts": [
+    {
+      "questionId": "a1b2…",
+      "status": "proposed",
+      "answerText": "Yes — ironmongery to internal doors is included, per clause 2G.310.",
+      "confidence": 0.86,
+      "needsClient": false,
+      "citations": [
+        { "passageId": "p1", "documentId": "d1", "filename": "2G-specification.pdf", "headingPath": "2G Internal doors > 2G.310 Ironmongery", "pageHint": 41, "quotedText": "Ironmongery to all internal doors shall be supplied and fitted by the Contractor", "shareUrl": null }
+      ],
+      "corpusSessionRef": "sess-…",
+      "passagesOffered": 8,
+      "model": "claude-opus-5",
+      "promptVersion": "v1"
+    }
+  ]
+}
+```
+
+- `status`: `proposed` (a usable answer), `insufficient_evidence` (the passages did not answer
+  it), `rejected_ungrounded` (the model's own citation failed the grounding check before this
+  call was even made — see below), or `error`.
+- **`answerText` is required when, and only when, `status = "proposed"`.** A draft with any
+  other status carries `answerText: null` — the estimator sees "the app could not answer this"
+  and writes it themselves, never an empty box pretending to be a considered refusal.
+- **Every citation's `quotedText` must be verbatim, in the passage it names** (the same passage
+  id, not merely present somewhere in the batch) — the scheduler's own responsibility, the same
+  `groundEvidence` doctrine applied to citations instead of questions. TPS stores what it is
+  given and does not re-verify it; a citation that fails this on the scheduler's own side must
+  never be sent as `proposed`.
+- Response: `{ "outcomes": [{ "questionId": "a1b2…", "applied": true, "reason": "proposed" }] }`.
+  A new draft always supersedes the previous live one for that question (TPS's own append-only
+  ledger, `tps.rfi_drafts`) — `applied: true` here means "recorded", not "approved"; approval is
+  a human, on the review page, separately.
+- Up to 25 drafts per call.

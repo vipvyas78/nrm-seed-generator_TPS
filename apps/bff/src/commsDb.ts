@@ -51,7 +51,7 @@ export type AttributionMethod =
 
 export type NotificationKind =
   | 'subcontractor_rfi' | 'client_reply' | 'forward_failed' | 'unattributed_email'
-  | 'itt_response_detected';
+  | 'itt_response_detected' | 'rfi_review_required';
 
 /**
  * What the bell says, decided by the caller rather than derived here.
@@ -73,7 +73,7 @@ export interface NotificationInput {
 
 export type MessageKind =
   | 'subcontractor_rfi' | 'client_forward' | 'client_reply' | 'relay_to_subcontractor' | 'note'
-  | 'itt_reminder';
+  | 'itt_reminder' | 'rfi_response';
 
 export interface RecordMessageInput {
   threadId: string;
@@ -127,7 +127,7 @@ export interface RecordMessageInput {
  *
  * Bump it in the same change that starts depending on a newer migration.
  */
-export const REQUIRED_COMMS_MIGRATION = '002_itt_reminder_kinds.sql';
+export const REQUIRED_COMMS_MIGRATION = '003_rfi_kinds.sql';
 
 /**
  * Refuses to continue unless the comms schema is present and at least at the migration
@@ -492,6 +492,81 @@ export class CommsDatabase {
         WHERE m.id = ANY($1::uuid[])
         ORDER BY m.occurred_at`,
       [ids]
+    );
+  }
+
+  // ─────────────────────────────────────────── RFI drafting (issue #41)
+  //
+  // The rfi_* tables are TPS's own (tps.rfi_message_reviews etc.), so "already
+  // reviewed" is an EXCLUSION LIST the caller computes from those tables first, the
+  // same pattern inboundEmailsSince above already uses for the reminder classifier —
+  // never a cross-schema JOIN from this file into a tps table.
+
+  /** Inbound subcontractor RFI messages not yet considered for question extraction.
+   *  Portal RFIs and emailed ones share kind='subcontractor_rfi', so one query
+   *  covers both channels. */
+  async pendingRfiCandidates(input: { excludeMessageIds: string[]; limit: number }): Promise<Row[]> {
+    return this.db.query<Row>(
+      `SELECT m.id AS message_id, m.thread_id, m.organization_id, m.workflow_id,
+              m.shortlist_entry_id, m.channel, m.attribution_method,
+              m.subject, m.body_text, m.occurred_at, m.author_name, m.author_email,
+              t.subcontractor_id, t.counterparty_name, t.counterparty_email
+         FROM comms.messages m
+         JOIN comms.threads t ON t.id = m.thread_id
+        WHERE m.direction = 'inbound'
+          AND m.kind = 'subcontractor_rfi'
+          AND NOT (m.id = ANY($1::uuid[]))
+        ORDER BY m.occurred_at ASC
+        LIMIT $2`,
+      [input.excludeMessageIds, input.limit]
+    );
+  }
+
+  /** Every attachment on the given messages — the bytes are read via BuildFlow's
+   *  attachment-text endpoint, this only returns what is needed to call it. */
+  async attachmentsForMessages(messageIds: string[]): Promise<Row[]> {
+    if (messageIds.length === 0) return [];
+    return this.db.query<Row>(
+      `SELECT id, message_id, filename, content_type, object_key
+         FROM comms.attachments
+        WHERE message_id = ANY($1::uuid[])
+        ORDER BY message_id, seq`,
+      [messageIds]
+    );
+  }
+
+  /**
+   * A human re-files a message onto the tender it actually belongs to, where the
+   * sender-address heuristic could not decide on its own (the eligibility gate's
+   * blocked_ambiguous_tender state). Writes attribution_method='manual' — the value
+   * that has existed in the vocabulary since migration 001 and, until this, was
+   * never once written.
+   *
+   * Re-homes the message onto a thread for (workflowId, the message's own sender) —
+   * findOrCreateThread already does the right thing whether or not one exists yet.
+   * shortlist_entry_id is left NULL: re-attribution answers "which tender", not
+   * "which package within it", which nothing here can infer safely.
+   */
+  async reattributeMessage(messageId: string, workflowId: string): Promise<Row> {
+    const [message] = await this.db.query<Row>(
+      `SELECT organization_id, author_email, author_name FROM comms.messages WHERE id = $1`, [messageId]
+    );
+    if (!message) throw notFound('This message no longer exists.');
+    const thread = await this.findOrCreateThread({
+      organizationId: String(message.organization_id),
+      workflowId,
+      counterpartyKind: 'subcontractor',
+      counterpartyEmail: String(message.author_email ?? ''),
+      counterpartyName: message.author_name != null ? String(message.author_name) : null,
+      subcontractorId: null,
+      subject: null
+    });
+    return this.db.one<Row>(
+      `UPDATE comms.messages
+          SET workflow_id = $2, thread_id = $3, shortlist_entry_id = NULL, attribution_method = 'manual'
+        WHERE id = $1
+        RETURNING *`,
+      [messageId, workflowId, thread.id]
     );
   }
 

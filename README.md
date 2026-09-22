@@ -192,8 +192,47 @@ entries without ever touching a real one. Reminders must be switched on for the 
 
 **Migrations.** `023_itt_reminders.sql` here (`022` is retired), and `002_itt_reminder_kinds.sql`
 in `novamerx-comms-worker`, which widens two `comms` CHECKs. `REQUIRED_COMMS_MIGRATION` is now
-`002_…`, so **comms migrates before TPS deploys**: `bff-tps` refuses to boot against a `comms`
-schema behind it.
+`003_…` (see below), so **comms migrates before TPS deploys**: `bff-tps` refuses to boot against a
+`comms` schema behind it.
+
+### RFI collation and drafting (issue #41)
+
+Once a subcontractor's RFI has arrived and been attributed to a live tender, four more
+`/internal/scheduled/rfi/*` routes — `rfiDb.ts` — collate it into individual questions, retrieve
+grounding passages from BuildFlow's tender-document corpus, and store a drafted answer for an
+estimator to review. See `TPS_SCHEDULED_TASKS_API.md` §6 for the full contract. Runs on its own,
+**more frequent** cron in the scheduler (every 15 minutes, not once a day) — a query arriving
+mid-morning should have a draft waiting within the hour.
+
+**The no-tender-mixup guarantee.** `rfiEligibility.ts` (pure, unit-tested without a database) is
+deliberately not an attempt to improve `portalRecipientFor`'s "most recently dispatched wins"
+heuristic — improving a heuristic yields a better heuristic. Instead, drafting refuses to run at
+all on a message whose attribution is not deterministic: `tps.rfi_message_reviews.state` records
+`blocked_ambiguous_tender` (the sender matches more than one live tender) or
+`blocked_cross_tender_suspected` (the message names a different live tender by name) rather than
+guessing, and `commsDb.reattributeMessage` — writing `attribution_method = 'manual'`, in the
+vocabulary since migration 001 and never once written before this — is how a human resolves it.
+The acceptance test for the whole feature, `rfi-drafting.integration.test.ts`, is exactly this: a
+subcontractor live on two workflows produces zero questions and zero drafts until re-attributed
+by hand.
+
+**Migrations.** `024_rfi_drafting.sql` here (seven `tps.rfi_*` tables — none of it belongs on
+`comms.*`, the same argument `023`'s `itt_reply_classifications` already makes), and
+`003_rfi_kinds.sql` in `novamerx-comms-worker` (`comms.messages.kind` +`rfi_response`;
+`comms.notifications.kind` +`rfi_review_required`). `REQUIRED_COMMS_MIGRATION` is now
+`003_rfi_kinds.sql`.
+
+**BuildFlow prerequisite.** Unlike the reminder routes, these four have a second, independent
+prerequisite — `BUILDFLOW_BASE_URL` and `BUILDFLOW_DOCUMENT_LINKS_TOKEN` (the same pair every
+other BuildFlow client here uses) — because retrieval happens on the TPS side: the scheduler
+holds no route to BuildFlow at all, so `pending-drafts` inlines every passage a question might
+need into its own response. A deployment can have reminders working and RFI drafting not; the
+routes are simply absent (404, never 500) without both variables.
+
+**Known gap, stated rather than hidden.** The estimator's review/approve/send screen — where a
+drafted answer is approved, edited, or the unanswered questions collated for the client — is not
+yet built. The pipeline through a stored, reviewable draft (`tps.rfi_drafts`) is complete and
+tested end to end; the UI to act on it is the next piece of this issue.
 
 ### Reading the SCMS schema
 
