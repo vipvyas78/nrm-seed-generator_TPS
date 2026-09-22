@@ -3218,7 +3218,7 @@ export class TenderPrepDatabase {
   private async ittFromAddress(organizationId: string): Promise<string> {
     const [row] = await this.db.query<Row>(
       `SELECT itt_from_address FROM public.itt_comms_config
-        WHERE organization_id = $1 AND project_id IS NULL`,
+        WHERE organization_id = $1 AND tender_id IS NULL`,
       [organizationId]
     );
     return row?.itt_from_address ? String(row.itt_from_address) : ITT_FROM_ADDRESS;
@@ -3720,7 +3720,7 @@ export class TenderPrepDatabase {
     const bare = domain ? `${local.split('+')[0]}@${domain}` : address;
     const [row] = await this.db.query<Row>(
       `SELECT organization_id FROM public.itt_comms_config
-        WHERE LOWER(itt_comms_address) = $1 AND project_id IS NULL
+        WHERE LOWER(itt_comms_address) = $1 AND tender_id IS NULL
         LIMIT 1`,
       [bare]
     );
@@ -4313,7 +4313,7 @@ export class TenderPrepDatabase {
     clientContactName: string | null; clientContactEmail: string | null;
   }> {
     const [row] = await this.db.query<Row>(
-      `SELECT * FROM public.itt_comms_config WHERE organization_id = $1 AND project_id IS NULL`,
+      `SELECT * FROM public.itt_comms_config WHERE organization_id = $1 AND tender_id IS NULL`,
       [organizationId]
     );
     return {

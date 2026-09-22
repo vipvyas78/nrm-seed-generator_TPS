@@ -161,7 +161,7 @@ export class IttRemindersDatabase {
          JOIN shortlist_entries se ON se.shortlist_id = sl.id AND se.selected
          JOIN itt_dispatch d ON d.shortlist_entry_id = se.id
          JOIN public.itt_comms_config cfg
-           ON cfg.organization_id = w.organization_id AND cfg.project_id IS NULL AND cfg.reminders_enabled
+           ON cfg.organization_id = w.organization_id AND cfg.tender_id IS NULL AND cfg.reminders_enabled
          LEFT JOIN itt_letter_details ld ON ld.workflow_id = sl.workflow_id
         WHERE sl.confirmed_at IS NOT NULL AND d.email_status = 'sent'
         ORDER BY sl.workflow_id, sl.package_name, se.id`
@@ -408,7 +408,7 @@ export class IttRemindersDatabase {
   private async commsConfig(organizationId: string): Promise<{ ittFromAddress: string; ittCommsAddress: string }> {
     const [row] = await this.db.query<Row>(
       `SELECT itt_from_address, itt_comms_address FROM public.itt_comms_config
-        WHERE organization_id = $1 AND project_id IS NULL`, [organizationId]
+        WHERE organization_id = $1 AND tender_id IS NULL`, [organizationId]
     );
     return {
       ittFromAddress: row?.itt_from_address ? String(row.itt_from_address) : this.fallbackFromAddress,
@@ -644,7 +644,7 @@ export class IttRemindersDatabase {
   private async confidenceFloor(organizationId: string): Promise<number> {
     const [row] = await this.db.query<Row>(
       `SELECT interest_classifier_min_confidence FROM public.itt_comms_config
-        WHERE organization_id = $1 AND project_id IS NULL`, [organizationId]
+        WHERE organization_id = $1 AND tender_id IS NULL`, [organizationId]
     );
     return Number(row?.interest_classifier_min_confidence ?? 0.8);
   }
