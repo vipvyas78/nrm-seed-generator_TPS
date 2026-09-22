@@ -72,7 +72,7 @@ describe('ITT reminders', () => {
     );
     await db.query(
       `INSERT INTO public.itt_comms_config
-         (organization_id, project_id, org_slug, itt_from_address, itt_comms_address,
+         (organization_id, tender_id, org_slug, itt_from_address, itt_comms_address,
           client_reply_address, reminders_enabled)
        VALUES ($1, NULL, 'reminder-test', 'tenders@novamerx.ai', 'reminder-test-ittcomms@novamerx.ai',
                'itt-reply@novamerx.co.uk', TRUE)`,

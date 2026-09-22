@@ -69,7 +69,7 @@ describe('RFI collation and drafting', () => {
     const id = randomUUID();
     await db.query(`INSERT INTO public.bf_organizations (id, oidc_issuer, external_id, name) VALUES ($1, 'test', $2, $3)`, [id, `ext-${id}`, name]);
     await db.query(
-      `INSERT INTO public.itt_comms_config (organization_id, project_id, org_slug, itt_from_address, itt_comms_address, client_reply_address)
+      `INSERT INTO public.itt_comms_config (organization_id, tender_id, org_slug, itt_from_address, itt_comms_address, client_reply_address)
        VALUES ($1, NULL, $2, 'tenders@novamerx.ai', $3, 'itt-reply@novamerx.co.uk')`,
       [id, `org-${id.slice(0, 8)}`, `org-${id.slice(0, 8)}-ittcomms@novamerx.ai`]
     );
