@@ -739,7 +739,8 @@ export class RfiDatabase {
                   d.citations
              FROM tps.rfi_questions q
              LEFT JOIN tps.rfi_drafts d ON d.question_id = q.id AND d.superseded_at IS NULL
-            WHERE q.id = ANY($1::uuid[])`,
+            WHERE q.id = ANY($1::uuid[])
+            ORDER BY q.raised_at, q.seq`,
           [ids]
         )
       : [];
@@ -762,7 +763,8 @@ export class RfiDatabase {
              FROM tps.rfi_questions q
              LEFT JOIN shortlist_entries se ON se.id = q.shortlist_entry_id
              LEFT JOIN shortlists        sl ON sl.id = se.shortlist_id
-            WHERE q.id = ANY($1::uuid[])`,
+            WHERE q.id = ANY($1::uuid[])
+            ORDER BY q.raised_at, q.seq`,
           [ids]
         )
       : [];
