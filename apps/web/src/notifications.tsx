@@ -24,16 +24,20 @@ const KIND_LABELS: Record<AppNotification['kind'], string> = {
   subcontractor_rfi: 'Query',
   client_reply: 'Client answer',
   forward_failed: 'Not sent',
-  unattributed_email: 'Unattributed'
+  unattributed_email: 'Unattributed',
+  itt_response_detected: 'ITT response',
+  rfi_review_required: 'Answer not sent'
 };
 
-/** Amber for a thing to do, red for a thing that went wrong. A failed forward is the only
- *  one of the four that is nobody's message — it is our own send that did not happen. */
+/** Amber for a thing to do, red for a thing that went wrong. A failed forward or a failed
+ *  RFI response is nobody's message — it is our own send that did not happen. */
 const KIND_TONE: Record<AppNotification['kind'], string> = {
   subcontractor_rfi: 'badge-blue',
   client_reply: 'badge-green',
   forward_failed: 'badge-red',
-  unattributed_email: 'badge-amber'
+  unattributed_email: 'badge-amber',
+  itt_response_detected: 'badge-green',
+  rfi_review_required: 'badge-red'
 };
 
 export function BellIcon({ unread }: { unread: number }) {

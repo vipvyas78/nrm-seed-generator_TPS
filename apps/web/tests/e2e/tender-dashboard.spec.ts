@@ -79,7 +79,9 @@ function fixture(): Pkg[] {
   ];
 }
 
-async function dashboard(page: Page) {
+async function dashboard(page: Page, options: {
+  rfiCounts?: { blocked: number; drafted: number; approved: number; for_client: number };
+} = {}) {
   const packages = fixture();
   const calls: Array<{ method: string; path: string; body: unknown }> = [];
 
@@ -120,6 +122,11 @@ async function dashboard(page: Page) {
     }
     if (path === `/api/tender-prep/${WORKFLOW_ID}/dashboard`) return json(dashboardRows());
     if (path === `/api/tender-prep/${WORKFLOW_ID}/launch-table`) return json(packages);
+    // The RFI review counts badge (issue #48) — undefined here reproduces every OTHER
+    // test in this file, which never stub it and must still render exactly as before.
+    if (path === `/api/tender-prep/${WORKFLOW_ID}/rfi` && options.rfiCounts) {
+      return json({ counts: options.rfiCounts });
+    }
     if (path === `/api/tender-prep/${WORKFLOW_ID}/packages/selection`) {
       const input = body as { packageName: string; entries: Array<{ subcontractorId: string; selected: boolean }> };
       const target = packages.find((pkg) => pkg.package_name === input.packageName);
@@ -222,4 +229,17 @@ test('marks the contractors that have asked for clarification, and only those', 
 
   // And a firm that has asked nothing leaves the column blank, so the eye runs down it.
   await expect(page.getByRole('link', { name: /Open Alpha Mechanical/ })).toHaveCount(0);
+});
+
+test('shows the drafts-waiting badge and opens the review tab from it (issue #48)', async ({ page }) => {
+  await dashboard(page, { rfiCounts: { blocked: 2, drafted: 3, approved: 0, for_client: 0 } });
+  const badge = page.getByRole('link', { name: /to file/ });
+  await expect(badge).toContainText('2 to file');
+  await expect(badge).toContainText('3 drafted answers to review');
+  await expect(badge).toHaveAttribute('href', new RegExp(`tender-prep\\?rfi=1$`));
+});
+
+test('shows no badge at all when nothing is blocked or drafted', async ({ page }) => {
+  await dashboard(page, { rfiCounts: { blocked: 0, drafted: 0, approved: 0, for_client: 0 } });
+  await expect(page.getByText(/to file|drafted answer/)).toHaveCount(0);
 });

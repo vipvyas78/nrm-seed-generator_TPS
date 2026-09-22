@@ -22,6 +22,7 @@ export default defineConfig({
     // not expect test() to be called here" while still reporting the rest as passed.
     // Playwright owns tests/e2e (its testDir); vitest owns tests/unit.
     environment: 'jsdom',
+    setupFiles: ['./tests/unit/setup.ts'],
     include: ['tests/unit/**/*.test.{ts,tsx}'],
     exclude: ['tests/e2e/**', 'node_modules/**']
   }
