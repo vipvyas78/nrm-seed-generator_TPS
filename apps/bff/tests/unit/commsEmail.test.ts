@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { renderClientAnswerRelayEmail, renderRfiForwardEmail, type ForwardedQuery } from '../../src/commsEmail.js';
+import {
+  renderClientAnswerRelayEmail, renderRfiForwardEmail, renderRfiResponseEmail,
+  type ForwardedQuery, type RfiAnswer
+} from '../../src/commsEmail.js';
 import { findReplyToken, inboundEmailPayload } from '../../src/inboundEmail.js';
 
 const TOKEN = 'Zm9vYmFyX3Rva2VuLTEyMzQ1Njc4OTA';
@@ -154,6 +157,94 @@ describe('renderClientAnswerRelayEmail', () => {
   it('escapes the client answer too', () => {
     const email = renderClientAnswerRelayEmail({ ...relay, clientAnswer: '<img src=x onerror=1>' });
     expect(email.html).not.toContain('<img src=x');
+    expect(email.html).toContain('&lt;img');
+  });
+});
+
+describe('renderRfiResponseEmail', () => {
+  const TOKEN2 = 'Zm9vYmFyX3Rva2VuLTk4NzY1NDMyMTA';
+
+  function answer(over: Partial<RfiAnswer> = {}): RfiAnswer {
+    return {
+      question: 'Is the suspended ceiling grid included in this package?',
+      answer: 'Yes — the grid and tiles are both in this package, per Section 2E.',
+      citations: [{ filename: 'Specification.pdf', headingPath: '2E Internal Finishes', pageHint: 41 }],
+      ...over
+    };
+  }
+
+  const context = {
+    projectName: 'Reading Riverside', packageName: 'Drylining & Partitions',
+    estimatorName: 'Alex Estimator', organizationName: 'Novamerx Ltd',
+    portalUrl: null as string | null, replyToken: TOKEN2
+  };
+
+  it('numbers the answers, because a follow-up needs something to refer back to', () => {
+    const email = renderRfiResponseEmail(
+      [answer(), answer({ question: 'What is the skirting height?' })], context
+    );
+    expect(email.text).toContain('1. Is the suspended ceiling grid included in this package?');
+    expect(email.text).toContain('2. What is the skirting height?');
+    expect(email.subject).toContain('your queries');
+  });
+
+  it('says "query" for one and "queries" for several', () => {
+    expect(renderRfiResponseEmail([answer()], context).subject).toContain('your query');
+    expect(renderRfiResponseEmail([answer(), answer()], context).subject).toContain('your queries');
+  });
+
+  it('names the citation by filename, section and page — never as a link', () => {
+    const email = renderRfiResponseEmail([answer()], context);
+    expect(email.text).toContain('Source: Specification.pdf — 2E Internal Finishes (p41)');
+    expect(email.html).toContain('Source: Specification.pdf — 2E Internal Finishes (p41)');
+    expect(email.html).not.toContain('<a href');
+  });
+
+  it('never renders a shareUrl, because the type given to it carries none', () => {
+    // Structural, not merely a missing test case: RfiAnswerCitation has no shareUrl field
+    // at all (see its own doc comment in commsEmail.ts) — there is nowhere for one to go.
+    const email = renderRfiResponseEmail([answer({
+      citations: [{ filename: 'Specification.pdf', headingPath: null, pageHint: null }]
+    })], context);
+    expect(email.text).not.toContain('shareUrl');
+    expect(email.html).not.toContain('shareUrl');
+  });
+
+  it('renders an answer with no citation at all, without a dangling "Source:" line', () => {
+    const email = renderRfiResponseEmail([answer({ citations: [] })], context);
+    expect(email.text).not.toContain('Source:');
+    expect(email.html).not.toContain('Source:');
+  });
+
+  it('carries a subject marker a follow-up question can be matched by', () => {
+    const email = renderRfiResponseEmail([answer()], context);
+    const followUp = inboundEmailPayload.parse({
+      recipient: 'novamerx-ittcomms@novamerx.ai',
+      from: { address: 'sam@acme.test' },
+      subject: `Re: ${email.subject}`
+    });
+    expect(findReplyToken(followUp)).toEqual({ token: TOKEN2, method: 'subject_marker' });
+  });
+
+  it('offers the portal link only when the firm has one', () => {
+    const withLink = renderRfiResponseEmail(
+      [answer()], { ...context, portalUrl: 'https://dev.novamerx.ai/tps/respond/tok' }
+    );
+    expect(withLink.html).toContain('pricing page</a>');
+    const withoutLink = renderRfiResponseEmail([answer()], context);
+    expect(withoutLink.html).not.toContain('pricing page</a>');
+  });
+
+  it('escapes markup in the question, the answer and the citation filename', () => {
+    const email = renderRfiResponseEmail([answer({
+      question: '<script>alert(1)</script>',
+      answer: 'a > b & c < d',
+      citations: [{ filename: '<img src=x onerror=1>.pdf', headingPath: null, pageHint: null }]
+    })], context);
+    expect(email.html).not.toContain('<script>');
+    expect(email.html).not.toContain('<img src=x');
+    expect(email.html).toContain('&lt;script&gt;');
+    expect(email.html).toContain('a &gt; b &amp; c &lt; d');
     expect(email.html).toContain('&lt;img');
   });
 });

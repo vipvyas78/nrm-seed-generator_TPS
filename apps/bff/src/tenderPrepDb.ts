@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto';
 import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
 import type { BuildflowCommsAttachmentsClient } from './buildflowCommsAttachmentsClient.js';
 import type { AttributionMethod, CommsAttachmentInput, CommsDatabase } from './commsDb.js';
-import { renderClientAnswerRelayEmail, renderRfiForwardEmail } from './commsEmail.js';
+import {
+  renderClientAnswerRelayEmail, renderRfiForwardEmail, renderRfiResponseEmail,
+  type ForwardedQuery, type RfiAnswerCitation
+} from './commsEmail.js';
 import {
   findReplyToken, isVerified, referencedMessageIds, replyAddressFor, type InboundEmail
 } from './inboundEmail.js';
@@ -24,6 +27,7 @@ import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js'
 import { deriveReturnDate, isTenderReturnUnit } from './tenderReturnPeriod.js';
 import { manualReminderKind, type IttResponse } from './ittReminders.js';
 import type { RfiDatabase } from './rfiDb.js';
+import { groupBy, normaliseCitations, resolveAnswer } from './rfiReview.js';
 import type { Actor } from './types.js';
 
 /**
@@ -3805,30 +3809,26 @@ export class TenderPrepDatabase {
   // ── Forwarding queries to the Client, and relaying the answer back ────────
 
   /**
-   * Several subcontractor queries put to the Client as ONE message.
+   * Everything about putting something to the Client EXCEPT deciding what — extracted
+   * from `forwardQueriesToClient` (issue #48) so a second caller (`forwardRfiQuestionsToClient`,
+   * putting individual RFI QUESTIONS to the Client rather than whole messages) can reuse
+   * the ordering rules rather than restate them. Every one of those rules is load-bearing:
+   * the message is recorded BEFORE the send; the Access include list is reconciled BEFORE
+   * the send (the same rule `confirmAndSendItt` follows — a Client link minted after the
+   * email has gone is refused at the edge with no signal anywhere in this application);
+   * the notification is written AFTER, because whether it sent is not knowable inside the
+   * transaction that recorded it.
    *
-   * One message rather than one per query, because that is what the issue asks for and
-   * what a Client can actually answer: six separate emails get one reply between them and
-   * nobody can tell which question it covered. `comms.forward_items` records which queries
-   * this forward carried, which is what later answers exactly that.
-   *
-   * ORDER MATTERS AND IS NOT INCIDENTAL. The Access include list is reconciled BEFORE the
-   * email leaves, the same rule confirmAndSendItt follows: a Client link minted after the
-   * email has gone is refused at the edge with no signal anywhere in this application.
+   * `input.recordItems` is the one thing that differs between callers: what ledger, at
+   * what grain, records what this forward carried. It runs BEFORE the send, in the same
+   * place `recordForwardItems` always has.
    */
-  async forwardQueriesToClient(actor: Actor, workflowId: string, input: {
-    messageIds: string[]; clientEmail: string; clientName: string | null; note: string | null;
+  private async sendClientForward(actor: Actor, workflowId: string, input: {
+    items: ForwardedQuery[];
+    recordItems: (forwardMessageId: string) => Promise<void>;
+    clientEmail: string; clientName: string | null; note: string | null;
   }): Promise<Row> {
     if (!this.commsDb) throw notFound('Queries are not available for this tender.');
-    await this.assertWorkflowAccess(actor, workflowId);
-
-    const sources = await this.commsDb.messagesByIds(input.messageIds);
-    if (sources.length === 0) throw conflict('Select at least one query to forward.');
-    // Every selected query must belong to THIS tender. Without the check a caller could
-    // forward another organisation's queries by id — the ids are the only thing the
-    // request carries, and assertWorkflowAccess has only vouched for the workflow.
-    const foreign = sources.filter((message) => String(message.workflow_id) !== workflowId);
-    if (foreign.length > 0) throw conflict('Those queries do not all belong to this tender.');
 
     const organizationId = await this.organizationForWorkflow(workflowId);
     const config = await this.commsConfig(organizationId);
@@ -3850,7 +3850,7 @@ export class TenderPrepDatabase {
       createdBy: actor.userId
     });
     if (!forward) throw conflict('That forward has already been sent.');
-    await this.commsDb.recordForwardItems(String(forward.id), sources.map((m) => String(m.id)));
+    await input.recordItems(String(forward.id));
 
     // A public/free domain never gets a link, the same rule mintPortalLinksFor applies to
     // a subcontractor: a domain-wide Access include for gmail.com would admit strangers.
@@ -3882,26 +3882,14 @@ export class TenderPrepDatabase {
       await this.accessAdmin.syncFor(recipients).catch(() => undefined);
     }
 
-    const email = renderRfiForwardEmail(
-      sources.map((message) => ({
-        firmName: message.counterparty_name != null ? String(message.counterparty_name) : String(message.counterparty_email),
-        authorName: message.author_name != null ? String(message.author_name) : null,
-        authorEmail: message.author_email != null ? String(message.author_email) : null,
-        packageName: null,
-        subject: message.subject != null ? String(message.subject) : null,
-        body: message.body_text != null ? String(message.body_text) : '',
-        raisedAt: message.occurred_at as Date,
-        attachmentCount: Number(message.attachment_count ?? 0)
-      })),
-      {
-        projectName,
-        tenderReference: null,
-        estimatorName: context?.estimatorName ?? null,
-        estimatorEmail: context?.estimatorEmail ?? null,
-        organizationName: context?.organizationName ?? null,
-        replyToken, replyUrl
-      }
-    );
+    const email = renderRfiForwardEmail(input.items, {
+      projectName,
+      tenderReference: null,
+      estimatorName: context?.estimatorName ?? null,
+      estimatorEmail: context?.estimatorEmail ?? null,
+      organizationName: context?.organizationName ?? null,
+      replyToken, replyUrl
+    });
 
     const sent = await this.sendCommsEmail({
       organizationId,
@@ -3932,9 +3920,50 @@ export class TenderPrepDatabase {
 
     return {
       forward_message_id: forward.id, thread_id: thread.id,
-      forwarded: sources.length, sent: sent.ok, error: sent.error,
+      forwarded: input.items.length, sent: sent.ok, error: sent.error,
       link_blocked_reason: link.blocked_reason, reply_url: replyUrl
     };
+  }
+
+  /**
+   * Several subcontractor queries put to the Client as ONE message.
+   *
+   * One message rather than one per query, because that is what the issue asks for and
+   * what a Client can actually answer: six separate emails get one reply between them and
+   * nobody can tell which question it covered. `comms.forward_items` records which queries
+   * this forward carried, which is what later answers exactly that.
+   */
+  async forwardQueriesToClient(actor: Actor, workflowId: string, input: {
+    messageIds: string[]; clientEmail: string; clientName: string | null; note: string | null;
+  }): Promise<Row> {
+    if (!this.commsDb) throw notFound('Queries are not available for this tender.');
+    await this.assertWorkflowAccess(actor, workflowId);
+
+    const sources = await this.commsDb.messagesByIds(input.messageIds);
+    if (sources.length === 0) throw conflict('Select at least one query to forward.');
+    // Every selected query must belong to THIS tender. Without the check a caller could
+    // forward another organisation's queries by id — the ids are the only thing the
+    // request carries, and assertWorkflowAccess has only vouched for the workflow.
+    const foreign = sources.filter((message) => String(message.workflow_id) !== workflowId);
+    if (foreign.length > 0) throw conflict('Those queries do not all belong to this tender.');
+
+    const items: ForwardedQuery[] = sources.map((message) => ({
+      firmName: message.counterparty_name != null ? String(message.counterparty_name) : String(message.counterparty_email),
+      authorName: message.author_name != null ? String(message.author_name) : null,
+      authorEmail: message.author_email != null ? String(message.author_email) : null,
+      packageName: null,
+      subject: message.subject != null ? String(message.subject) : null,
+      body: message.body_text != null ? String(message.body_text) : '',
+      raisedAt: message.occurred_at as Date,
+      attachmentCount: Number(message.attachment_count ?? 0)
+    }));
+
+    return this.sendClientForward(actor, workflowId, {
+      items,
+      recordItems: (forwardMessageId) =>
+        this.commsDb!.recordForwardItems(forwardMessageId, sources.map((m) => String(m.id))),
+      clientEmail: input.clientEmail, clientName: input.clientName, note: input.note
+    });
   }
 
   /**
@@ -4010,6 +4039,271 @@ export class TenderPrepDatabase {
     }
 
     return { relayed: results.length, recipients: results };
+  }
+
+  // ── The estimator's RFI review: sending, putting to the Client, re-attribution (issue #48) ──
+
+  /**
+   * The unanswered questions put to the Client as ONE email — the same machinery as
+   * `forwardQueriesToClient` above, at QUESTION grain rather than message grain, so
+   * `tps.rfi_client_forward_items` can say WHICH questions (not just which message) went.
+   *
+   * `rfiDb.questionsForClientForward` already refuses any question whose OWN workflow_id
+   * disagrees with this one; the check on `threads` below is the second, independent one
+   * — a question's thread may since have moved under a re-attribution while the question
+   * row itself, a snapshot taken at extraction, still says the old tender.
+   */
+  async forwardRfiQuestionsToClient(actor: Actor, workflowId: string, input: {
+    questionIds: string[]; clientEmail: string; clientName: string | null; note: string | null;
+  }): Promise<Row> {
+    if (!this.commsDb || !this.rfiDb) throw notFound('Queries are not available for this tender.');
+    await this.assertWorkflowAccess(actor, workflowId);
+
+    const questions = await this.rfiDb.questionsForClientForward(actor, workflowId, input.questionIds);
+    const threadIds = [...new Set(questions.map((question) => String(question.thread_id)))];
+    const threads = await this.commsDb.threadsByIds(threadIds);
+    if (threads.length !== threadIds.length || threads.some((thread) => String(thread.workflow_id) !== workflowId)) {
+      throw conflict('Those questions do not all belong to this tender.');
+    }
+    const threadById = new Map(threads.map((thread) => [String(thread.id), thread]));
+
+    const messageIds = [...new Set(questions.map((question) => String(question.message_id)))];
+    const sourceMessages = await this.commsDb.messagesByIds(messageIds);
+    const messageById = new Map(sourceMessages.map((message) => [String(message.id), message]));
+
+    const items: ForwardedQuery[] = questions.map((question) => {
+      const thread = threadById.get(String(question.thread_id));
+      const message = messageById.get(String(question.message_id));
+      return {
+        firmName: thread
+          ? String(thread.counterparty_name ?? thread.counterparty_email)
+          : String(question.asked_by_email ?? ''),
+        authorName: question.asked_by_name != null ? String(question.asked_by_name) : null,
+        authorEmail: question.asked_by_email != null ? String(question.asked_by_email) : null,
+        packageName: question.package_name != null ? String(question.package_name) : null,
+        subject: null,
+        body: String(question.question_text),
+        raisedAt: question.raised_at as Date,
+        // Named ("available in the tender system") rather than silently dropped —
+        // renderRfiForwardEmail carries no attachment, only its count.
+        attachmentCount: message ? Number(message.attachment_count ?? 0) : 0
+      };
+    });
+
+    const result = await this.sendClientForward(actor, workflowId, {
+      items,
+      recordItems: async (forwardMessageId) => {
+        // Both ledgers, before the send: comms.forward_items at MESSAGE grain (so the
+        // Client's reply still resolves through commsDb.forwardedQueries) and
+        // tps.rfi_client_forward_items at QUESTION grain — the only one that can say
+        // WHICH three of the seven questions on a message actually went.
+        await this.commsDb!.recordForwardItems(forwardMessageId, messageIds);
+        await this.rfiDb!.recordClientForwardItems(forwardMessageId, questions.map((question) => String(question.id)));
+      },
+      clientEmail: input.clientEmail, clientName: input.clientName, note: input.note
+    });
+
+    await this.rfiDb.markQuestionsSentToClient(questions.map((question) => String(question.id)));
+    return { ...result, questions_forwarded: questions.length };
+  }
+
+  /**
+   * The approved answers sent back to each firm — one email per THREAD (a firm's
+   * conversation on this tender, whatever package each question belongs to), covering
+   * every approved question on it. Follows `forwardQueriesToClient` step for step:
+   * claim-before-send, the message recorded before the send, and a notification only
+   * after — but the recipient here comes from the THREAD, never the request body, and
+   * neither the recipient nor the answer text is ever supplied by the caller.
+   *
+   * THE SECOND, INDEPENDENT TENDER CHECK. `rfiDb.questionsForSend` already refuses a
+   * question whose own `workflow_id` disagrees with this one — but that column is a
+   * snapshot taken at extraction, and `commsDb.reattributeMessage` moves the THREAD, not
+   * this row. So every thread these questions actually belong to is re-checked here,
+   * independently, which is the check this whole issue is really asking for.
+   */
+  async sendRfiResponses(actor: Actor, workflowId: string, questionIds: string[]): Promise<Row> {
+    if (!this.commsDb || !this.rfiDb) throw notFound('Queries are not available for this tender.');
+    await this.assertWorkflowAccess(actor, workflowId);
+
+    const questions = await this.rfiDb.questionsForSend(actor, workflowId, questionIds);
+    const threadIds = [...new Set(questions.map((question) => String(question.thread_id)))];
+    const threads = await this.commsDb.threadsByIds(threadIds);
+    if (threads.length !== threadIds.length || threads.some((thread) => String(thread.workflow_id) !== workflowId)) {
+      throw conflict('Those questions do not all belong to this tender.');
+    }
+    const threadById = new Map(threads.map((thread) => [String(thread.id), thread]));
+
+    const resolved = questions.map((question) => {
+      const label = `"${String(question.question_text).slice(0, 60)}"`;
+      if (String(question.status) === 'sent') throw conflict(`${label} has already been sent.`);
+      if (String(question.status) !== 'approved') throw conflict(`${label} has not been approved yet.`);
+
+      const draftId = question.draft_id != null ? String(question.draft_id) : null;
+      const answer = resolveAnswer({
+        estimatorAnswerText: question.estimator_answer_text != null ? String(question.estimator_answer_text) : null,
+        liveDraft: draftId ? {
+          id: draftId,
+          status: question.draft_status as 'proposed' | 'insufficient_evidence' | 'rejected_ungrounded' | 'error',
+          answerText: question.draft_answer_text != null ? String(question.draft_answer_text) : null
+        } : null
+      });
+      if (!answer) throw conflict(`${label} has no answer to send.`);
+
+      // Citations travel with the answer only when it actually came from (or was edited
+      // from) that draft — an estimator's own answer beside an unusable draft carries no
+      // citation, because resolveAnswer already refused to credit that draft for it.
+      const citations: RfiAnswerCitation[] = answer.draftId
+        ? normaliseCitations(question.citations).map((citation) => ({
+            filename: citation.filename, headingPath: citation.headingPath, pageHint: citation.pageHint
+          }))
+        : [];
+
+      return { question, answer, citations };
+    });
+
+    const organizationId = await this.organizationForWorkflow(workflowId);
+    const config = await this.commsConfig(organizationId);
+    const context = await this.letterContextFor(actor, workflowId).catch(() => null);
+    const projectName = await this.projectNameForWorkflow(workflowId);
+
+    const results: Array<{ thread_id: string; to: string; status: string; error?: string }> = [];
+
+    for (const [threadId, items] of groupBy(resolved, (item) => String(item.question.thread_id))) {
+      const thread = threadById.get(threadId);
+      if (!thread) continue; // ruled out above; never trusted twice
+      const to = String(thread.counterparty_email);
+      const shortlistEntryId = items.find((item) => item.question.shortlist_entry_id != null)?.question.shortlist_entry_id;
+
+      const responseId = await this.rfiDb.claimResponse({
+        workflowId, threadId, shortlistEntryId: shortlistEntryId != null ? String(shortlistEntryId) : null,
+        toEmail: to, fromEmail: this.testEmailOverride?.from ?? config.ittFromAddress,
+        fromFallbackUsed: false, replyToEmail: config.ittCommsAddress,
+        createdBy: actor.userId, isTest: Boolean(this.testEmailOverride)
+      });
+
+      const message = await this.commsDb.recordMessage({
+        threadId, organizationId, workflowId,
+        shortlistEntryId: shortlistEntryId != null ? String(shortlistEntryId) : null,
+        direction: 'outbound', channel: 'email', kind: 'rfi_response',
+        authorName: context?.estimatorName ?? actor.email ?? null,
+        authorEmail: context?.estimatorEmail ?? actor.email ?? null,
+        subject: null,
+        bodyText: items.map((item) => item.answer.answerText).join('\n\n'),
+        idempotencyKey: `rfi-response:${responseId}`,
+        createdBy: actor.userId
+      });
+      if (!message) {
+        await this.rfiDb.settleResponse(responseId, { status: 'failed', error: 'already sent' });
+        results.push({ thread_id: threadId, to, status: 'failed', error: 'already sent' });
+        continue;
+      }
+
+      // Snapshotted BEFORE the send, exactly as recordForwardItems is written before the
+      // forward's send — this is what the sent email actually said, and must never be
+      // re-derived from a draft that may since have changed.
+      await this.rfiDb.recordResponseItems(responseId, items.map((item, index) => ({
+        questionId: String(item.question.id), seq: index + 1,
+        answerText: item.answer.answerText, source: item.answer.source, draftId: item.answer.draftId
+      })));
+
+      const email = renderRfiResponseEmail(
+        items.map((item) => ({
+          question: String(item.question.question_text),
+          answer: item.answer.answerText,
+          citations: item.citations
+        })),
+        {
+          projectName, packageName: null,
+          estimatorName: context?.estimatorName ?? null,
+          organizationName: context?.organizationName ?? null,
+          portalUrl: null,
+          replyToken: String(message.id)
+        }
+      );
+
+      const sent = await this.sendCommsEmail({
+        organizationId, to: this.testEmailOverride?.to ?? to,
+        replyTo: config.ittCommsAddress, email
+      });
+      await this.commsDb.setExternalMessageId(String(message.id), sent.externalMessageId);
+      await this.commsDb.setThreadStatus(threadId, 'answered');
+      await this.rfiDb.settleResponse(responseId, {
+        status: sent.ok ? 'sent' : 'failed', error: sent.error,
+        emailMessageId: sent.externalMessageId, commsMessageId: String(message.id)
+      });
+
+      if (sent.ok) {
+        await this.rfiDb.markQuestionsSent(items.map((item) => String(item.question.id)));
+      } else {
+        // The one failure here nobody sees otherwise: the caller's response is gone the
+        // moment the page closes, and the questions stay 'approved' (never 'sent') so
+        // they are still visible in the review queue — but nothing else says WHY they
+        // did not go. Raised after the send, for the same reason forwardQueriesToClient's
+        // does: whether it sent is not knowable inside the transaction that recorded it.
+        await this.commsDb.recordNotification({
+          kind: 'rfi_review_required',
+          organizationId, workflowId, threadId,
+          messageId: String(message.id),
+          title: `The answer to ${thread.counterparty_name ?? to} did not send`,
+          body: sent.error ?? 'The email was recorded but the provider rejected it.',
+          deepLinkPath: await this.commsDeepLink(workflowId, threadId)
+        });
+      }
+
+      results.push({ thread_id: threadId, to, status: sent.ok ? 'sent' : 'failed', error: sent.error });
+    }
+
+    return { sent: results.filter((result) => result.status === 'sent').length, responses: results };
+  }
+
+  /**
+   * A human re-files a subcontractor query onto the tender it actually belongs to — the
+   * one place that closes the eligibility gate's blocked_ambiguous_tender /
+   * blocked_cross_tender_suspected loop (see `rfiEligibility.ts`'s own doctrine).
+   *
+   * BOTH ends are authorised: the TARGET workflow through the ordinary
+   * `assertWorkflowAccess`, and the SOURCE message's organisation directly —
+   * `blocked_ambiguous_tender` routinely carries no workflow_id at all ("no tender
+   * matched this sender at all"), so the organisation is the only boundary it has, the
+   * same rule `getCommsThread` above already applies.
+   */
+  async reattributeCommsMessage(actor: Actor, messageId: string, workflowId: string): Promise<Row> {
+    if (!this.commsDb || !this.rfiDb) throw notFound('Queries are not available.');
+    await this.assertWorkflowAccess(actor, workflowId);
+
+    const [message] = await this.commsDb.messagesByIds([messageId]);
+    if (!message) throw notFound('This message no longer exists.');
+    if (String(message.organization_id) !== actor.organizationId) {
+      throw notFound('This message no longer exists.');
+    }
+    if (message.workflow_id) {
+      await this.assertWorkflowAccess(actor, String(message.workflow_id));
+    }
+    if (message.kind !== 'subcontractor_rfi') {
+      throw conflict('Only a subcontractor query can be re-filed.');
+    }
+    if (String(message.workflow_id) === workflowId) {
+      throw conflict('That message is already filed under this tender.');
+    }
+
+    // The guard that prevents data loss. Both tps.rfi_response_items and
+    // tps.rfi_client_forward_items cascade from tps.rfi_questions, so discarding the
+    // questions once either exists would silently erase real, already-sent history.
+    const committed = await this.rfiDb.committedQuestionsFor(messageId);
+    if (committed > 0) {
+      throw conflict('Answers to this query have already been sent or put to the client, so it cannot be re-filed.');
+    }
+
+    // tps FIRST, comms SECOND, and the order is the design — see discardExtraction's own
+    // doc comment for why the other order leaves the message unreadable rather than
+    // merely re-reading it once more.
+    const questionsDiscarded = await this.rfiDb.discardExtraction(messageId);
+    const moved = await this.commsDb.reattributeMessage(messageId, workflowId);
+
+    return {
+      message_id: messageId, workflow_id: workflowId,
+      thread_id: moved.thread_id, questions_discarded: questionsDiscarded
+    };
   }
 
   /** The addresses this organisation uses, with the built-in defaults where it has saved

@@ -1090,6 +1090,88 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       return tpDb.relayClientAnswer(requireActor(request), messageId, { note: input.note ?? null });
     });
 
+    // ── The estimator's RFI review, approve and send (issue #48) ────────────
+    //
+    // The drafting half (issue #41) runs on a cron and writes tps.rfi_*; this is the only
+    // place a human ever sees it. Nested under the workflow like the routes above —
+    // except the attribute route below, which is about a message that may belong to no
+    // tender at all. `rfiDb` is unconditionally defined (see app.ts's own construction
+    // comment above); nothing here needs to check for it before calling it.
+
+    protectedApi.get('/api/tender-prep/:workflowId/rfi', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const { view, includeDismissed } = query(request, z.object({
+        view: z.enum(['full', 'counts']).default('full'),
+        includeDismissed: z.enum(['true', 'false']).optional()
+      }));
+      const actor = requireActor(request);
+      if (view === 'counts') return { counts: await rfiDb.reviewCounts(actor, workflowId) };
+      return rfiDb.reviewQueue(actor, workflowId, { includeDismissed: includeDismissed === 'true' });
+    });
+
+    const rfiQuestionParams = z.object({ workflowId: uuid, questionId: uuid });
+
+    // `answerText` present means edit-then-send: it is stored on the QUESTION
+    // (estimator_answer_text), never written into tps.rfi_drafts — see rfiDb.ts's own
+    // doc comment on approveQuestion for why. `workflowId` in the path is not read here;
+    // the question's OWN workflow decides authorisation (questionForActor), the same
+    // reason the question, not the workflow, is what every dispositon route addresses.
+    protectedApi.post('/api/tender-prep/:workflowId/rfi/questions/:questionId/approve', async (request) => {
+      const { questionId } = params(request, rfiQuestionParams);
+      const input = body(request, z.object({ answerText: z.string().trim().max(8000).nullish() }));
+      return rfiDb.approveQuestion(requireActor(request), questionId, input.answerText ?? null);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/rfi/questions/:questionId/ask-client', async (request) => {
+      const { questionId } = params(request, rfiQuestionParams);
+      return rfiDb.askClientQuestion(requireActor(request), questionId);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/rfi/questions/:questionId/dismiss', async (request) => {
+      const { questionId } = params(request, rfiQuestionParams);
+      return rfiDb.dismissQuestion(requireActor(request), questionId);
+    });
+
+    // THE SEND. No recipient and no answer text in the body: the address comes from each
+    // question's own comms thread and the answer from what approve stored, so a caller
+    // holding a question id can neither redirect the answer nor rewrite it in flight —
+    // the same rule threads/forward above follows for a Client forward.
+    protectedApi.post('/api/tender-prep/:workflowId/rfi/responses', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const input = body(request, z.object({ questionIds: z.array(uuid).min(1).max(100) }));
+      return tpDb.sendRfiResponses(requireActor(request), workflowId, input.questionIds);
+    });
+
+    // The unanswered questions put to the Client as ONE email — the same shape as
+    // /threads/forward above, at question grain rather than message grain.
+    protectedApi.post('/api/tender-prep/:workflowId/rfi/client-forward', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      const input = body(request, z.object({
+        questionIds: z.array(uuid).min(1).max(100),
+        clientEmail: z.string().trim().email('The client needs a valid email address').max(320),
+        clientName: z.string().trim().max(200).nullish(),
+        note: z.string().trim().max(4000).nullish()
+      }));
+      return tpDb.forwardRfiQuestionsToClient(requireActor(request), workflowId, {
+        questionIds: input.questionIds,
+        clientEmail: input.clientEmail,
+        clientName: input.clientName ?? null,
+        note: input.note ?? null
+      });
+    });
+
+    // Filing a query under the tender it actually belongs to — the one place a human
+    // closes the eligibility gate's blocked_ambiguous_tender / blocked_cross_tender_
+    // suspected loop. Addressed by MESSAGE and not nested under a workflow, for the same
+    // reason /api/comms/threads/:threadId above is not: the interesting case is a message
+    // that belongs to no tender at all, and a placeholder workflow in the URL would make
+    // that case unreachable.
+    protectedApi.post('/api/comms/messages/:messageId/attribute', async (request) => {
+      const { messageId } = params(request, z.object({ messageId: uuid }));
+      const input = body(request, z.object({ workflowId: uuid }));
+      return tpDb.reattributeCommsMessage(requireActor(request), messageId, input.workflowId);
+    });
+
     // ── Step 3: Comparative ─────────────────────────────────────────────────
 
     protectedApi.get('/api/tender-prep/:workflowId/comparative', async (request) => {

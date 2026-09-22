@@ -735,7 +735,8 @@ export class RfiDatabase {
     await this.assertWorkflowAccess(actor, workflowId);
     const rows = ids.length > 0
       ? await this.db.query<Row>(
-          `SELECT q.*, d.id AS draft_id, d.status AS draft_status, d.answer_text AS draft_answer_text
+          `SELECT q.*, d.id AS draft_id, d.status AS draft_status, d.answer_text AS draft_answer_text,
+                  d.citations
              FROM tps.rfi_questions q
              LEFT JOIN tps.rfi_drafts d ON d.question_id = q.id AND d.superseded_at IS NULL
             WHERE q.id = ANY($1::uuid[])`,

@@ -1,15 +1,16 @@
 import { subjectMarker } from './inboundEmail.js';
 
 /**
- * The two emails the RFI loop sends: a collated set of subcontractor queries put to the
- * Client, and the Client's answer relayed back to the firms that asked.
+ * The three emails the RFI loop sends: a collated set of subcontractor queries put to
+ * the Client, the Client's answer relayed back to the firms that asked, and — since
+ * issue #48 — the app's own answer sent straight back to the firm that raised it.
  *
  * Pure functions returning `{ subject, html, text }`, with no I/O and no database — the
- * same split `ittEmail.ts` keeps, so both are unit-tested in CI, which has neither.
+ * same split `ittEmail.ts` keeps, so all three are unit-tested in CI, which has neither.
  *
- * Both carry a `[TPS-<token>]` subject marker. It is not decoration: plus-addressing does
- * not survive every mail system, so the marker is the second of three ways a reply finds
- * its way back to the question it answers (see findReplyToken).
+ * All three carry a `[TPS-<token>]` subject marker. It is not decoration: plus-addressing
+ * does not survive every mail system, so the marker is the second of three ways a reply
+ * finds its way back to the question it answers (see findReplyToken).
  */
 
 export interface ForwardedQuery {
@@ -193,6 +194,112 @@ export function renderClientAnswerRelayEmail(context: RelayEmailContext): Render
       <div style="white-space:pre-wrap">${escapeHtml(context.clientAnswer)}</div>
       ${context.portalUrl ? `<p style="margin-top:16px">The full conversation is on <a href="${escapeHtml(context.portalUrl)}">your pricing page</a>.</p>` : ''}
       <p>If anything is still unclear, reply to this email and we will put it back to the client.</p>
+      ${signoff ? `<p style="white-space:pre-wrap">${escapeHtml(signoff)}</p>` : ''}
+    </div>`.trim();
+
+  return { subject, html, text };
+}
+
+/**
+ * A citation as it may go in an EMAIL, not the full shape a citation carries in the app.
+ *
+ * Structurally, not just by convention: `RfiCitation` (rfiReview.ts) also carries
+ * `passageId`, `documentId`, `quotedText` and `shareUrl`, and `shareUrl` in particular is
+ * a BuildFlow link behind Cloudflare Access for OUR users — in a subcontractor's inbox it
+ * is a dead link at best and a leak at worst. Narrowing the type here, rather than simply
+ * not referencing the field, means a caller cannot pass it through by accident: there is
+ * nowhere in this file's code for it to go even if one tried.
+ */
+export interface RfiAnswerCitation {
+  filename: string;
+  headingPath: string | null;
+  pageHint: number | null;
+}
+
+export interface RfiAnswer {
+  question: string;
+  /** What the app is sending. Never empty — the caller refuses to send a question with
+   *  nothing to say, the same rule `resolveAnswer` (rfiReview.ts) enforces before this is
+   *  ever called. */
+  answer: string;
+  citations: RfiAnswerCitation[];
+}
+
+export interface RfiResponseEmailContext {
+  projectName: string | null;
+  packageName: string | null;
+  estimatorName: string | null;
+  organizationName: string | null;
+  /** The pricing portal, where the whole conversation lives — same field, same meaning,
+   *  as RelayEmailContext's. Null when the firm has no live link; they still get the
+   *  answer by email. */
+  portalUrl: string | null;
+  replyToken: string;
+}
+
+function citationLine(citation: RfiAnswerCitation): string {
+  const heading = citation.headingPath ? ` — ${citation.headingPath}` : '';
+  const page = citation.pageHint != null ? ` (p${citation.pageHint})` : '';
+  return `Source: ${citation.filename}${heading}${page}`;
+}
+
+/**
+ * The app's own answer, sent straight back to the firm that raised the question — the
+ * SEND half of issue #48, as distinct from `renderRfiForwardEmail` above (which puts a
+ * question TO the Client) and `renderClientAnswerRelayEmail` (which relays the Client's
+ * OWN words back). Numbered for the same reason the forward is: several questions from
+ * one firm answered in one email need something for a follow-up to refer back to.
+ *
+ * A citation is named — filename, section, page — so a subcontractor pricing from this
+ * answer can check it against their own copy of the document, rather than having to
+ * trust it. It is never a link (see RfiAnswerCitation's own doc comment).
+ */
+export function renderRfiResponseEmail(
+  answers: RfiAnswer[], context: RfiResponseEmailContext
+): RenderedEmail {
+  const project = context.projectName ?? 'the project';
+  const packageSuffix = context.packageName ? ` (${context.packageName})` : '';
+  const count = answers.length;
+  const subject = `Response to your ${count === 1 ? 'query' : 'queries'} — ${project} ${subjectMarker(context.replyToken)}`;
+
+  const intro = count === 1
+    ? `Here is the answer to your query on ${project}${packageSuffix}.`
+    : `Here are the answers to your ${count} queries on ${project}${packageSuffix}.`;
+
+  const signoff = context.estimatorName
+    ? `${context.estimatorName}${context.organizationName ? `\n${context.organizationName}` : ''}`
+    : context.organizationName ?? '';
+
+  const textAnswers = answers.map((item, index) => [
+    `${index + 1}. ${item.question}`,
+    '',
+    item.answer.split('\n').map((line) => `   ${line}`).join('\n'),
+    ...item.citations.map((citation) => `   ${citationLine(citation)}`),
+    ''
+  ].join('\n')).join('\n');
+
+  const text = [
+    intro, '', textAnswers,
+    context.portalUrl ? `The full conversation is on your pricing page:\n${context.portalUrl}\n` : '',
+    'If anything is still unclear, reply to this email and we will look into it.',
+    signoff ? `\n${signoff}` : ''
+  ].join('\n');
+
+  const htmlAnswers = answers.map((item) => `
+    <li style="margin-bottom:18px">
+      <div><strong>${escapeHtml(item.question)}</strong></div>
+      <div style="white-space:pre-wrap;margin-top:8px">${escapeHtml(item.answer)}</div>
+      ${item.citations.map((citation) =>
+        `<div style="color:#6b7280;font-size:13px;margin-top:4px">${escapeHtml(citationLine(citation))}</div>`
+      ).join('')}
+    </li>`).join('');
+
+  const html = `
+    <div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;font-size:14px;line-height:1.5;color:#111827">
+      <p>${escapeHtml(intro)}</p>
+      <ol style="padding-left:20px">${htmlAnswers}</ol>
+      ${context.portalUrl ? `<p>The full conversation is on <a href="${escapeHtml(context.portalUrl)}">your pricing page</a>.</p>` : ''}
+      <p>If anything is still unclear, reply to this email and we will look into it.</p>
       ${signoff ? `<p style="white-space:pre-wrap">${escapeHtml(signoff)}</p>` : ''}
     </div>`.trim();
 
