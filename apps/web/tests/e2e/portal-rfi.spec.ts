@@ -160,6 +160,12 @@ test('sends an attachment and renders it as a preview link', async ({ page }) =>
     name: 'sketch.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 pretend sketch')
   });
   await page.getByRole('button', { name: 'Send' }).click();
+  // Reading the file and base64-encoding it is genuinely async — without this wait the
+  // assertions below run while the request is still in flight (the button still reads
+  // "Sending…") and `model.raised[0]` is undefined. The other tests in this file get this
+  // for free because they assert on the panel closing first; this one has to ask for it
+  // explicitly since it goes straight to the model.
+  await expect(page.getByRole('button', { name: 'Request information' })).toBeVisible();
 
   const attachments = model.raised[0].attachments as Array<{ filename: string; contentBase64: string }>;
   expect(attachments).toHaveLength(1);
