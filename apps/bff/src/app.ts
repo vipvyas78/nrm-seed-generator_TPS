@@ -146,10 +146,20 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     : undefined;
   const verifyAccessIdentity = buildAccessVerifier(config, db);
 
+  // RFI collation and drafting (issue #41), and — since issue #48 — the estimator's own
+  // review/approve/send loop over what that pipeline produced. Constructed
+  // UNCONDITIONALLY: the estimator half needs only db + commsDb, both already available
+  // here, and gating the whole class on the BuildFlow pair (as before) would mean a
+  // deployment with BuildFlow unconfigured showed an estimator no RFI screen at all
+  // rather than an empty one. The two BuildFlow clients are optional constructor params
+  // instead — see rfiDb.ts's own header. The /internal/scheduled/rfi/* routes below stay
+  // gated on the BuildFlow pair directly, not on this being defined, since it always is.
+  const rfiDb = new RfiDatabase(db, commsDb, attachmentTextClient, tenderPassagesClient);
+
   const tpDb = new TenderPrepDatabase(
     db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, documentBundles,
     emailService, testEmailOverride, portalDb, accessAdmin, portalBaseUrl, config.PORTAL_LINK_TTL_DAYS,
-    mepBoq, commsDb, commsAttachments, config.CLIENT_LINK_TTL_DAYS
+    mepBoq, commsDb, commsAttachments, config.CLIENT_LINK_TTL_DAYS, rfiDb
   );
 
   // ITT reminders and the reading of a firm's emailed reply. Its own module rather than more
@@ -157,14 +167,6 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const reminders = new IttRemindersDatabase(
     db, scmsDb, commsDb, emailService, testEmailOverride, portalBaseUrl, ITT_FROM_ADDRESS
   );
-  // RFI collation and drafting (issue #41). Needs both BuildFlow clients above —
-  // without them there is nowhere to read an attachment's text or a tender's
-  // documents from, so the /internal/scheduled/rfi/* routes below are registered
-  // only when this is defined, the same all-or-nothing rule the scheduled-secrets
-  // pair already follows.
-  const rfiDb = attachmentTextClient && tenderPassagesClient
-    ? new RfiDatabase(db, commsDb, attachmentTextClient, tenderPassagesClient)
-    : undefined;
 
   app.decorate('tps', { config, db, tpDb, scmsDb });
   await app.register(cors, { origin: config.WEB_ORIGIN, credentials: false });
@@ -470,11 +472,14 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
 
       // RFI drafting (issue #41), on its own frequent cron in the scheduled-tasks
       // worker. Registered in this SAME scope — same auth, same raw-body parser —
-      // but only when rfiDb exists, i.e. both BuildFlow clients above are configured.
-      // A half-configured deployment (reminders working, RFI drafting not) is a real
-      // and acceptable state: unlike the token pair, these routes' own prerequisite
-      // is a second, independent pair of variables.
-      if (rfiDb) {
+      // but only when BOTH BuildFlow clients above are configured. rfiDb itself is
+      // ALWAYS defined since issue #48 (it also serves the estimator's own review
+      // screen, which needs neither client), so the gate checks the clients directly
+      // rather than rfiDb's existence. A half-configured deployment (reminders
+      // working, RFI drafting not) is a real and acceptable state: unlike the token
+      // pair, these routes' own prerequisite is a second, independent pair of
+      // variables.
+      if (attachmentTextClient && tenderPassagesClient) {
         scheduled.post('/internal/scheduled/rfi/pending-extraction', async (request) => {
           authenticate(request);
           body(request, z.object({}).passthrough());

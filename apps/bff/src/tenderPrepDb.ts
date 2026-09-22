@@ -23,6 +23,7 @@ import type { ScmsReadDatabase } from './scmsReadDb.js';
 import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js';
 import { deriveReturnDate, isTenderReturnUnit } from './tenderReturnPeriod.js';
 import { manualReminderKind, type IttResponse } from './ittReminders.js';
+import type { RfiDatabase } from './rfiDb.js';
 import type { Actor } from './types.js';
 
 /**
@@ -271,7 +272,12 @@ export class TenderPrepDatabase {
     private readonly commsAttachments?: BuildflowCommsAttachmentsClient,
     // Shorter than a portal link by default: a tender query is answered in days, and the
     // link is a bearer capability sitting in somebody's inbox.
-    private readonly clientLinkTtlDays: number = 30
+    private readonly clientLinkTtlDays: number = 30,
+    // Optional: without one configured, the RFI send/forward/re-attribute methods below
+    // throw notFound the same way every other optional-collaborator method here does.
+    // Unlike commsDb above, its absence has nothing to do with BuildFlow being
+    // configured — see rfiDb.ts's own header for why it is unconditionally constructed.
+    private readonly rfiDb?: RfiDatabase
   ) {}
 
   /**
