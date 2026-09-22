@@ -211,5 +211,5 @@ const timestamp = String(Math.floor(Date.now() / 1000));
 const signature = signInboundRequest(SECRET, timestamp, body);
 ```
 
-`apps/bff/src/inboundEmail.test.ts` exercises the signature, the idempotency key and all
+`apps/bff/tests/unit/inboundEmail.test.ts` exercises the signature, the idempotency key and all
 three token routes with no database and no network.

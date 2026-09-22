@@ -15,11 +15,14 @@ export default defineConfig({
   server: { port: 5175 },
   build: { sourcemap: true },
   test: {
-    // Vitest's default include is every *.test.ts / *.spec.ts under the package, which takes
-    // in the Playwright specs in e2e/ — they import @playwright/test, so vitest collects them
-    // and fails with "Playwright Test did not expect test() to be called here" while still
-    // reporting the rest as passed. Playwright owns e2e/ (its testDir); vitest owns src/.
-    include: ['src/**/*.test.ts'],
-    exclude: ['e2e/**', 'node_modules/**']
+    // Tests live under tests/unit (vitest) and tests/e2e (Playwright) rather than beside
+    // src/ or under it — issue #48's test relocation. The exclude is still needed for the
+    // same reason it always was: vitest's default glob would otherwise also collect the
+    // Playwright specs, which import @playwright/test, and fail with "Playwright Test did
+    // not expect test() to be called here" while still reporting the rest as passed.
+    // Playwright owns tests/e2e (its testDir); vitest owns tests/unit.
+    environment: 'jsdom',
+    include: ['tests/unit/**/*.test.{ts,tsx}'],
+    exclude: ['tests/e2e/**', 'node_modules/**']
   }
 });

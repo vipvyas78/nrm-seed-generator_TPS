@@ -1,6 +1,6 @@
 node_modules/
 dist/
-apps/bff/src/__itt_preview_output__/
+apps/bff/tests/integration/__itt_preview_output__/
 .env
 __pycache__/
 .pytest_cache/

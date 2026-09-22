@@ -1,0 +1,15 @@
+{
+  // Extends the app's own tsconfig.json rather than restating it, so a component test is
+  // checked under the exact same compiler options the app itself builds under — with
+  // "tests/unit" added to what gets checked. Nothing here changes what Vite bundles or
+  // what `tsc -b` emits for the app: this file is noEmit-only, per its parent.
+  //
+  // tests/e2e is deliberately EXCLUDED: those specs run under Playwright's own TS
+  // transform (which never enforced this project's lib/types either — they were never
+  // covered by any tsc pass before this file existed) and use Node globals (Buffer) this
+  // DOM-only config has no ambient types for. Mixing the two domains in one tsconfig would
+  // require adding "node" types here just to satisfy a spec file, which then lets a DOM
+  // unit test accidentally reference a Node global that jsdom would not actually provide.
+  "extends": "./tsconfig.json",
+  "include": ["src", "tests/unit"]
+}
