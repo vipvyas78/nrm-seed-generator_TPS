@@ -997,15 +997,44 @@ export class TenderPrepDatabase {
   async letterContextFor(actor: Actor, workflowId: string): Promise<IttEmailLetterContext> {
     const details = await this.getIttLetterDetails(actor, workflowId);
     const orgName = await this.organizationName(actor);
+    const projectEstimator = (details?.estimator_name || details?.estimator_email) ? null : await this.defaultProjectEstimator(workflowId);
     return {
       siteAddress: (details?.site_address as string | null) ?? null,
       tenderReturnDeadline: this.formatDate(details?.tender_return_deadline),
       clarificationsCloseDate: this.formatDate(details?.clarifications_close_date),
       siteVisitPermitted: (details?.site_visit_permitted as boolean | null) ?? null,
-      estimatorName: (details?.estimator_name as string | null) ?? actor.displayName ?? null,
-      estimatorEmail: (details?.estimator_email as string | null) ?? actor.email ?? null,
+      estimatorName: (details?.estimator_name as string | null) ?? projectEstimator?.name ?? actor.displayName ?? null,
+      estimatorEmail: (details?.estimator_email as string | null) ?? projectEstimator?.email ?? actor.email ?? null,
       organizationName: orgName
     };
+  }
+
+  /**
+   * The project's DEFAULT signatory (issue #41, bf_project_estimators.seq = 1) —
+   * the middle rung between a saved itt_letter_details row (a human deliberately
+   * set one, for this workflow) and the confirming actor's own account (the last
+   * resort, always available). A project names its estimators once at creation;
+   * this is what lets every package under it default to that name without asking
+   * again.
+   *
+   * workflows carries no project_id column directly — it is only ever reachable
+   * through step_data.takeoff.projectId (the same trap db.ts's own comment on
+   * bf_takeoff_package_versions warns about), so a workflow with no take-off
+   * launched yet (the ITT preview path) correctly resolves to no project estimator.
+   */
+  private async defaultProjectEstimator(workflowId: string): Promise<{ name: string; email: string } | null> {
+    const [row] = await this.db.query<Row>(
+      `SELECT e.name, e.email
+         FROM workflows w
+         JOIN public.bf_project_estimators e
+           ON e.project_id = (w.step_data -> 'takeoff' ->> 'projectId')::uuid
+        WHERE w.id = $1
+        ORDER BY e.seq
+        LIMIT 1`,
+      [workflowId]
+    );
+    if (!row) return null;
+    return { name: String(row.name), email: String(row.email) };
   }
 
   /** The {{token}} -> value map every template (email body and PDF alike) resolves
