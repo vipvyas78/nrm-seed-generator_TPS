@@ -16,6 +16,7 @@ import { BoqReadDatabase } from './boqReadDb.js';
 import { BuildflowAttachmentTextClient } from './buildflowAttachmentTextClient.js';
 import { BuildflowDocumentBundlesClient } from './buildflowDocumentBundlesClient.js';
 import { BuildflowDocumentLinksClient } from './buildflowDocumentLinksClient.js';
+import { BuildflowAddendumDeltaClient } from './buildflowAddendumDeltaClient.js';
 import { BuildflowMepBoqClient } from './buildflowMepBoqClient.js';
 import { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
 import { BuildflowTenderPassagesClient } from './buildflowTenderPassagesClient.js';
@@ -104,6 +105,9 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const documentBundles = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
     ? new BuildflowDocumentBundlesClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
     : undefined;
+  const addendumDelta = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
+    ? new BuildflowAddendumDeltaClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
+    : undefined;
   const emailService = config.CLOUDFLARE_ACCOUNT_ID && config.CLOUDFLARE_EMAIL_TOKEN
     ? new EmailService({ cloudflareAccountId: config.CLOUDFLARE_ACCOUNT_ID, cloudflareApiToken: config.CLOUDFLARE_EMAIL_TOKEN })
     : undefined;
@@ -159,7 +163,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const tpDb = new TenderPrepDatabase(
     db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, documentBundles,
     emailService, testEmailOverride, portalDb, accessAdmin, portalBaseUrl, config.PORTAL_LINK_TTL_DAYS,
-    mepBoq, commsDb, commsAttachments, config.CLIENT_LINK_TTL_DAYS, rfiDb
+    mepBoq, commsDb, commsAttachments, config.CLIENT_LINK_TTL_DAYS, rfiDb, addendumDelta
   );
 
   // ITT reminders and the reading of a firm's emailed reply. Its own module rather than more
@@ -1186,6 +1190,38 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
 
     // The unanswered questions put to the Client as ONE email — the same shape as
     // /threads/forward above, at question grain rather than message grain.
+    // ── tender addenda (BuildFlow issue #68) ────────────────────────────────
+    //
+    // The client sent revised documents, BuildFlow re-measured, and the subcontractors
+    // holding the ITT are pricing a document set that no longer describes the job. These
+    // three routes are the estimator's half: see what changed, approve it, and (next) issue
+    // it. The packages BuildFlow's delta proposes are a proposal — the tick is the decision.
+    protectedApi.get('/api/tender-prep/:workflowId/addenda', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.listAddenda(requireActor(request), workflowId);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/addenda', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.createAddendum(requireActor(request), workflowId);
+    });
+
+    // One call, because the issue asks for two approvals that are one decision: which
+    // packages the addendum goes to, and the revised tender return date.
+    protectedApi.post('/api/tender-prep/addenda/:addendumId/approve', async (request) => {
+      const { addendumId } = params(request, z.object({ addendumId: uuid }));
+      const input = body(request, z.object({
+        packages: z.array(z.object({
+          packageName: z.string().trim().min(1).max(200),
+          included: z.boolean(),
+          // A date, not a period: the period produced the ORIGINAL deadline and is still
+          // on the shortlist. What an addendum states is the new date itself.
+          revisedReturnDeadline: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().default(null)
+        })).min(1).max(200)
+      }));
+      return tpDb.approveAddendum(requireActor(request), addendumId, input);
+    });
+
     protectedApi.post('/api/tender-prep/:workflowId/rfi/client-forward', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));
       const input = body(request, z.object({
