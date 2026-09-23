@@ -26,7 +26,8 @@ const KIND_LABELS: Record<AppNotification['kind'], string> = {
   forward_failed: 'Not sent',
   unattributed_email: 'Unattributed',
   itt_response_detected: 'ITT response',
-  rfi_review_required: 'Answer not sent'
+  rfi_review_required: 'Answer not sent',
+  addendum_approval_required: 'Addendum'
 };
 
 /** Amber for a thing to do, red for a thing that went wrong. A failed forward or a failed
@@ -37,7 +38,9 @@ const KIND_TONE: Record<AppNotification['kind'], string> = {
   forward_failed: 'badge-red',
   unattributed_email: 'badge-amber',
   itt_response_detected: 'badge-green',
-  rfi_review_required: 'badge-red'
+  rfi_review_required: 'badge-red',
+  // The app asking its own estimator a question — a thing to do, not a thing that failed.
+  addendum_approval_required: 'badge-amber'
 };
 
 export function BellIcon({ unread }: { unread: number }) {
