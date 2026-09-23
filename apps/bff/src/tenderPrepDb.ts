@@ -3248,6 +3248,23 @@ export class TenderPrepDatabase {
    * an HTTP call for a string this row already holds. Null is fine: the emails say "the
    * tender" rather than refusing to send.
    */
+  /** This workflow's tender, read through the package it was created for.
+   *
+   *  `workflows.package_id` IS `public.bf_takeoff_packages.id` (migration 001), so this is
+   *  the same direct-SQL read across the boundary that boqReadDb and ittRemindersDb make.
+   *  Not taken from `step_data`, which carries a tenderId only once a take-off has been
+   *  released: a client contact has to resolve before that. */
+  private async tenderIdForWorkflow(workflowId: string): Promise<string | null> {
+    const [row] = await this.db.query<Row>(
+      `SELECT p.tender_id
+         FROM workflows w
+         JOIN public.bf_takeoff_packages p ON p.id = w.package_id
+        WHERE w.id = $1`,
+      [workflowId]
+    );
+    return row?.tender_id != null ? String(row.tender_id) : null;
+  }
+
   private async tenderNameForWorkflow(workflowId: string): Promise<string | null> {
     const [row] = await this.db.query<Row>(
       `SELECT step_data -> 'takeoff' ->> 'tenderName' AS tender_name FROM workflows WHERE id = $1`,
@@ -4392,7 +4409,21 @@ export class TenderPrepDatabase {
 
   /** The addresses this organisation uses, with the built-in defaults where it has saved
    *  nothing. One read, shared by every comms path. */
-  private async commsConfig(organizationId: string): Promise<{
+  /**
+   * This organisation's comms settings, with the client contact resolved for ONE tender.
+   *
+   * The ADDRESSES stay organisation-wide -- they are this organisation's own mailboxes and
+   * the employer has nothing to do with them. The CLIENT CONTACT is per-tender (BuildFlow
+   * issue #65): migration 088 filed it on the organisation and said so itself, "in reality
+   * each tender has a different employer". Without this, every client-facing email on a
+   * second tender goes to the first tender's employer.
+   *
+   * Resolution mirrors BuildFlow's `clientContactFor` exactly, and mirrors the rule
+   * `itt_attachment_templates` and `itt_reminder_templates` already use: a tender row beats
+   * the organisation's NULL-tender row. Passing no tenderId keeps the old behaviour, which
+   * is what the address-only callers want.
+   */
+  private async commsConfig(organizationId: string, tenderId?: string | null): Promise<{
     ittFromAddress: string; ittCommsAddress: string; clientReplyAddress: string;
     clientContactName: string | null; clientContactEmail: string | null;
   }> {
@@ -4400,19 +4431,32 @@ export class TenderPrepDatabase {
       `SELECT * FROM public.itt_comms_config WHERE organization_id = $1 AND tender_id IS NULL`,
       [organizationId]
     );
+    // The tender's own contact, where it has one. Only the contact is taken from it.
+    const [override] = tenderId
+      ? await this.db.query<Row>(
+          `SELECT client_contact_name, client_contact_email
+             FROM public.itt_comms_config
+            WHERE organization_id = $1 AND tender_id = $2`,
+          [organizationId, tenderId]
+        )
+      : [undefined];
+    const contact = override ?? row;
     return {
       ittFromAddress: row?.itt_from_address ? String(row.itt_from_address) : ITT_FROM_ADDRESS,
       ittCommsAddress: row?.itt_comms_address ? String(row.itt_comms_address) : ITT_FROM_ADDRESS,
       clientReplyAddress: row?.client_reply_address ? String(row.client_reply_address) : DEFAULT_CLIENT_REPLY_ADDRESS,
-      clientContactName: row?.client_contact_name != null ? String(row.client_contact_name) : null,
-      clientContactEmail: row?.client_contact_email != null ? String(row.client_contact_email) : null
+      clientContactName: contact?.client_contact_name != null ? String(contact.client_contact_name) : null,
+      clientContactEmail: contact?.client_contact_email != null ? String(contact.client_contact_email) : null
     };
   }
 
   /** The Client contact this organisation configured, for pre-filling the forward form. */
   async commsDefaults(actor: Actor, workflowId: string): Promise<Row> {
     await this.assertWorkflowAccess(actor, workflowId);
-    const config = await this.commsConfig(await this.organizationForWorkflow(workflowId));
+    const config = await this.commsConfig(
+      await this.organizationForWorkflow(workflowId),
+      await this.tenderIdForWorkflow(workflowId)
+    );
     return {
       client_contact_name: config.clientContactName,
       client_contact_email: config.clientContactEmail,
