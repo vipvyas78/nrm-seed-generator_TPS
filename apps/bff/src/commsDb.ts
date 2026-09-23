@@ -51,7 +51,9 @@ export type AttributionMethod =
 
 export type NotificationKind =
   | 'subcontractor_rfi' | 'client_reply' | 'forward_failed' | 'unattributed_email'
-  | 'itt_response_detected' | 'rfi_review_required';
+  | 'itt_response_detected' | 'rfi_review_required'
+  // The one kind that is about a THING rather than a message — see dedupeKey below.
+  | 'addendum_approval_required';
 
 /**
  * What the bell says, decided by the caller rather than derived here.
@@ -69,6 +71,15 @@ export interface NotificationInput {
   body: string | null;
   deepLinkPath: string;
   subcontractorId?: string | null;
+  /**
+   * Idempotency for a notification with NO message behind it (comms migration 004).
+   *
+   * Every other notification gets it from `message_id`, which is UNIQUE. An addendum
+   * approval has no message — nothing was sent to anyone; the app is asking its own
+   * estimator a question — and a NULL message_id gives no protection at all, because a
+   * UNIQUE index treats every NULL as distinct. Set exactly one of the two.
+   */
+  dedupeKey?: string | null;
 }
 
 export type MessageKind =
@@ -127,7 +138,7 @@ export interface RecordMessageInput {
  *
  * Bump it in the same change that starts depending on a newer migration.
  */
-export const REQUIRED_COMMS_MIGRATION = '003_rfi_kinds.sql';
+export const REQUIRED_COMMS_MIGRATION = '004_addendum_notification.sql';
 
 /**
  * Refuses to continue unless the comms schema is present and at least at the migration
@@ -664,14 +675,21 @@ export class CommsDatabase {
   private async insertNotification(input: NotificationInput & {
     organizationId: string; workflowId: string | null; threadId: string | null; messageId: string | null;
   }, client?: Parameters<Database['query']>[2]): Promise<void> {
+    // The conflict target follows whichever key this notification actually has. A
+    // message-backed one dedupes on message_id as it always has; one about a THING (an
+    // addendum awaiting approval) dedupes on dedupe_key, because its message_id is NULL
+    // and UNIQUE treats every NULL as distinct — so `ON CONFLICT (message_id)` would
+    // never fire and a retry would put a second "1 addendum to approve" on the bell.
+    const target = input.messageId != null ? 'message_id' : 'dedupe_key';
     await this.db.query(
       `INSERT INTO comms.notifications
          (organization_id, kind, thread_id, message_id, workflow_id, subcontractor_id,
-          title, body, deep_link_path)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       ON CONFLICT (message_id) DO NOTHING`,
+          title, body, deep_link_path, dedupe_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       ON CONFLICT (${target}) DO NOTHING`,
       [input.organizationId, input.kind, input.threadId, input.messageId, input.workflowId,
-       input.subcontractorId ?? null, input.title, input.body, input.deepLinkPath],
+       input.subcontractorId ?? null, input.title, input.body, input.deepLinkPath,
+       input.dedupeKey ?? null],
       client
     );
   }

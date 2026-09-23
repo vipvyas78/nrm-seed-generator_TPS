@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
 import type { BuildflowCommsAttachmentsClient } from './buildflowCommsAttachmentsClient.js';
+import { proposedPackages, type BuildflowAddendumDeltaClient }
+  from './buildflowAddendumDeltaClient.js';
 import type { AttributionMethod, CommsAttachmentInput, CommsDatabase } from './commsDb.js';
 import {
   renderClientAnswerRelayEmail, renderConflictForwardEmail, renderRfiForwardEmail,
@@ -283,7 +285,11 @@ export class TenderPrepDatabase {
     // throw notFound the same way every other optional-collaborator method here does.
     // Unlike commsDb above, its absence has nothing to do with BuildFlow being
     // configured — see rfiDb.ts's own header for why it is unconditionally constructed.
-    private readonly rfiDb?: RfiDatabase
+    private readonly rfiDb?: RfiDatabase,
+    // Optional: without one configured, no tender addendum can be raised (BuildFlow #68).
+    // Deliberately NOT best-effort where it IS configured — see the client's header: an
+    // addendum covering no packages reads exactly like "nothing changed".
+    private readonly addendumDelta?: BuildflowAddendumDeltaClient
   ) {}
 
   /**
@@ -961,10 +967,23 @@ export class TenderPrepDatabase {
    * into the package's own column and rung 1 stays reversible.
    */
   private resolveReturnDeadline(
-    pkg: { tender_return_period_value?: unknown; tender_return_period_unit?: unknown; tender_return_deadline?: unknown },
+    pkg: {
+      tender_return_period_value?: unknown; tender_return_period_unit?: unknown;
+      tender_return_deadline?: unknown; revised_tender_return_deadline?: unknown;
+    },
     explicit: unknown,
     asOf?: Date
   ): { display: string | null; toStamp: string | null } {
+    // RUNG 0: an approved addendum's extended date (migration 027). It beats the typed
+    // override and the stamped original alike, because it is the most recent decision
+    // anybody made about this window and it is the one the tenderers have been told.
+    //
+    // The original is deliberately NOT overwritten — tender_return_deadline stays
+    // write-once, so what each tenderer was first told is still on the record and the
+    // reason it moved is `revised_by_addendum_id` rather than a memory.
+    if (pkg.revised_tender_return_deadline) {
+      return { display: this.formatDate(pkg.revised_tender_return_deadline), toStamp: null };
+    }
     if (explicit) return { display: this.formatDate(explicit), toStamp: null };
     if (pkg.tender_return_deadline) return { display: this.formatDate(pkg.tender_return_deadline), toStamp: null };
 
@@ -4595,6 +4614,183 @@ export class TenderPrepDatabase {
   }
 
   // ── Internal ──────────────────────────────────────────────────────────────
+
+  // ────────────────────────────────────────── tender addenda (BuildFlow #68)
+
+  /**
+   * Raise an addendum for what the client's revised documents changed.
+   *
+   * BuildFlow computes WHAT changed (its issue #67); this decides what to do about it. The
+   * packages it proposes come from that delta and are a PROPOSAL: the estimator ticks them
+   * on approval, because the derivation is evidence and the approval is the decision.
+   *
+   * Two refusals, and they are different facts:
+   *   `available: false`  the comparison was never made — a take-off predating BuildFlow's
+   *                       migration 096, or a run interrupted before its last node. NOT
+   *                       "nothing changed", and raising an empty addendum on it would send
+   *                       a revision to nobody.
+   *   `baseline: none`    nothing was ever tendered for this package, so there is no
+   *                       issued document set to addend. The ordinary release path applies.
+   */
+  async createAddendum(actor: Actor, workflowId: string): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.addendumDelta) throw notFound('Take-off comparison is not configured.');
+
+    const [wf] = await this.db.query<{ step_data: { takeoff?: { takeoffId?: string } } }>(
+      `SELECT step_data FROM workflows WHERE id = $1`, [workflowId]
+    );
+    const takeoffId = wf?.step_data?.takeoff?.takeoffId;
+    if (!takeoffId) throw conflict('No take-off is linked to this tender yet.');
+
+    const response = await this.addendumDelta.deltaFor(String(takeoffId));
+    if (!response.available || !response.delta) {
+      throw conflict(
+        'This take-off has not been compared with the last one tendered, so what changed is not known. Re-run the take-off.'
+      );
+    }
+    const delta = response.delta;
+    if (delta.baseline_resolution === 'none') {
+      throw conflict('Nothing has been tendered for this package yet, so there is nothing to addend.');
+    }
+
+    const packages = proposedPackages(delta);
+    if (packages.length === 0) {
+      throw conflict('Nothing changed for any work package since the last tender.');
+    }
+
+    const addendum = await this.db.transaction(async (client) => {
+      // seq is taken inside the transaction: two reviewers raising one at once must not
+      // both read the same "next" number.
+      const [row] = await this.db.query<Row>(
+        `INSERT INTO addenda
+           (workflow_id, seq, takeoff_id, baseline_takeoff_id, status, delta, created_by)
+         VALUES ($1, COALESCE((SELECT MAX(seq) FROM addenda WHERE workflow_id = $1), 0) + 1,
+                 $2, $3, 'awaiting_approval', $4::jsonb, $5)
+         ON CONFLICT (workflow_id, takeoff_id) DO NOTHING
+         RETURNING *`,
+        [workflowId, takeoffId, delta.baseline_takeoff_id, JSON.stringify(delta), actor.userId],
+        client
+      );
+      if (!row) throw conflict('An addendum has already been raised for this take-off.');
+
+      for (const pkg of packages) {
+        await this.db.query(
+          `INSERT INTO addendum_packages
+             (addendum_id, package_name, wp_code, proposed, included,
+              items_added, items_removed, items_changed, unattributed)
+           VALUES ($1,$2,$3,TRUE,TRUE,$4,$5,$6,$7)`,
+          [row.id, pkg.packageName, pkg.wpCode, pkg.added, pkg.removed, pkg.changed, pkg.unattributed],
+          client
+        );
+      }
+      return row;
+    });
+
+    // After the commit, like every other notification whose subject had to exist first.
+    // dedupeKey rather than a message id: nothing was sent to anyone, so there is no
+    // message — and a NULL message_id gives no idempotency at all (comms migration 004).
+    if (this.commsDb) {
+      const changed = delta.items_added + delta.items_removed + delta.items_changed;
+      await this.commsDb.recordNotification({
+        kind: 'addendum_approval_required',
+        organizationId: await this.organizationForWorkflow(workflowId),
+        workflowId, threadId: null, messageId: null,
+        dedupeKey: `addendum:${String(addendum.id)}`,
+        title: `Addendum ${String(addendum.seq)} needs approval`,
+        body: `${changed} take-off line${changed === 1 ? '' : 's'} changed across `
+          + `${packages.length} work package${packages.length === 1 ? '' : 's'}.`,
+        deepLinkPath: await this.addendumDeepLink(workflowId, String(addendum.id))
+      });
+    }
+    return { ...addendum, packages };
+  }
+
+  /** Where an addendum notification sends its reader. */
+  private async addendumDeepLink(workflowId: string, addendumId: string): Promise<string> {
+    const [row] = await this.db.query<Row>(`SELECT package_id FROM workflows WHERE id = $1`, [workflowId]);
+    return row?.package_id
+      ? `/packages/${String(row.package_id)}/tender-prep?addendum=${addendumId}`
+      : `/tender-prep?addendum=${addendumId}`;
+  }
+
+  async listAddenda(actor: Actor, workflowId: string): Promise<Row[]> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    const rows = await this.db.query<Row>(
+      `SELECT a.*, COALESCE(
+                (SELECT json_agg(p.* ORDER BY p.unattributed, p.package_name)
+                   FROM addendum_packages p WHERE p.addendum_id = a.id), '[]'::json) AS packages
+         FROM addenda a WHERE a.workflow_id = $1 ORDER BY a.seq DESC`,
+      [workflowId]
+    );
+    return rows;
+  }
+
+  /**
+   * Approve an addendum: which packages it goes to, and the revised return date.
+   *
+   * The issue asks for two approvals and they are one decision, so they are one call. The
+   * revised date is written to `shortlists.revised_tender_return_deadline` alongside the
+   * addendum that moved it; `tender_return_deadline` is NOT touched, so what each tenderer
+   * was originally told stays on the record (migration 021's rule, kept).
+   *
+   * The package set is re-read INSIDE the transaction, the way releaseTakeoffForTender
+   * re-counts pendingReview: a stale screen must not approve an addendum that has since
+   * been cancelled, and must not silently drop a package it never displayed.
+   */
+  async approveAddendum(actor: Actor, addendumId: string, input: {
+    packages: Array<{ packageName: string; included: boolean; revisedReturnDeadline?: string | null }>;
+  }): Promise<Row> {
+    return this.db.transaction(async (client) => {
+      const [addendum] = await this.db.query<Row>(
+        `SELECT a.*, w.organization_id
+           FROM addenda a JOIN workflows w ON w.id = a.workflow_id
+          WHERE a.id = $1 AND w.organization_id = $2 AND w.archived_at IS NULL
+          FOR UPDATE OF a`,
+        [addendumId, actor.organizationId], client
+      );
+      if (!addendum) throw notFound('That addendum no longer exists.');
+      if (addendum.status !== 'awaiting_approval') {
+        throw conflict(`This addendum is ${String(addendum.status)} and cannot be approved.`);
+      }
+
+      const known = await this.db.query<Row>(
+        `SELECT package_name FROM addendum_packages WHERE addendum_id = $1`, [addendumId], client
+      );
+      const names = new Set(known.map((row) => String(row.package_name)));
+      const foreign = input.packages.filter((row) => !names.has(row.packageName));
+      if (foreign.length > 0) {
+        throw conflict('Those packages are not part of this addendum — reload and try again.');
+      }
+
+      for (const pkg of input.packages) {
+        await this.db.query(
+          `UPDATE addendum_packages
+              SET included = $3, revised_return_deadline = $4::date
+            WHERE addendum_id = $1 AND package_name = $2`,
+          [addendumId, pkg.packageName, pkg.included, pkg.revisedReturnDeadline ?? null], client
+        );
+        // The revised date reaches the shortlist only for a package actually included:
+        // a package the estimator unticked is not part of this revision and its tenderers
+        // are still working to the date they were given.
+        if (pkg.included && pkg.revisedReturnDeadline) {
+          await this.db.query(
+            `UPDATE shortlists
+                SET revised_tender_return_deadline = $3::date,
+                    revised_by_addendum_id = $2, revised_at = NOW()
+              WHERE workflow_id = $1 AND package_name = $4`,
+            [addendum.workflow_id, addendumId, pkg.revisedReturnDeadline, pkg.packageName], client
+          );
+        }
+      }
+
+      const [updated] = await this.db.query<Row>(
+        `UPDATE addenda SET status = 'approved', approved_by = $2, approved_at = NOW()
+          WHERE id = $1 RETURNING *`,
+        [addendumId, actor.userId], client
+      );
+      return updated;
+    });
+  }
 
   private async assertWorkflowAccess(actor: Actor, workflowId: string): Promise<void> {
     const rows = await this.db.query(
