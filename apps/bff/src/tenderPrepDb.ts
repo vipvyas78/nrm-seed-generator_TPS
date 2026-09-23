@@ -3,8 +3,10 @@ import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
 import type { BuildflowCommsAttachmentsClient } from './buildflowCommsAttachmentsClient.js';
 import type { AttributionMethod, CommsAttachmentInput, CommsDatabase } from './commsDb.js';
 import {
-  renderClientAnswerRelayEmail, renderRfiForwardEmail, renderRfiResponseEmail,
-  type ForwardedQuery, type RfiAnswerCitation
+  renderClientAnswerRelayEmail, renderConflictForwardEmail, renderRfiForwardEmail,
+  renderRfiResponseEmail,
+  type ForwardedConflict, type ForwardedQuery, type ForwardEmailContext,
+  type RenderedEmail, type RfiAnswerCitation
 } from './commsEmail.js';
 import {
   findReplyToken, isVerified, referencedMessageIds, replyAddressFor, type InboundEmail
@@ -3837,8 +3839,12 @@ export class TenderPrepDatabase {
    * what grain, records what this forward carried. It runs BEFORE the send, in the same
    * place `recordForwardItems` always has.
    */
-  private async sendClientForward(actor: Actor, workflowId: string, input: {
-    items: ForwardedQuery[];
+  private async sendClientForward<TItem>(actor: Actor, workflowId: string, input: {
+    items: TItem[];
+    /** How this caller's items read as an email. The second thing that differs between
+     *  callers, alongside `recordItems`: a conflict has no firm and no author behind it,
+     *  so it cannot be rendered by the query renderer without inventing both. */
+    render: (items: TItem[], context: ForwardEmailContext) => RenderedEmail;
     recordItems: (forwardMessageId: string) => Promise<void>;
     clientEmail: string; clientName: string | null; note: string | null;
   }): Promise<Row> {
@@ -3896,7 +3902,7 @@ export class TenderPrepDatabase {
       await this.accessAdmin.syncFor(recipients).catch(() => undefined);
     }
 
-    const email = renderRfiForwardEmail(input.items, {
+    const email = input.render(input.items, {
       tenderName,
       tenderReference: null,
       estimatorName: context?.estimatorName ?? null,
@@ -3974,6 +3980,7 @@ export class TenderPrepDatabase {
 
     return this.sendClientForward(actor, workflowId, {
       items,
+      render: renderRfiForwardEmail,
       recordItems: (forwardMessageId) =>
         this.commsDb!.recordForwardItems(forwardMessageId, sources.map((m) => String(m.id))),
       clientEmail: input.clientEmail, clientName: input.clientName, note: input.note
@@ -4067,6 +4074,68 @@ export class TenderPrepDatabase {
    * — a question's thread may since have moved under a re-attribution while the question
    * row itself, a snapshot taken at extraction, still says the old tender.
    */
+  /**
+   * The tender's own drawing/specification conflicts put to the Client (issue #66).
+   *
+   * The third caller of `sendClientForward`, and the first that BuildFlow originates: the
+   * estimator reads conflicts on BuildFlow's Conflicts tab, and raising them should not
+   * mean leaving it. So this is reached over the internal bearer route rather than the
+   * session-authenticated API, and the conflicts arrive as CONTENT, not as ids.
+   *
+   * That is not a shortcut around reading `public.bf_ge_conflicts` from here -- it is the
+   * better shape. agents/conflict_finder destroys and rebuilds that table on every run, so
+   * a row id is stale the moment the client's answer prompts a re-import. What was actually
+   * sent is snapshotted in `tps.conflict_forward_items` and stays readable afterwards.
+   *
+   * The workflow is resolved from the PACKAGE id, so BuildFlow never has to hold a TPS
+   * workflow id; `assertWorkflowAccess` then re-checks it against the organisation the
+   * caller claimed, because the bearer vouches for the caller and not for the person.
+   */
+  async forwardConflictsToClient(actor: Actor, packageId: string, input: {
+    conflicts: ForwardedConflict[];
+    digests: string[];
+    conflictIds: (string | null)[];
+    clientEmail: string; clientName: string | null; note: string | null;
+  }): Promise<Row> {
+    if (!this.commsDb) throw notFound('Queries are not available for this tender.');
+    if (input.conflicts.length === 0) throw conflict('Select at least one conflict to raise.');
+
+    const rows = await this.db.query(
+      `SELECT id FROM workflows WHERE package_id = $1 AND organization_id = $2 AND archived_at IS NULL`,
+      [packageId, actor.organizationId]
+    );
+    if (rows.length === 0) throw notFound('No tender workflow exists for that package yet.');
+    const workflowId = String(rows[0].id);
+    await this.assertWorkflowAccess(actor, workflowId);
+
+    const result = await this.sendClientForward(actor, workflowId, {
+      items: input.conflicts,
+      render: renderConflictForwardEmail,
+      recordItems: (forwardMessageId) => this.recordConflictForwardItems(forwardMessageId, input),
+      clientEmail: input.clientEmail, clientName: input.clientName, note: input.note
+    });
+
+    return { ...result, conflicts_forwarded: input.conflicts.length, workflow_id: workflowId };
+  }
+
+  /** What this forward carried, at conflict grain and with the text exactly as sent. */
+  private async recordConflictForwardItems(forwardMessageId: string, input: {
+    conflicts: ForwardedConflict[]; digests: string[]; conflictIds: (string | null)[];
+  }): Promise<void> {
+    for (let index = 0; index < input.conflicts.length; index += 1) {
+      const item = input.conflicts[index];
+      await this.db.query(
+        `INSERT INTO conflict_forward_items
+           (forward_message_id, conflict_digest, seq, conflict_id,
+            ge_code, conflict_type, severity, spec_ref, drawing_ref, detail)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (forward_message_id, conflict_digest) DO NOTHING`,
+        [forwardMessageId, input.digests[index], index + 1, input.conflictIds[index] ?? null,
+         item.geCode, item.conflictType, item.severity, item.specRef, item.drawingRef, item.detail]
+      );
+    }
+  }
+
   async forwardRfiQuestionsToClient(actor: Actor, workflowId: string, input: {
     questionIds: string[]; clientEmail: string; clientName: string | null; note: string | null;
   }): Promise<Row> {
@@ -4106,6 +4175,7 @@ export class TenderPrepDatabase {
 
     const result = await this.sendClientForward(actor, workflowId, {
       items,
+      render: renderRfiForwardEmail,
       recordItems: async (forwardMessageId) => {
         // Both ledgers, before the send: comms.forward_items at MESSAGE grain (so the
         // Client's reply still resolves through commsDb.forwardedQueries) and

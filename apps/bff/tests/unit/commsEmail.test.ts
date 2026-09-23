@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
-  renderClientAnswerRelayEmail, renderRfiForwardEmail, renderRfiResponseEmail,
-  type ForwardedQuery, type RfiAnswer
+  renderClientAnswerRelayEmail, renderConflictForwardEmail, renderRfiForwardEmail,
+  renderRfiResponseEmail,
+  type ForwardedConflict, type ForwardedQuery, type RfiAnswer
 } from '../../src/commsEmail.js';
 import { findReplyToken, inboundEmailPayload } from '../../src/inboundEmail.js';
 
@@ -246,5 +247,105 @@ describe('renderRfiResponseEmail', () => {
     expect(email.html).toContain('&lt;script&gt;');
     expect(email.html).toContain('a &gt; b &amp; c &lt; d');
     expect(email.html).toContain('&lt;img');
+  });
+});
+
+function conflictItem(over: Partial<ForwardedConflict> = {}): ForwardedConflict {
+  return {
+    geCode: 'GE5',
+    conflictType: 'count_mismatch',
+    severity: 'high',
+    specRef: 'AHU schedule — North Zone',
+    drawingRef: 'M-101',
+    detail: 'The schedule lists 4 air handling units; drawing M-101 shows 3.',
+    ...over
+  };
+}
+
+describe('renderConflictForwardEmail', () => {
+  it('numbers the conflicts, because the answer refers to them by number', () => {
+    const email = renderConflictForwardEmail(
+      [conflictItem(), conflictItem({ drawingRef: 'M-104' })], context
+    );
+    expect(email.text).toContain('1. Count mismatch');
+    expect(email.text).toContain('2. Count mismatch');
+    expect(email.subject).toContain('2 tender document queries');
+  });
+
+  it('says "query" for one and "queries" for several', () => {
+    expect(renderConflictForwardEmail([conflictItem()], context).subject)
+      .toContain('1 tender document query');
+    expect(renderConflictForwardEmail([conflictItem(), conflictItem()], context).subject)
+      .toContain('2 tender document queries');
+  });
+
+  it('carries the subject marker, the second of three ways a reply finds its way home', () => {
+    const email = renderConflictForwardEmail([conflictItem()], context);
+    expect(email.subject).toContain(`[TPS-${TOKEN}]`);
+  });
+
+  it('shows BOTH references, because the answer is usually a revised document', () => {
+    const email = renderConflictForwardEmail([conflictItem()], context);
+    expect(email.text).toContain('Specification / schedule: AHU schedule — North Zone');
+    expect(email.text).toContain('Drawing: M-101');
+  });
+
+  it('omits a reference the pack does not state rather than printing an empty label', () => {
+    const email = renderConflictForwardEmail(
+      [conflictItem({ specRef: null, drawingRef: null })], context
+    );
+    expect(email.text).not.toContain('Specification / schedule:');
+    expect(email.text).not.toContain('Drawing:');
+    expect(email.text).toContain('The schedule lists 4 air handling units');
+  });
+
+  it('sends the detail verbatim — a paraphrase that loses a qualification is the failure', () => {
+    const detail = 'Schedule says 4 units "subject to final coordination"; drawing shows 3.';
+    const email = renderConflictForwardEmail([conflictItem({ detail })], context);
+    expect(email.text).toContain(detail);
+  });
+
+  it('escapes the detail into the HTML body, since none of it is trusted markup', () => {
+    const email = renderConflictForwardEmail(
+      [conflictItem({ detail: 'Schedule <b>4</b> & drawing 3' })], context
+    );
+    expect(email.html).toContain('Schedule &lt;b&gt;4&lt;/b&gt; &amp; drawing 3');
+    expect(email.html).not.toContain('<b>4</b>');
+  });
+
+  it('humanises the conflict type rather than leaking the enum', () => {
+    const email = renderConflictForwardEmail(
+      [conflictItem({ conflictType: 'missing_on_drawings' })], context
+    );
+    expect(email.text).toContain('Missing on drawings');
+    expect(email.text).not.toContain('missing_on_drawings');
+  });
+
+  it('still renders a conflict type it does not recognise', () => {
+    const email = renderConflictForwardEmail(
+      [conflictItem({ conflictType: 'client_boq_unmatched' })], context
+    );
+    expect(email.text).toContain('Client boq unmatched');
+  });
+
+  it('asks for the revised document, which is what the answer usually is', () => {
+    const email = renderConflictForwardEmail([conflictItem()], context);
+    expect(email.text).toMatch(/revised drawing or specification/);
+  });
+
+  it('names the missing link rather than silently offering one route back', () => {
+    const email = renderConflictForwardEmail(
+      [conflictItem()], { ...context, replyUrl: null }
+    );
+    expect(email.text).toContain('No in-app link could be issued');
+    expect(email.html).not.toContain('<a href');
+  });
+
+  it('omits the severity when the conflict does not carry one', () => {
+    const email = renderConflictForwardEmail(
+      [conflictItem({ severity: null })], context
+    );
+    expect(email.text).toContain('1. Count mismatch');
+    expect(email.text).not.toContain('priority');
   });
 });

@@ -1,14 +1,16 @@
 import { subjectMarker } from './inboundEmail.js';
 
 /**
- * The three emails the RFI loop sends: a collated set of subcontractor queries put to
- * the Client, the Client's answer relayed back to the firms that asked, and — since
- * issue #48 — the app's own answer sent straight back to the firm that raised it.
+ * The four emails on the client-forward rails: a collated set of subcontractor queries put
+ * to the Client, the Client's answer relayed back to the firms that asked, the app's own
+ * answer sent straight back to the firm that raised it (issue #48), and — since issue #66
+ * — the tender's own document conflicts put to the Client, which have no firm and no
+ * author behind them and so could not reuse the first.
  *
  * Pure functions returning `{ subject, html, text }`, with no I/O and no database — the
- * same split `ittEmail.ts` keeps, so all three are unit-tested in CI, which has neither.
+ * same split `ittEmail.ts` keeps, so all four are unit-tested in CI, which has neither.
  *
- * All three carry a `[TPS-<token>]` subject marker. It is not decoration: plus-addressing
+ * All four carry a `[TPS-<token>]` subject marker. It is not decoration: plus-addressing
  * does not survive every mail system, so the marker is the second of three ways a reply
  * finds its way back to the question it answers (see findReplyToken).
  */
@@ -300,6 +302,102 @@ export function renderRfiResponseEmail(
       <ol style="padding-left:20px">${htmlAnswers}</ol>
       ${context.portalUrl ? `<p>The full conversation is on <a href="${escapeHtml(context.portalUrl)}">your pricing page</a>.</p>` : ''}
       <p>If anything is still unclear, reply to this email and we will look into it.</p>
+      ${signoff ? `<p style="white-space:pre-wrap">${escapeHtml(signoff)}</p>` : ''}
+    </div>`.trim();
+
+  return { subject, html, text };
+}
+
+export interface ForwardedConflict {
+  /** The NRM1 group element the conflict sits in, e.g. "GE5". */
+  geCode: string;
+  /** count_mismatch | size_mismatch | spec_mismatch | missing_on_drawings | not_in_schedule */
+  conflictType: string;
+  severity: string | null;
+  /** Where each side of the disagreement was found, when the pack names it. */
+  specRef: string | null;
+  drawingRef: string | null;
+  detail: string;
+}
+
+/** "count_mismatch" reads as jargon to an employer; "Count mismatch" does not. The
+ *  vocabulary is closed (agents/conflict_finder._CONFLICT_TYPES), but an unknown value is
+ *  still rendered rather than dropped — a conflict nobody can name is still a question. */
+function conflictTypeLabel(type: string): string {
+  const spaced = type.replace(/_/g, ' ').trim();
+  if (!spaced) return 'Discrepancy';
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+/**
+ * The tender's own drawing/specification conflicts put to the Client.
+ *
+ * Deliberately NOT renderRfiForwardEmail with different words. That email forwards
+ * something a named person at a named firm wrote, and says who, because who asked changes
+ * how much context the Client needs. A conflict has no author: the app found it by
+ * cross-checking the employer's own drawings against their own schedules. Reusing
+ * `ForwardedQuery` would have meant inventing a firm and an author for every row.
+ *
+ * Both sides of the disagreement are shown with their references, because the Client's
+ * answer is usually a revised document and they need to know which one. The detail is the
+ * app's own wording and is sent verbatim — a paraphrase that loses a qualification is the
+ * failure this loop exists to prevent, the same rule the RFI forward follows.
+ */
+export function renderConflictForwardEmail(
+  conflicts: ForwardedConflict[], context: ForwardEmailContext
+): RenderedEmail {
+  const tender = context.tenderName ?? 'the tender';
+  const reference = context.tenderReference ? ` (${context.tenderReference})` : '';
+  const count = conflicts.length;
+  const noun = count === 1 ? 'query' : 'queries';
+  const subject = `${count} tender document ${noun} — ${tender}${reference} ${subjectMarker(context.replyToken)}`;
+
+  const intro = count === 1
+    ? `While reviewing the tender documents for ${tender}${reference} we have identified the following discrepancy, and would be grateful for your clarification.`
+    : `While reviewing the tender documents for ${tender}${reference} we have identified the following ${count} discrepancies, and would be grateful for your clarification.`;
+
+  const replyInstruction = context.replyUrl
+    ? 'You can answer by replying to this email, or by opening the link below. If a revised drawing or specification resolves any of these, please attach it.'
+    : 'Please answer by replying to this email, attaching any revised drawing or specification. (No in-app link could be issued for this message.)';
+
+  const signoff = context.estimatorName
+    ? `${context.estimatorName}${context.organizationName ? `\n${context.organizationName}` : ''}`
+    : context.organizationName ?? '';
+
+  const heading = (conflict: ForwardedConflict): string => {
+    const severity = conflict.severity ? ` (${conflict.severity} priority)` : '';
+    return `${conflictTypeLabel(conflict.conflictType)}${severity}`;
+  };
+
+  const textConflicts = conflicts.map((conflict, index) => [
+    `${index + 1}. ${heading(conflict)}`,
+    conflict.specRef ? `   Specification / schedule: ${conflict.specRef}` : null,
+    conflict.drawingRef ? `   Drawing: ${conflict.drawingRef}` : null,
+    '',
+    conflict.detail.split('\n').map((line) => `   ${line}`).join('\n'),
+    ''
+  ].filter((line) => line !== null).join('\n')).join('\n');
+
+  const text = [
+    intro, '', textConflicts, replyInstruction,
+    context.replyUrl ? `\n${context.replyUrl}\n` : '',
+    signoff ? `\n${signoff}` : ''
+  ].join('\n');
+
+  const htmlConflicts = conflicts.map((conflict) => `
+    <li style="margin-bottom:18px">
+      <div><strong>${escapeHtml(heading(conflict))}</strong></div>
+      ${conflict.specRef ? `<div style="color:#6b7280;font-size:13px">Specification / schedule: ${escapeHtml(conflict.specRef)}</div>` : ''}
+      ${conflict.drawingRef ? `<div style="color:#6b7280;font-size:13px">Drawing: ${escapeHtml(conflict.drawingRef)}</div>` : ''}
+      <div style="white-space:pre-wrap;margin-top:8px">${escapeHtml(conflict.detail)}</div>
+    </li>`).join('');
+
+  const html = `
+    <div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;font-size:14px;line-height:1.5;color:#111827">
+      <p>${escapeHtml(intro)}</p>
+      <ol style="padding-left:20px">${htmlConflicts}</ol>
+      <p>${escapeHtml(replyInstruction)}</p>
+      ${context.replyUrl ? `<p><a href="${escapeHtml(context.replyUrl)}">Answer these queries</a></p>` : ''}
       ${signoff ? `<p style="white-space:pre-wrap">${escapeHtml(signoff)}</p>` : ''}
     </div>`.trim();
 
