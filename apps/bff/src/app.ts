@@ -586,6 +586,48 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       const input = body(request, z.object({ notificationIds: z.array(uuid).max(500).default([]) }));
       return tpDb.markNotificationsRead(actor, input.notificationIds);
     });
+
+    // ── Conflicts raised with the Client (BuildFlow issue #66) ──────────────────
+    //
+    // The estimator reads conflicts on BuildFlow's Conflicts tab; sending them should not
+    // mean leaving it. Same direction and same bearer as the bell above, for the same
+    // reason: internal Docker network, caller-supplied identity, and the two applications
+    // share `public.bf_users` / `public.bf_organizations`, so the ids match by
+    // construction. `forwardConflictsToClient` re-checks the workflow against the claimed
+    // organisation, because the bearer vouches for the caller and not for the person.
+    //
+    // The CONTENT travels, not ids: agents/conflict_finder destroys and rebuilds
+    // bf_ge_conflicts on every run, so what was sent has to be snapshotted here or it is
+    // unreadable after the client's answer prompts the next re-import.
+    app.post('/internal/conflicts/client-forward', async (request) => {
+      const actor = callerActor(request);
+      const input = body(request, z.object({
+        packageId: uuid,
+        clientEmail: z.string().email(),
+        clientName: z.string().trim().min(1).max(200).nullable().default(null),
+        note: z.string().trim().max(4000).nullable().default(null),
+        conflicts: z.array(z.object({
+          digest: z.string().trim().min(8).max(128),
+          conflictId: uuid.nullable().default(null),
+          geCode: z.string().trim().min(1).max(32),
+          conflictType: z.string().trim().min(1).max(64),
+          severity: z.string().trim().max(32).nullable().default(null),
+          specRef: z.string().trim().max(500).nullable().default(null),
+          drawingRef: z.string().trim().max(500).nullable().default(null),
+          detail: z.string().trim().min(1).max(8000)
+        })).min(1).max(100)
+      }));
+
+      return tpDb.forwardConflictsToClient(actor, input.packageId, {
+        conflicts: input.conflicts.map((row) => ({
+          geCode: row.geCode, conflictType: row.conflictType, severity: row.severity,
+          specRef: row.specRef, drawingRef: row.drawingRef, detail: row.detail
+        })),
+        digests: input.conflicts.map((row) => row.digest),
+        conflictIds: input.conflicts.map((row) => row.conflictId),
+        clientEmail: input.clientEmail, clientName: input.clientName, note: input.note
+      });
+    });
   }
 
   await app.register(async (protectedApi) => {
