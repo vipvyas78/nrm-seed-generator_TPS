@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { renderAddendumEmail, summariseChanges, type AddendumEmailContext } from './addendumEmail.js';
 import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
 import type { BuildflowCommsAttachmentsClient } from './buildflowCommsAttachmentsClient.js';
 import { proposedPackages, type BuildflowAddendumDeltaClient }
@@ -4790,6 +4791,225 @@ export class TenderPrepDatabase {
       );
       return updated;
     });
+  }
+
+  /**
+   * Send the approved addendum to every subcontractor still in the running.
+   *
+   * RECIPIENTS ARE DERIVED, NEVER CHOSEN — the same rule `relayClientAnswer` states for the
+   * client loop. A firm qualifies by having actually received the ORIGINAL ITT for an
+   * INCLUDED package (`itt_dispatch.email_status = 'sent'`) and not having declined
+   * (`response <> 'decline'`). A firm that never received the original ITT has nothing to
+   * be issued a revision OF, and a declined firm has nothing left to revise.
+   *
+   * A firm selected on two included packages gets two dispatch rows and two emails, one per
+   * package, because the content genuinely differs — `changeSummary` and the document
+   * bundle are per package, and merging them would either drop one package's changes or
+   * force a firm pricing only one package to read about the other's.
+   *
+   * THE UNATTRIBUTED BUCKET IS NEVER SENT TO ANYONE. It carries no `wp_code`, so it has no
+   * shortlist and no `itt_dispatch` row to derive a recipient from — there is nobody to
+   * send it to. It stays on the addendum record as a flag for the estimator; being
+   * unreachable by this method is the honest outcome for work the pipeline could not
+   * attribute to a package, not a bug to route around.
+   *
+   * CLAIM-BEFORE-SEND, the `itt_reminders` / `rfi_responses` pattern: the row is written
+   * 'pending' before the email leaves, so a crash mid-send leaves evidence rather than
+   * silence. Re-issuing after a clean run sends nothing new — the UNIQUE index and the
+   * `ON CONFLICT` in `claimAddendumDispatch` only re-arm a row that previously `failed` or
+   * was `skipped_no_email`.
+   */
+  async issueAddendum(actor: Actor, addendumId: string): Promise<Row> {
+    const [addendum] = await this.db.query<Row>(
+      `SELECT a.*, w.organization_id::text AS organization_id
+         FROM addenda a JOIN workflows w ON w.id = a.workflow_id
+        WHERE a.id = $1 AND w.organization_id = $2 AND w.archived_at IS NULL`,
+      [addendumId, actor.organizationId]
+    );
+    if (!addendum) throw notFound('That addendum no longer exists.');
+    // 'issued' is allowed as well as 'approved' — this method is meant to be called again.
+    // A send that FAILED needs a retry, and claimAddendumDispatch is what makes a repeat
+    // call safe: a row that already sent is never re-armed, so re-issuing an addendum that
+    // went out cleanly the first time sends nothing new.
+    if (!['approved', 'issued'].includes(String(addendum.status))) {
+      throw conflict(`This addendum is ${String(addendum.status)} and cannot be issued.`);
+    }
+    const workflowId = String(addendum.workflow_id);
+
+    const packages = await this.db.query<Row>(
+      `SELECT * FROM addendum_packages WHERE addendum_id = $1 AND included AND NOT unattributed`,
+      [addendumId]
+    );
+    if (packages.length === 0) {
+      throw conflict('No included package can be issued to — everything included is unattributed.');
+    }
+    const packageByName = new Map(packages.map((p) => [String(p.package_name), p]));
+
+    // A firm who received the ORIGINAL ITT for an included package and has not declined.
+    // Scoped through addendum_packages, not read off shortlists directly, so an UNTICKED
+    // package sends nothing even though its shortlist still exists.
+    const recipients = await this.db.query<Row>(
+      `SELECT se.id::text AS shortlist_entry_id, se.subcontractor_id::text AS subcontractor_id,
+              sl.package_name,
+              COALESCE(sl.revised_tender_return_deadline, ld.tender_return_deadline,
+                       sl.tender_return_deadline)::text AS deadline
+         FROM addendum_packages ap
+         JOIN shortlists sl ON sl.workflow_id = $2 AND sl.package_name = ap.package_name
+         JOIN shortlist_entries se ON se.shortlist_id = sl.id AND se.selected
+         JOIN itt_dispatch d ON d.shortlist_entry_id = se.id
+         LEFT JOIN itt_letter_details ld ON ld.workflow_id = sl.workflow_id
+        WHERE ap.addendum_id = $1 AND ap.included AND NOT ap.unattributed
+          AND d.email_status = 'sent'
+          AND (d.response IS NULL OR d.response <> 'decline')`,
+      [addendumId, workflowId]
+    );
+    if (recipients.length === 0) {
+      throw conflict('No subcontractor has been sent an ITT for any package this addendum affects.');
+    }
+
+    // Fetched once, keyed on THIS addendum's own takeoff_id — never the workflow's current
+    // one, which could have moved on to a later re-run by the time this sends. That is
+    // exactly what keeps a re-run from swapping the documents behind an already-issued link.
+    const bundles = this.bundles ? await this.bundles.bundlesFor(String(addendum.takeoff_id)) : [];
+    const completeBundleUrl = bundles.find((b) => b.wpCode === null)?.url ?? null;
+
+    const subcontractorIds = [...new Set(recipients.map((r) => String(r.subcontractor_id)))];
+    const contacts = new Map(
+      (await this.scms.getContactsForSubcontractors(subcontractorIds))
+        .map((c) => [String(c.subcontractor_id), c])
+    );
+
+    const tenderId = await this.tenderIdForWorkflow(workflowId);
+    const letterContext = await this.letterContextFor(actor, workflowId);
+    const tenderName = await this.tenderNameForWorkflow(workflowId);
+    const template = await this.addendumTemplateFor(actor.organizationId);
+    const config = await this.commsConfig(actor.organizationId, tenderId);
+    const from = this.testEmailOverride?.from ?? config.ittFromAddress;
+
+    let sent = 0, failed = 0, skippedNoEmail = 0;
+    const detail: Array<{ shortlistEntryId: string; packageName: string; status: string; error?: string }> = [];
+
+    for (const recipient of recipients) {
+      const packageName = String(recipient.package_name);
+      const pkg = packageByName.get(packageName);
+      if (!pkg) continue; // joined through addendum_packages above; defensive only
+
+      const shortlistEntryId = String(recipient.shortlist_entry_id);
+      const subcontractorId = String(recipient.subcontractor_id);
+      const contact = contacts.get(subcontractorId);
+      const realEmail = contact?.contact_email ? String(contact.contact_email) : null;
+      // Test mode redirects every send to a fixed inbox, the same rule confirmAndSendItt
+      // and sendOne follow, so the whole recipient list is exercised end-to-end.
+      const to = this.testEmailOverride?.to ?? realEmail;
+
+      const claim = await this.claimAddendumDispatch(addendumId, shortlistEntryId);
+      if (!claim) continue; // already sent, or claimed by a concurrent call — not re-sent
+
+      if (!to) {
+        skippedNoEmail += 1;
+        await this.settleAddendumDispatch(claim, { status: 'skipped_no_email' });
+        detail.push({ shortlistEntryId, packageName, status: 'skipped_no_email' });
+        continue;
+      }
+      if (!this.emailService) {
+        failed += 1;
+        await this.settleAddendumDispatch(claim, { status: 'failed', error: 'EmailService not configured in this environment' });
+        detail.push({ shortlistEntryId, packageName, status: 'failed', error: 'EmailService not configured in this environment' });
+        continue;
+      }
+
+      try {
+        const bundleUrl = bundles.find((b) => b.wpCode === pkg.wp_code)?.url ?? completeBundleUrl;
+        const deadline = recipient.deadline
+          ? new Date(`${String(recipient.deadline)}T00:00:00Z`).toLocaleDateString('en-GB', { timeZone: 'UTC' })
+          : 'the date given in your invitation';
+
+        const context: AddendumEmailContext = {
+          firmName: contact?.name ? String(contact.name) : 'your firm',
+          contactName: contact?.contact_name ? String(contact.contact_name) : null,
+          packageName,
+          tenderName,
+          addendumNumber: Number(addendum.seq),
+          changeSummary: summariseChanges({
+            itemsAdded: Number(pkg.items_added), itemsRemoved: Number(pkg.items_removed),
+            itemsChanged: Number(pkg.items_changed)
+          }),
+          tenderReturnDeadline: deadline,
+          documentsUrl: bundleUrl,
+          estimatorName: letterContext.estimatorName,
+          organizationName: letterContext.organizationName,
+          // The reply token is this dispatch row's own id — there is no comms.messages row
+          // behind an addendum send (unlike a reminder or an RFI, neither of which this is),
+          // so there is nothing else stable to key the subject marker on.
+          replyToken: claim
+        };
+        const rendered = renderAddendumEmail(template, context);
+        const subject = this.testEmailOverride
+          ? `[TEST → ${context.firmName} <${realEmail ?? 'no email on file'}>] ${rendered.subject}` : rendered.subject;
+
+        const result = await this.emailService.send({
+          from, to, replyTo: config.ittCommsAddress, subject, html: rendered.html, text: rendered.text
+        }) as { id?: string } | undefined;
+
+        await this.settleAddendumDispatch(claim, { status: 'sent', emailMessageId: result?.id ?? null });
+        sent += 1;
+        detail.push({ shortlistEntryId, packageName, status: 'sent' });
+      } catch (error) {
+        failed += 1;
+        const text = error instanceof Error ? error.message : 'Send failed';
+        await this.settleAddendumDispatch(claim, { status: 'failed', error: text });
+        detail.push({ shortlistEntryId, packageName, status: 'failed', error: text });
+      }
+    }
+
+    const [updated] = await this.db.query<Row>(
+      `UPDATE addenda SET status = 'issued', issued_at = COALESCE(issued_at, NOW()) WHERE id = $1 RETURNING *`,
+      [addendumId]
+    );
+    return { ...updated, sent, failed, skippedNoEmail, detail };
+  }
+
+  /** Inserts 'pending', or re-takes a row whose earlier attempt did not go out. A 'pending'
+   *  or 'sent' row matches neither branch, returns nothing, and so is never sent twice. */
+  private async claimAddendumDispatch(addendumId: string, shortlistEntryId: string): Promise<string | null> {
+    const [row] = await this.db.query<{ id: string }>(
+      `INSERT INTO addendum_dispatch (addendum_id, shortlist_entry_id, email_status, is_test)
+       VALUES ($1, $2, 'pending', $3)
+       ON CONFLICT (addendum_id, shortlist_entry_id)
+         DO UPDATE SET email_status = 'pending', email_error = NULL
+         WHERE addendum_dispatch.email_status IN ('failed', 'skipped_no_email')
+       RETURNING id::text AS id`,
+      [addendumId, shortlistEntryId, Boolean(this.testEmailOverride)]
+    );
+    return row?.id ?? null;
+  }
+
+  private async settleAddendumDispatch(dispatchId: string, outcome: {
+    status: 'sent' | 'failed' | 'skipped_no_email'; error?: string; emailMessageId?: string | null;
+  }): Promise<void> {
+    await this.db.query(
+      `UPDATE addendum_dispatch
+          SET email_status = $2, email_error = $3, email_message_id = $4, sent_at = NOW()
+        WHERE id = $1`,
+      [dispatchId, outcome.status, outcome.error ?? null, outcome.emailMessageId ?? null]
+    );
+  }
+
+  /** The organisation's own wording if it has set some, else the seeded default — the same
+   *  override rule `templateFor` in ittRemindersDb.ts already follows. */
+  private async addendumTemplateFor(organizationId: string): Promise<{ subject: string; bodyText: string }> {
+    const [row] = await this.db.query<Row>(
+      `SELECT subject, body_text FROM public.itt_addendum_templates
+        WHERE template_kind = 'addendum_issued' AND (organization_id = $1 OR organization_id IS NULL)
+        ORDER BY organization_id NULLS LAST LIMIT 1`,
+      [organizationId]
+    );
+    if (!row) {
+      // 097 seeds the global default, so this is a database that never ran it. Refuse
+      // rather than send an email whose words nobody chose.
+      throw new Error('No addendum_issued template is configured (public.itt_addendum_templates)');
+    }
+    return { subject: String(row.subject), bodyText: String(row.body_text) };
   }
 
   private async assertWorkflowAccess(actor: Actor, workflowId: string): Promise<void> {
