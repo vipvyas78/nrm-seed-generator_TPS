@@ -1194,8 +1194,8 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     //
     // The client sent revised documents, BuildFlow re-measured, and the subcontractors
     // holding the ITT are pricing a document set that no longer describes the job. These
-    // three routes are the estimator's half: see what changed, approve it, and (next) issue
-    // it. The packages BuildFlow's delta proposes are a proposal — the tick is the decision.
+    // four routes are the estimator's half: see what changed, approve it, and issue it. The
+    // packages BuildFlow's delta proposes are a proposal — the tick is the decision.
     protectedApi.get('/api/tender-prep/:workflowId/addenda', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));
       return tpDb.listAddenda(requireActor(request), workflowId);
@@ -1220,6 +1220,13 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
         })).min(1).max(200)
       }));
       return tpDb.approveAddendum(requireActor(request), addendumId, input);
+    });
+
+    // Recipients are derived (see issueAddendum's own comment), never supplied — the body
+    // carries only which addendum, exactly the shape confirmAndSendItt already has.
+    protectedApi.post('/api/tender-prep/addenda/:addendumId/issue', async (request) => {
+      const { addendumId } = params(request, z.object({ addendumId: uuid }));
+      return tpDb.issueAddendum(requireActor(request), addendumId);
     });
 
     protectedApi.post('/api/tender-prep/:workflowId/rfi/client-forward', async (request) => {
