@@ -5,6 +5,7 @@ import { api, TENDER_RETURN_MAX, type ConfirmIttResult, type IttDispatch, type I
 import { oidc, signIn } from './auth';
 import { CommsModal } from './comms';
 import { NotificationBell } from './notifications';
+import { AddendaButton } from './addendum';
 
 export function ErrorMessage({ error }: { error: unknown }) {
   return error ? <p className="error">{error instanceof Error ? error.message : 'Something went wrong'}</p> : null;
@@ -89,6 +90,9 @@ export function TenderPrepPage() {
   // Where the dashboard's "drafts waiting" badge lands (issue #48) — the same
   // Communications modal, opened straight onto its fourth tab.
   const openRfi = searchParams.get('rfi') === '1';
+  // Where an `addendum_approval_required` notification lands (tenderPrepDb.ts's
+  // addendumDeepLink) — opens the Addenda modal on that addendum directly.
+  const deepLinkAddendumId = searchParams.get('addendum');
 
   // A completed take-off launches the workflow with nobody in the app, so the page has
   // to look for one it never started. Polling while none exists means a page left open
@@ -180,6 +184,10 @@ export function TenderPrepPage() {
       <div className="step-header">
         <h2>Step {currentStep}: {STEP_TITLES[currentStep - 1]}</h2>
         <div className="button-row">
+          {/* Not scoped to one step — an addendum can be raised any time after ITTs are
+              out, and a subcontractor's revision has nothing to do with which step the
+              estimator happens to be looking at. */}
+          <AddendaButton workflowId={workflowId} initialAddendumId={deepLinkAddendumId} />
           {currentStep > 1 && <button className="secondary small" onClick={() => goToStep.mutate(currentStep - 1)} disabled={goToStep.isPending}>
             ← Back: {STEP_TITLES[currentStep - 2]}
           </button>}

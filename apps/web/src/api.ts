@@ -679,7 +679,7 @@ export type RfiClientForwardResult = ForwardResult & { questions_forwarded: numb
 export type AppNotification = {
   id: string;
   kind: 'subcontractor_rfi' | 'client_reply' | 'forward_failed' | 'unattributed_email'
-    | 'itt_response_detected' | 'rfi_review_required';
+    | 'itt_response_detected' | 'rfi_review_required' | 'addendum_approval_required';
   title: string;
   body: string | null;
   deep_link_path: string;
@@ -736,6 +736,114 @@ export type TenderSubmission = {
   aggregate_total?: number;
   board_approved_at?: string;
   dispatched_at?: string;
+};
+
+/**
+ * The tender addendum (BuildFlow issue #42/#68/#78) — raised on what changed in a
+ * revised take-off, decided here. `delta` is BuildFlow's own comparison, snapshotted at
+ * creation and never re-read (tenderPrepDb.ts's `createAddendum`) — the same rule
+ * IttEmailPack states for `public.takeoff_items`.
+ *
+ * `available: false` on `conflicts`/`documents`/the delta's own baseline_resolution
+ * means the comparison was NEVER MADE — render that distinctly from "nothing changed".
+ * A pairing whose `rung` is 'wording' is the identity ladder's last resort: it is a
+ * guess, not an identity, and should read as one.
+ */
+export type AddendumDeltaChange =
+  | { kind: 'unit'; before: string | null; after: string | null; before_quantity: number | null; after_quantity: number | null }
+  | { kind: 'now_measured'; before_quantity: null; after_quantity: number }
+  | { kind: 'no_longer_measured'; before_quantity: number; after_quantity: null }
+  // delta is a FRACTION (0.173 = +17.3%), and null when the baseline was 0.
+  | { kind: 'quantity'; before_quantity: number | null; after_quantity: number | null; delta: number | null };
+
+export type AddendumDeltaItemSummary = {
+  id: string; ge_code: string | null; element_code: string | null; clause_ref: string | null;
+  description: string | null; unit: string | null;
+  // null means UNMEASURED, never 0 — see now_measured/no_longer_measured above.
+  quantity: number | null;
+  work_package: string | null; measurement_method: string | null;
+};
+
+export type AddendumDeltaChangedPair = {
+  rung: 'clause_ref' | 'component_key' | 'classification' | 'wording';
+  change: AddendumDeltaChange;
+  item: AddendumDeltaItemSummary;
+  baseline: AddendumDeltaItemSummary;
+};
+
+export type AddendumDeltaPackage = {
+  work_package: string | null;
+  // No work package, or one work_package_config no longer holds — a thing for the
+  // estimator to decide, never a thing to silently drop.
+  unattributed: boolean;
+  added: number; removed: number; changed: number;
+};
+
+export type AddendumDeltaConflictRow = {
+  conflict_digest: string; ge_code: string | null; conflict_type: string; severity: string | null;
+  spec_ref: string | null; drawing_ref: string | null; detail: string | null; review_status: string | null;
+};
+
+export type AddendumDeltaDocument = { display_name: string; dropbox_file_id: string };
+
+export type AddendumDelta = {
+  baseline_takeoff_id: string | null;
+  baseline_resolution: 'tendered' | 'none' | 'unavailable';
+  items_added: number; items_removed: number; items_changed: number; items_unchanged: number;
+  packages: AddendumDeltaPackage[];
+  delta: {
+    added: AddendumDeltaItemSummary[];
+    removed: AddendumDeltaItemSummary[];
+    changed: AddendumDeltaChangedPair[];
+  };
+  conflicts: { new: AddendumDeltaConflictRow[]; recurring: AddendumDeltaConflictRow[]; resolved: AddendumDeltaConflictRow[]; available: boolean };
+  documents: { added: AddendumDeltaDocument[]; changed: AddendumDeltaDocument[]; removed: AddendumDeltaDocument[]; available: boolean };
+  rung_mix: Record<string, number>;
+};
+
+/** One row of `tps.addendum_packages` — `proposed` is what BuildFlow's delta derived,
+ *  `included` is the estimator's own tick, kept apart deliberately so a later reviewer
+ *  can see where they differed. */
+export type AddendumPackageRow = {
+  addendum_id: string; package_name: string; wp_code: string | null;
+  proposed: boolean; included: boolean;
+  items_added: number; items_removed: number; items_changed: number;
+  unattributed: boolean;
+  revised_return_deadline: string | null;
+};
+
+export type Addendum = {
+  id: string; workflow_id: string; seq: number;
+  takeoff_id: string; baseline_takeoff_id: string | null; package_version_id: string | null;
+  status: 'draft' | 'awaiting_approval' | 'approved' | 'issued' | 'cancelled';
+  delta: AddendumDelta;
+  created_by: string | null; created_at: string;
+  approved_by: string | null; approved_at: string | null;
+  issued_at: string | null; cancelled_at: string | null;
+  packages: AddendumPackageRow[];
+};
+
+/** createAddendum's OWN `packages` field is camelCase and shaped differently from
+ *  listAddenda's — tenderPrepDb.ts's `proposedPackages()`, not `addendum_packages` rows.
+ *  Never share a type between them; the UI reads from listAddenda after create instead. */
+export type ProposedAddendumPackage = {
+  packageName: string; wpCode: string | null; unattributed: boolean;
+  added: number; removed: number; changed: number;
+};
+export type CreateAddendumResult = Omit<Addendum, 'packages'> & { packages: ProposedAddendumPackage[] };
+
+export type ApproveAddendumInput = {
+  // Every package row, ticked or not — an omitted row keeps its CURRENT value rather
+  // than being un-ticked, so a partial payload silently under-approves.
+  packages: Array<{ packageName: string; included: boolean; revisedReturnDeadline: string | null }>;
+};
+/** approveAddendum returns the updated addenda row alone, with no `packages` — refetch
+ *  listAddenda to see the tick take effect. */
+export type ApproveAddendumResult = Omit<Addendum, 'packages'>;
+
+export type IssueAddendumResult = Omit<Addendum, 'packages'> & {
+  sent: number; failed: number; skippedNoEmail: number;
+  detail: Array<{ shortlistEntryId: string; packageName: string; status: 'sent' | 'failed' | 'skipped_no_email'; error?: string }>;
 };
 
 // ── API Client ─────────────────────────────────────────────────────────────
@@ -928,6 +1036,18 @@ export const api = {
       method: 'POST', body: JSON.stringify({ notificationIds })
     }),
   commsTimeline: () => request<CommsTimeline>('/api/comms/timeline'),
+
+  // The addendum record, its approval and its issue (BuildFlow issue #42/#68/#78). TPS
+  // owns every decision here — BuildFlow only computed the delta these snapshot.
+  listAddenda: (workflowId: string) => request<Addendum[]>(`/api/tender-prep/${workflowId}/addenda`),
+  createAddendum: (workflowId: string) =>
+    request<CreateAddendumResult>(`/api/tender-prep/${workflowId}/addenda`, { method: 'POST' }),
+  approveAddendum: (addendumId: string, input: ApproveAddendumInput) =>
+    request<ApproveAddendumResult>(`/api/tender-prep/addenda/${addendumId}/approve`, {
+      method: 'POST', body: JSON.stringify(input)
+    }),
+  issueAddendum: (addendumId: string) =>
+    request<IssueAddendumResult>(`/api/tender-prep/addenda/${addendumId}/issue`, { method: 'POST' }),
 
   // Step 3: Comparative
   listComparative: (workflowId: string) => request<TenderComparative[]>(`/api/tender-prep/${workflowId}/comparative`),
