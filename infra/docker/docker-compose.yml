@@ -41,7 +41,11 @@ services:
       PORT: "3200"
       DATABASE_URL: postgresql://buildflow:buildflow@postgres:5432/buildflow
       DATABASE_SCHEMA: ${DATABASE_SCHEMA:-tps}
-      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:5175}
+      # The origin the SPA is SERVED from, which since issue #37 is BuildFlow's — TPS is
+      # mounted at /tps/ there so one session covers both apps (sessionStorage is keyed on
+      # the page origin). This is what CORS validates, and it is no longer :5175 even
+      # though that port still publishes the container for debugging TPS alone.
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:5173}
       TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-tps-dev-token-key-32-chars-min}
       AUTH_DISABLED: ${AUTH_DISABLED:-true}
       # TPS reads the SCMS module's schema directly for Step 4 shortlist candidates —
@@ -104,9 +108,11 @@ services:
         VITE_MAIN_APP_URL: ${VITE_MAIN_APP_URL:-http://localhost:5173}
         # Must match the parent platform's dev identity, or provisionActor mints a second
         # organization and every take-off-launched workflow is filtered out of view.
-        VITE_DEV_SUBJECT: ${VITE_DEV_SUBJECT:-local-user}
-        VITE_DEV_ORGANIZATION: ${VITE_DEV_ORGANIZATION:-local-org}
-        VITE_DEV_EMAIL: ${VITE_DEV_EMAIL:-dev@example.com}
+        # Empty by default since issue #37 — see Dockerfile.web's own note. Setting
+        # these in the environment (or in infra/docker/.env) restores the bypass.
+        VITE_DEV_SUBJECT: ${VITE_DEV_SUBJECT:-}
+        VITE_DEV_ORGANIZATION: ${VITE_DEV_ORGANIZATION:-}
+        VITE_DEV_EMAIL: ${VITE_DEV_EMAIL:-}
     ports:
       - "5175:8080"
     # nginx resolves the /tps-api/ proxy_pass hostname at startup, so bff-tps should
