@@ -19,6 +19,7 @@ import { handleTakeoffTendered } from '../../src/queues.js';
 import { ScmsReadDatabase } from '../../src/scmsReadDb.js';
 import { takeoffTenderedMessage, type TakeoffTendered } from '../../src/takeoffCompletion.js';
 import { TenderPrepDatabase } from '../../src/tenderPrepDb.js';
+import { testActor } from '../testActor.js';
 
 const { DATABASE_URL } = process.env;
 
@@ -109,7 +110,7 @@ describe('deriving a tender package list', () => {
     const msg = message({ workPackages: [{ wpCode: 'WP-DRYLINE', itemCount: 14 }] });
     try {
       const result = await tpDb.buildPackagesFromTakeoff(
-        { userId: msg.requestedBy, organizationId: msg.organizationId, subject: 'test' }, msg);
+        testActor({ userId: msg.requestedBy, organizationId: msg.organizationId, subject: 'test' }), msg);
 
       expect(result.selected).toBeGreaterThan(0);
       expect(result.byCondition.All).toBeGreaterThan(0);
@@ -143,7 +144,7 @@ describe('deriving a tender package list', () => {
     const { db, tpDb } = connect();
     const works = message({ tenderScope: 'works' });
     const dnb = message({ tenderScope: 'design_and_build', tenderId: works.tenderId, organizationId: works.organizationId });
-    const actor = { userId: works.requestedBy, organizationId: works.organizationId, subject: 'test' };
+    const actor = testActor({ userId: works.requestedBy, organizationId: works.organizationId, subject: 'test' });
     try {
       const first = await tpDb.buildPackagesFromTakeoff(actor, works);
       expect(first.byCondition['D&B']).toBeUndefined();
@@ -167,7 +168,7 @@ describe('deriving a tender package list', () => {
     const { db, tpDb } = connect();
     const dnb = message({ tenderScope: 'design_and_build' });
     const works = message({ tenderScope: 'works', tenderId: dnb.tenderId, organizationId: dnb.organizationId });
-    const actor = { userId: dnb.requestedBy, organizationId: dnb.organizationId, subject: 'test' };
+    const actor = testActor({ userId: dnb.requestedBy, organizationId: dnb.organizationId, subject: 'test' });
     try {
       await tpDb.buildPackagesFromTakeoff(actor, dnb);
       const [dnbRow] = await db.query<{ id: string }>(
@@ -189,7 +190,7 @@ describe('deriving a tender package list', () => {
   it('a rebuild keeps the route a reviewer chose', async () => {
     const { db, tpDb } = connect();
     const msg = message();
-    const actor = { userId: msg.requestedBy, organizationId: msg.organizationId, subject: 'test' };
+    const actor = testActor({ userId: msg.requestedBy, organizationId: msg.organizationId, subject: 'test' });
     try {
       await tpDb.buildPackagesFromTakeoff(actor, msg);
       await db.query(
@@ -234,7 +235,7 @@ describe('deriving a tender package list', () => {
       `SELECT count(*) AS n FROM package_config WHERE project_id IS NULL`);
     try {
       await tpDb.buildPackagesFromTakeoff(
-        { userId: msg.requestedBy, organizationId: msg.organizationId, subject: 'test' }, msg);
+        testActor({ userId: msg.requestedBy, organizationId: msg.organizationId, subject: 'test' }), msg);
       const after = await db.query<{ n: string }>(
         `SELECT count(*) AS n FROM package_config WHERE project_id IS NULL`);
       expect(after[0].n).toBe(before[0].n);

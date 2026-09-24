@@ -1341,10 +1341,25 @@ export class TenderPrepDatabase {
   // ── Workflows ─────────────────────────────────────────────────────────────
 
   /** Every workflow the caller's organization can see, most recently updated first. */
+  /**
+   * The workflows this person may see.
+   *
+   * A LIST, so the scope gate in `auth.ts` cannot help — it resolves a tender from a
+   * route parameter, and there is none here. So the visibility rule is applied in the
+   * query, by the same `public.bf_effective_tender_role` function the gate calls: an L4
+   * sees every tender in the organisation, everybody else sees what they were assigned.
+   *
+   * The join is INNER on purpose. A workflow whose package or tender has gone is a
+   * workflow nobody can open anyway, and listing it would offer a card that 404s.
+   */
   async listWorkflows(actor: Actor): Promise<Row[]> {
     return this.db.query(
-      `SELECT * FROM workflows WHERE organization_id = $1 AND archived_at IS NULL ORDER BY updated_at DESC`,
-      [actor.organizationId]
+      `SELECT w.* FROM workflows w
+         JOIN public.bf_takeoff_packages p ON p.id = w.package_id
+        WHERE w.organization_id = $1 AND w.archived_at IS NULL
+          AND public.bf_effective_tender_role(p.tender_id, $2) IS NOT NULL
+        ORDER BY w.updated_at DESC`,
+      [actor.organizationId, actor.userId]
     );
   }
 

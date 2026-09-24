@@ -25,6 +25,7 @@ import type { EmailService } from '../../src/emailService.js';
 import type { ScmsReadDatabase } from '../../src/scmsReadDb.js';
 import { TenderPrepDatabase } from '../../src/tenderPrepDb.js';
 import type { Actor } from '../../src/types.js';
+import { testActor } from '../testActor.js';
 
 const { DATABASE_URL } = process.env;
 
@@ -164,7 +165,7 @@ describe('issuing a tender addendum', () => {
       undefined, undefined // rfiDb, addendumDelta
     );
     const tpDb = make(null);
-    const actor: Actor = { userId, organizationId, subject: 'estimator', email: 'estimator@example.test' };
+    const actor: Actor = testActor({ userId, organizationId, subject: 'estimator', email: 'estimator@example.test' });
 
     const cleanup = async () => {
       await db.query(`DELETE FROM addendum_dispatch WHERE addendum_id = $1`, [addendum.id]);

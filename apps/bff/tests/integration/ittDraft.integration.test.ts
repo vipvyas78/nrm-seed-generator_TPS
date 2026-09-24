@@ -25,6 +25,7 @@ import { Database } from '../../src/db.js';
 import { ScmsReadDatabase } from '../../src/scmsReadDb.js';
 import { TenderPrepDatabase } from '../../src/tenderPrepDb.js';
 import type { Actor } from '../../src/types.js';
+import { testActor } from '../testActor.js';
 
 const { DATABASE_URL, BUILDFLOW_BASE_URL, BUILDFLOW_DOCUMENT_LINKS_TOKEN } = process.env;
 
@@ -50,7 +51,7 @@ describe('draftIttEmail', () => {
       db, new ScmsReadDatabase(db, config.SCMS_SCHEMA), new BoqReadDatabase(db),
       undefined, undefined, undefined, bundles
     );
-    const actor: Actor = { userId: 'itt-draft-test', organizationId: ORGANIZATION_ID, subject: 'itt-draft-test' };
+    const actor: Actor = testActor({ userId: 'itt-draft-test', organizationId: ORGANIZATION_ID, subject: 'itt-draft-test' });
 
     try {
       const draft = await tpDb.draftIttEmail(actor, WORKFLOW_ID, PACKAGE_NAME);

@@ -24,6 +24,7 @@ import { Database } from '../../src/db.js';
 import { ScmsReadDatabase } from '../../src/scmsReadDb.js';
 import { TenderPrepDatabase } from '../../src/tenderPrepDb.js';
 import type { Actor } from '../../src/types.js';
+import { testActor } from '../testActor.js';
 
 const { DATABASE_URL } = process.env;
 
@@ -44,7 +45,7 @@ describe('previewIttEmail', () => {
     const config = loadWorkerConfig({ ...process.env, REDIS_URL: 'redis://unused:6379' });
     const db = new Database(config);
     const tpDb = new TenderPrepDatabase(db, new ScmsReadDatabase(db, config.SCMS_SCHEMA), new BoqReadDatabase(db));
-    const actor: Actor = { userId: 'itt-preview-test', organizationId: ORGANIZATION_ID, subject: 'itt-preview-test' };
+    const actor: Actor = testActor({ userId: 'itt-preview-test', organizationId: ORGANIZATION_ID, subject: 'itt-preview-test' });
 
     try {
       const { subject, html, text, attachments } = await tpDb.previewIttEmail(actor, {

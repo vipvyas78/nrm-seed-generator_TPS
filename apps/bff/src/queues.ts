@@ -6,17 +6,17 @@ import {
   type TakeoffCompletion, type TakeoffTendered
 } from './takeoffCompletion.js';
 import type { TenderPrepDatabase } from './tenderPrepDb.js';
-import type { Actor } from './types.js';
+import { systemActor, type Actor } from './types.js';
 
 export { TAKEOFF_COMPLETION_QUEUE, TAKEOFF_TENDER_QUEUE };
 
 /** Same reasoning as handleTakeoffCompleted's: the actor is provenance, built from the message. */
 function actorFor(message: { requestedBy: string; organizationId: string; takeoffId: string }): Actor {
-  return {
+  return systemActor({
     userId: message.requestedBy,
     organizationId: message.organizationId,
     subject: `buildflow-takeoff-${message.takeoffId}`
-  };
+  });
 }
 
 /**
@@ -47,11 +47,11 @@ export async function handleTakeoffCompleted(
   job: Pick<Job, 'data'>, tpDb: TenderPrepDatabase
 ): Promise<void> {
   const message: TakeoffCompletion = takeoffCompletionMessage.parse(job.data);
-  const actor: Actor = {
+  const actor: Actor = systemActor({
     userId: message.requestedBy,
     organizationId: message.organizationId,
     subject: `buildflow-takeoff-${message.takeoffId}`
-  };
+  });
   await tpDb.launchFromTakeoff(actor, message);
 }
 

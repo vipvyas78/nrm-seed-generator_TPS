@@ -273,3 +273,16 @@ header nav.header-nav .link-button { margin-left: 0; }
 .query-icon:hover { text-decoration: none; }
 .query-icon.is-outstanding { color: #d97706; }
 .query-icon .query-count { font-size: .65rem; font-weight: 600; vertical-align: super; }
+
+/* Issue #37: the signed-in identity and its authorisation level.
+   Written in this file's own literal palette rather than BuildFlow's custom properties —
+   TPS defines none, and borrowing names that do not exist here would render an
+   unstyled badge on a dark header. The level CODE is the label, never colour alone. */
+.session-identity { display: inline-flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 0.875rem; }
+.level-badge {
+  border-radius: 999px; padding: 1px 7px; font-size: 0.7rem; font-weight: 700;
+  background: #334155; color: #cbd5e1;
+}
+.level-badge.level-l4 { background: #1d4ed8; color: #dbeafe; }
+.level-badge.level-l3 { background: #15803d; color: #dcfce7; }
+.level-badge.level-l2 { background: #334155; color: #cbd5e1; }
