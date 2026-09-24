@@ -23,7 +23,14 @@ export function AppShell() {
   const [signingIn, setSigningIn] = useState(false);
   // Issue #37. `retry: false` because a 401 here is an answer, not a failure — somebody
   // reached TPS without a session, and asking again does not change that.
-  const session = useQuery({ queryKey: ['session'], queryFn: () => api.session(), retry: false });
+  //
+  // The response is checked for a LEVEL rather than trusted for being present. A body
+  // that is not a session — `[]` from a stub, an HTML error page from a proxy, a shape
+  // from a future version — is still truthy, and `authorisationLevel.toLowerCase()` on
+  // it throws during render, which white-screens the whole shell rather than losing one
+  // badge. Anything without a level reads as "no session", which is the safe direction.
+  const sessionQuery = useQuery({ queryKey: ['session'], queryFn: () => api.session(), retry: false });
+  const session = typeof sessionQuery.data?.authorisationLevel === 'string' ? sessionQuery.data : undefined;
   return <main className="shell">
     <header>
       <Link to="/" className="brand">BuildFlow</Link>
@@ -38,13 +45,13 @@ export function AppShell() {
             needs to see why without asking. There is no sign-out here — BuildFlow owns
             the session, and a button that ended it from this shell would leave the other
             one holding a token it thinks is live. */}
-        {session.data && <span className="session-identity" title={`Authorisation level ${session.data.authorisationLevel}`}>
-          {session.data.displayName ?? session.data.email}
-          <span className={`level-badge level-${session.data.authorisationLevel.toLowerCase()}`}>
-            {session.data.authorisationLevel}
+        {session && <span className="session-identity" title={`Authorisation level ${session.authorisationLevel}`}>
+          {session.displayName ?? session.email}
+          <span className={`level-badge level-${session.authorisationLevel.toLowerCase()}`}>
+            {session.authorisationLevel}
           </span>
         </span>}
-        {oidc && !session.data && <button className="link-button" disabled={signingIn} onClick={() => { setSigningIn(true); void signIn(); }}>Sign in</button>}
+        {oidc && !session && <button className="link-button" disabled={signingIn} onClick={() => { setSigningIn(true); void signIn(); }}>Sign in</button>}
       </nav>
     </header>
     <Outlet />
