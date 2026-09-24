@@ -319,6 +319,40 @@ export class CommsDatabase {
     return rows[0]?.id ?? null;
   }
 
+  /**
+   * The tender a comms message belongs to, for issue #37's scope gate.
+   *
+   * Here rather than in `routeAccess.ts` beside the other three resolvers because this
+   * file is the only one permitted to name a `comms.` table in SQL — see
+   * commsBoundary.test.ts, and the reason it gives.
+   *
+   * `workflow_id` is nullable: an inbound email nobody has attributed to a tender yet
+   * belongs to the organisation and to no tender, so this returns null and the gate
+   * falls back to the organisation check. That is the honest answer, not a gap.
+   */
+  async tenderIdForMessage(messageId: string): Promise<string | null> {
+    const rows = await this.db.query<{ tender_id: string | null }>(
+      `SELECT p.tender_id FROM comms.messages m
+         JOIN tps.workflows w ON w.id = m.workflow_id
+         JOIN public.bf_takeoff_packages p ON p.id = w.package_id
+        WHERE m.id = $1`,
+      [messageId]
+    );
+    return rows[0]?.tender_id ?? null;
+  }
+
+  /** As above, for a thread. Same nullable `workflow_id`, same meaning. */
+  async tenderIdForThread(threadId: string): Promise<string | null> {
+    const rows = await this.db.query<{ tender_id: string | null }>(
+      `SELECT p.tender_id FROM comms.threads t
+         JOIN tps.workflows w ON w.id = t.workflow_id
+         JOIN public.bf_takeoff_packages p ON p.id = w.package_id
+        WHERE t.id = $1`,
+      [threadId]
+    );
+    return rows[0]?.tender_id ?? null;
+  }
+
   async threadsByIds(ids: string[]): Promise<Row[]> {
     if (ids.length === 0) return [];
     return this.db.query(`SELECT * FROM comms.threads WHERE id = ANY($1::uuid[])`, [ids]);

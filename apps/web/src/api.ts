@@ -1059,7 +1059,22 @@ export const api = {
   saveSubmission: (workflowId: string, input: { packages: unknown[]; aggregateTotal?: number }) =>
     request<TenderSubmission>(`/api/tender-prep/${workflowId}/submission`, { method: 'POST', body: JSON.stringify(input) }),
   boardApproveSubmission: (workflowId: string) =>
-    request<TenderSubmission>(`/api/tender-prep/${workflowId}/submission/approve`, { method: 'POST' })
+    request<TenderSubmission>(`/api/tender-prep/${workflowId}/submission/approve`, { method: 'POST' }),
+
+  /**
+   * Who is signed in, and what their authorisation level permits (issue #37).
+   *
+   * Read-only here. BuildFlow owns signing in, signing out and changing a password —
+   * `public.bf_user_sessions` is one table, and two applications minting sessions
+   * against it would be two password policies and two lockout counters.
+   */
+  session: () => request<TpsSession>('/api/auth/me')
+};
+
+export type TpsSession = {
+  id: string; email: string | null; displayName: string | null; organizationId: string;
+  authorisationLevel: string; canApprove: boolean; seesAllTenders: boolean;
+  mustChangePassword: boolean; isLocalSession: boolean;
 };
 
 // ── portalApi: the PUBLIC pricing page, no BuildFlow authentication ─────────────────

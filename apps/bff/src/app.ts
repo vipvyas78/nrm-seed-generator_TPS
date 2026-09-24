@@ -2,7 +2,10 @@ import cors from '@fastify/cors';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import { ZodError, z } from 'zod';
 import { buildAccessVerifier } from './accessJwt.js';
-import { buildAuthenticator, requireActor } from './auth.js';
+import { buildAccessGate, buildAuthenticator, requireActor } from './auth.js';
+import { registerAudit } from './audit.js';
+import { systemActor } from './types.js';
+import { routeKey, unclassifiedRoutes } from './routeAccess.js';
 import type { Config } from './config.js';
 import { CloudflareAccessAdmin } from './cloudflareAccess.js';
 import { CommsDatabase } from './commsDb.js';
@@ -80,12 +83,20 @@ function params<T extends z.ZodTypeAny>(request: FastifyRequest, schema: T): z.i
 declare module 'fastify' {
   interface FastifyInstance {
     tps: { config: Config; db: Database; tpDb: TenderPrepDatabase; scmsDb: ScmsReadDatabase };
+    /**
+     * Every route on the authenticated plugin, as `METHOD /template` (issue #37).
+     * Collected by an `onRoute` hook inside that plugin; read by the boot check below
+     * and by routeAccess.test.ts, which fails the build on anything unclassified.
+     */
+    authenticatedRoutes: string[];
   }
 }
 
 export async function createApp(config: Config): Promise<FastifyInstance> {
   const app = Fastify({ logger: { level: config.LOG_LEVEL } });
   const db = new Database(config);
+  const authenticatedRoutes: string[] = [];
+  app.decorate('authenticatedRoutes', authenticatedRoutes);
   const scmsDb = new ScmsReadDatabase(db, config.SCMS_SCHEMA);
   const boqDb = new BoqReadDatabase(db);
   const documentLinks = config.DROPBOX_ACCESS_TOKEN
@@ -187,6 +198,20 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   });
 
   app.addHook('onClose', async () => { await db.close(); });
+  // Issue #37. On the ROOT instance, so it also covers the unauthenticated surface: a
+  // subcontractor opening their portal link and an employer answering a query are
+  // activities on a tender, and neither has an actor by construction.
+  registerAudit(app, db);
+
+  // Say at boot which routes carry no authorisation classification. They still refuse an
+  // L2 at runtime (accessFor defaults to 'approval'), so this is not the guard — it is
+  // what tells an operator why a route nobody meant to gate is refusing them.
+  app.addHook('onReady', async () => {
+    for (const route of unclassifiedRoutes(app.authenticatedRoutes)) {
+      app.log.warn(`Route access: ${route} is not classified in routeAccess.ts and will require approval`);
+    }
+  });
+
   app.get('/health', async () => ({ status: 'ok', service: 'tps-bff' }));
 
   // ── Subcontractor pricing portal: PUBLIC routes, no BuildFlow authentication ────────
@@ -574,7 +599,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       }
       // `subject` is the OIDC subject and nothing here reads it; it is filled with a
       // constant rather than left blank so a row written under this path is recognisable.
-      return { ...identity.data, subject: 'buildflow-internal' };
+      return systemActor({ ...identity.data, subject: 'buildflow-internal' });
     };
 
     app.get('/internal/notifications', async (request) => {
@@ -635,7 +660,34 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   }
 
   await app.register(async (protectedApi) => {
+    // Issue #37. Registered before the routes below so it sees every one of them, and
+    // inside this plugin so it sees only them — the portal, the client-reply page,
+    // /internal/* and /scheduled/* carry their own gates and have no level to classify.
+    protectedApi.addHook('onRoute', (route) => {
+      const methods = Array.isArray(route.method) ? route.method : [route.method];
+      for (const method of methods) {
+        if (method === 'HEAD' || method === 'OPTIONS') continue;
+        authenticatedRoutes.push(routeKey(method, route.url));
+      }
+    });
     protectedApi.addHook('preHandler', buildAuthenticator(config, db));
+    // Both axes of the matrix: which tender this is about (new to TPS — every query in
+    // tenderPrepDb is scoped by organisation alone) and whether this person may sign
+    // off. See auth.ts.
+    protectedApi.addHook('preHandler', buildAccessGate(db, commsDb));
+
+    // The session, read-only. BuildFlow owns signing in and changing a password; TPS
+    // only needs to be able to say who is here and what they may do.
+    protectedApi.get('/api/auth/me', async (request) => {
+      const actor = requireActor(request);
+      return {
+        id: actor.userId, email: actor.email ?? null, displayName: actor.displayName ?? null,
+        organizationId: actor.organizationId, authorisationLevel: actor.authorisationLevel,
+        canApprove: actor.canApprove, seesAllTenders: actor.seesAllTenders,
+        mustChangePassword: Boolean(request.mustChangePassword),
+        isLocalSession: Boolean(actor.sessionId)
+      };
+    });
 
     // ── Workflow lifecycle ──────────────────────────────────────────────────
 

@@ -21,6 +21,9 @@ const FINAL_STEP = STEP_TITLES.length;
 
 export function AppShell() {
   const [signingIn, setSigningIn] = useState(false);
+  // Issue #37. `retry: false` because a 401 here is an answer, not a failure — somebody
+  // reached TPS without a session, and asking again does not change that.
+  const session = useQuery({ queryKey: ['session'], queryFn: () => api.session(), retry: false });
   return <main className="shell">
     <header>
       <Link to="/" className="brand">BuildFlow</Link>
@@ -31,7 +34,17 @@ export function AppShell() {
         {/* On every page, because a subcontractor's query is not about the page you
             happen to be on. */}
         <NotificationBell />
-        {oidc && <button className="link-button" disabled={signingIn} onClick={() => { setSigningIn(true); void signIn(); }}>Sign in</button>}
+        {/* The level is shown, not merely held: somebody whose send button refuses them
+            needs to see why without asking. There is no sign-out here — BuildFlow owns
+            the session, and a button that ended it from this shell would leave the other
+            one holding a token it thinks is live. */}
+        {session.data && <span className="session-identity" title={`Authorisation level ${session.data.authorisationLevel}`}>
+          {session.data.displayName ?? session.data.email}
+          <span className={`level-badge level-${session.data.authorisationLevel.toLowerCase()}`}>
+            {session.data.authorisationLevel}
+          </span>
+        </span>}
+        {oidc && !session.data && <button className="link-button" disabled={signingIn} onClick={() => { setSigningIn(true); void signIn(); }}>Sign in</button>}
       </nav>
     </header>
     <Outlet />

@@ -9,7 +9,7 @@ import { DropboxDocumentLinkProvider } from './documentLinkProvider.js';
 import { EmailService } from './emailService.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
 import { TenderPrepDatabase } from './tenderPrepDb.js';
-import type { Actor } from './types.js';
+import { systemActor, type Actor } from './types.js';
 
 const config = loadConfig();
 
@@ -67,11 +67,11 @@ for (const pkg of packages) {
     const orgRow = await db.one<{ organization_id: string }>(
       `SELECT organization_id FROM workflows WHERE id = $1`, [pkg.workflow_id]
     );
-    const actor: Actor = {
+    const actor: Actor = systemActor({
       userId: '00000000-0000-0000-0000-000000000001',
       organizationId: String(orgRow.organization_id),
       subject: 'send-test-itt-script'
-    };
+    });
     const result = await tpDb.confirmAndSendItt(actor, pkg.workflow_id, pkg.package_name);
     console.log(`\n${pkg.package_name}:`, result);
   } catch (error) {
