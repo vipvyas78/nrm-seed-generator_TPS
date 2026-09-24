@@ -18,6 +18,7 @@ import { loadWorkerConfig } from '../../src/config.js';
 import { Database } from '../../src/db.js';
 import { ScmsReadDatabase } from '../../src/scmsReadDb.js';
 import { TenderPrepDatabase } from '../../src/tenderPrepDb.js';
+import { testActor } from '../testActor.js';
 
 const { DATABASE_URL } = process.env;
 
@@ -53,7 +54,7 @@ describe('the tender return period', () => {
     );
     return {
       workflowId: String(workflow.id), packageName, tenderId, organizationId,
-      actor: { userId, organizationId, subject: 'test' }
+      actor: testActor({ userId, organizationId, subject: 'test' })
     };
   };
 

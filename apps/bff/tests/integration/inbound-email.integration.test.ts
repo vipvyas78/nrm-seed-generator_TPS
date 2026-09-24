@@ -24,6 +24,7 @@ import { inboundEmailPayload, subjectMarker, type InboundEmail } from '../../src
 import { ScmsReadDatabase } from '../../src/scmsReadDb.js';
 import { TenderPrepDatabase } from '../../src/tenderPrepDb.js';
 import type { Actor } from '../../src/types.js';
+import { testActor } from '../testActor.js';
 
 const { DATABASE_URL } = process.env;
 
@@ -48,7 +49,7 @@ describe('inbound email', () => {
   // parent owns and is entitled to enforce.
   const organizationId = randomUUID();
   const tenderId = randomUUID();
-  const actor: Actor = { userId: randomUUID(), organizationId, subject: 'buyer', email: 'buyer@novamerx.ai' };
+  const actor: Actor = testActor({ userId: randomUUID(), organizationId, subject: 'buyer', email: 'buyer@novamerx.ai' });
   const commsAddress = `acme-${organizationId.slice(0, 8)}-ittcomms@novamerx.ai`;
   const firmEmail = `estimator@${organizationId.slice(0, 8)}.test`;
 

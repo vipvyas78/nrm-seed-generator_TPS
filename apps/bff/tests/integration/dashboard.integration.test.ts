@@ -18,6 +18,7 @@ import { Database } from '../../src/db.js';
 import { ScmsReadDatabase } from '../../src/scmsReadDb.js';
 import { TenderPrepDatabase } from '../../src/tenderPrepDb.js';
 import type { Actor } from '../../src/types.js';
+import { testActor } from '../testActor.js';
 
 const { DATABASE_URL } = process.env;
 
@@ -38,7 +39,7 @@ describe('the tender dashboard', () => {
     const organizationId = randomUUID();
     const tenderId = randomUUID();
     const packageId = randomUUID();
-    const actor: Actor = { userId: randomUUID(), organizationId, subject: 'buyer', email: 'buyer@example.test' };
+    const actor: Actor = testActor({ userId: randomUUID(), organizationId, subject: 'buyer', email: 'buyer@example.test' });
     const accepted = randomUUID();
     const declined = randomUUID();
     const packageName = `Drylining ${packageId.slice(0, 8)}`;
@@ -119,7 +120,7 @@ describe('the tender dashboard', () => {
     const organizationId = randomUUID();
     const tenderId = randomUUID();
     const packageId = randomUUID();
-    const actor: Actor = { userId: randomUUID(), organizationId, subject: 'buyer', email: 'buyer@example.test' };
+    const actor: Actor = testActor({ userId: randomUUID(), organizationId, subject: 'buyer', email: 'buyer@example.test' });
     const packageName = `Roofing ${packageId.slice(0, 8)}`;
 
     try {

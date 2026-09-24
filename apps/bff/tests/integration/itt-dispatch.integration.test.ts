@@ -18,6 +18,7 @@ import { Database } from '../../src/db.js';
 import { ScmsReadDatabase } from '../../src/scmsReadDb.js';
 import { TenderPrepDatabase } from '../../src/tenderPrepDb.js';
 import type { Actor } from '../../src/types.js';
+import { testActor } from '../testActor.js';
 
 const { DATABASE_URL } = process.env;
 const PLACEHOLDER = '00000000-0000-0000-0000-000000000000';
@@ -38,7 +39,7 @@ describe('the Step 2 package list', () => {
     const { db, tpDb } = connect();
     const organizationId = randomUUID();
     const packageId = randomUUID();
-    const actor: Actor = { userId: randomUUID(), organizationId, subject: 'buyer' };
+    const actor: Actor = testActor({ userId: randomUUID(), organizationId, subject: 'buyer' });
     const suffix = packageId.slice(0, 8);
     const invited = `Invited ${suffix}`;
     const notPicked = `NotPicked ${suffix}`;

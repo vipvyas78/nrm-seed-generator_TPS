@@ -29,6 +29,7 @@ import { RfiDatabase } from '../../src/rfiDb.js';
 import { ScmsReadDatabase } from '../../src/scmsReadDb.js';
 import { TenderPrepDatabase } from '../../src/tenderPrepDb.js';
 import type { Actor } from '../../src/types.js';
+import { testActor } from '../testActor.js';
 
 const { DATABASE_URL } = process.env;
 
@@ -129,7 +130,7 @@ describe('the estimator RFI review loop', () => {
   }
 
   function actorFor(organizationId: string): Actor {
-    return { userId: randomUUID(), organizationId, subject: 'estimator', email: 'estimator@example.test' };
+    return testActor({ userId: randomUUID(), organizationId, subject: 'estimator', email: 'estimator@example.test' });
   }
 
   /** Files an inbound RFI message directly through commsDb — the shape a real portal
