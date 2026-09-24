@@ -5,7 +5,12 @@ body { font-family: system-ui, sans-serif; font-size: 14px; color: #111827; back
 .shell { min-height: 100vh; display: flex; flex-direction: column; }
 
 header { display: flex; align-items: center; gap: 12px; padding: 0 24px; height: 52px; background: #1e293b; color: #fff; }
-header .brand { font-weight: 700; font-size: 1.1rem; color: #fff; }
+/* The Novamerx wordmark rather than text. Sized by HEIGHT with width auto so the mark
+   keeps its proportions if the asset is ever replaced; `display: block` on the img
+   removes the inline-baseline gap that would push the 52px header's centre line off.
+   The font rules still style the alt text while the image loads or if it fails. */
+header .brand { font-weight: 700; font-size: 1.1rem; color: #fff; display: inline-flex; align-items: center; }
+header .brand img { display: block; height: 22px; width: auto; }
 header .header-sub { color: #94a3b8; font-size: 0.875rem; }
 .link-button { background: none; color: #93c5fd; border: none; padding: 0; cursor: pointer; font-size: 0.875rem; margin-left: auto; }
 
