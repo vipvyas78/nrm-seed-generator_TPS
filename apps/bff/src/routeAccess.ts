@@ -109,7 +109,20 @@ export const ROUTE_ACCESS: Record<string, RouteAccess> = {
   'POST /api/tender-prep/addenda/:addendumId/approve': 'approval',
   'POST /api/tender-prep/addenda/:addendumId/issue': 'approval',
 
-  // ── comparison and the bid itself
+  // ── the levelled quote comparison (issue #100). Opening it, noting a cell, adding an
+  // estimator row and keying in a manually-received return are all work; awarding the
+  // package writes trade_analysis and the draft tender_boq_lines, which is the act that
+  // leaves a mark on the firm's own bill — the same line the addenda/RFI approvals draw.
+  'GET /api/tender-prep/:workflowId/quote-comparisons': 'read',
+  'POST /api/tender-prep/:workflowId/quote-comparisons/:packageName/open': 'ordinary',
+  'GET /api/tender-prep/:workflowId/quote-comparisons/:packageName': 'read',
+  'PATCH /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/cells/:cellId': 'ordinary',
+  'POST /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/rows': 'ordinary',
+  'DELETE /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/rows/:rowId': 'ordinary',
+  'POST /api/tender-prep/:workflowId/quote-comparisons/:packageName/returns': 'ordinary',
+  'POST /api/tender-prep/:workflowId/quote-comparisons/:packageName/approve': 'approval',
+
+  // ── comparison and the bid itself (legacy tps.comparative screen, superseded above)
   'GET /api/tender-prep/:workflowId/comparative': 'read',
   'POST /api/tender-prep/:workflowId/comparative': 'ordinary',
   'GET /api/tender-prep/:workflowId/submission': 'read',

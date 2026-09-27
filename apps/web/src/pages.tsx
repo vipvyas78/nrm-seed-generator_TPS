@@ -6,6 +6,7 @@ import { oidc, signIn } from './auth';
 import { CommsModal } from './comms';
 import { NotificationBell } from './notifications';
 import { AddendaButton } from './addendum';
+import { QuoteComparisonPanel } from './quoteComparisonPanel';
 
 export function ErrorMessage({ error }: { error: unknown }) {
   return error ? <p className="error">{error instanceof Error ? error.message : 'Something went wrong'}</p> : null;
@@ -222,7 +223,7 @@ export function TenderPrepPage() {
       {currentStep === 1 && takeoff && <TakeoffSummary takeoff={takeoff} packageId={packageId} />}
       {currentStep === 1 && <Step1TenderLaunchPack workflowId={workflowId} />}
       {currentStep === 2 && <Step2IttDispatch workflowId={workflowId} initialThreadId={deepLinkThreadId} openRfi={openRfi} />}
-      {currentStep === 3 && <Step3Comparative workflowId={workflowId} />}
+      {currentStep === 3 && <QuoteComparisonPanel workflowId={workflowId} />}
       {currentStep === 4 && <Step4Submission workflowId={workflowId} />}
     </section>
   </div>;

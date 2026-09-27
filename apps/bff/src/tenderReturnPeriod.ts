@@ -65,3 +65,21 @@ export function deriveReturnDate(from: Date, value: number, unit: TenderReturnUn
 
 const iso = (d: Date): string =>
   `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+
+/**
+ * The SQL for the deadline actually IN FORCE for one package — rungs 0-2 of
+ * `TenderPrepDatabase.resolveReturnDeadline`'s precedence, never rung 3 (the return-period
+ * derivation): that rung is only valid alongside an explicit `asOf` and would make a
+ * stored comparison slide forward every day it is read, which `resolveReturnDeadline`'s
+ * own doc comment warns against for exactly this kind of read-only surface.
+ *
+ * `sl` names whichever table carries `revised_tender_return_deadline` and
+ * `tender_return_deadline` for one package (`shortlists` in every current caller); `ld`
+ * names `itt_letter_details`, the workflow-wide explicit override. Used three times now —
+ * ittRemindersDb.ts's automatic and manual reminder queries, and quoteComparisonDb.ts's
+ * readiness check — and extracted here rather than left a third copy, so the three can
+ * never quote a tenderer three different dates for the same package.
+ */
+export function knownReturnDeadlineSql(sl = 'sl', ld = 'ld'): string {
+  return `COALESCE(${sl}.revised_tender_return_deadline, ${ld}.tender_return_deadline, ${sl}.tender_return_deadline)`;
+}

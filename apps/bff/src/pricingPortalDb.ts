@@ -271,15 +271,24 @@ export class PricingPortalDatabase {
 
       await this.db.query(`DELETE FROM tps.tender_return_lines WHERE return_id = $1`, [ret.id], client);
       if (lines.length > 0) {
+        // seq/source_item_id/added_by_tenderer (migration 028) are carried through
+        // verbatim, not just the priced fields — the quote comparison (BuildFlow #100)
+        // aligns tenderers against each other on `seq`, an exact cross-tenderer key
+        // because every link for a package is snapshotted from the same ITT assembly, and
+        // needs `added_by_tenderer` to tell a tenderer's own extra line apart from one the
+        // ITT bill itself carried.
         await this.db.query(
           `INSERT INTO tps.tender_return_lines
-             (return_id, ge_code, element_code, description, quantity, unit, rate, total, status, note)
-           SELECT $1, ge, el, descr, qty, unit, rate, total, status, note
-             FROM unnest($2::text[], $3::text[], $4::text[], $5::numeric[], $6::text[], $7::numeric[], $8::numeric[], $9::text[], $10::text[])
-               AS t(ge, el, descr, qty, unit, rate, total, status, note)`,
-          [ret.id, lines.map((l) => l.ge_code), lines.map((l) => l.element_code), lines.map((l) => l.description),
-           lines.map((l) => l.quantity), lines.map((l) => l.unit), lines.map((l) => l.rate), lines.map((l) => l.total),
-           lines.map((l) => l.status), lines.map((l) => l.note)],
+             (return_id, seq, source_item_id, ge_code, element_code, description, quantity,
+              unit, rate, total, status, note, added_by_tenderer)
+           SELECT $1, seq, item, ge, el, descr, qty, unit, rate, total, status, note, added
+             FROM unnest($2::int[], $3::uuid[], $4::text[], $5::text[], $6::text[], $7::numeric[],
+                         $8::text[], $9::numeric[], $10::numeric[], $11::text[], $12::text[], $13::boolean[])
+               AS t(seq, item, ge, el, descr, qty, unit, rate, total, status, note, added)`,
+          [ret.id, lines.map((l) => l.seq), lines.map((l) => l.source_item_id), lines.map((l) => l.ge_code),
+           lines.map((l) => l.element_code), lines.map((l) => l.description), lines.map((l) => l.quantity),
+           lines.map((l) => l.unit), lines.map((l) => l.rate), lines.map((l) => l.total),
+           lines.map((l) => l.status), lines.map((l) => l.note), lines.map((l) => l.added_by_tenderer)],
           client
         );
       }

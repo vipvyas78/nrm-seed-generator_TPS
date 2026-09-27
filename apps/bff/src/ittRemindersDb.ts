@@ -8,6 +8,7 @@ import {
 } from './ittReminders.js';
 import { renderReminderEmail, type ReminderContext } from './reminderEmail.js';
 import type { ScmsReadDatabase } from './scmsReadDb.js';
+import { knownReturnDeadlineSql } from './tenderReturnPeriod.js';
 import type { Actor } from './types.js';
 
 type Row = Record<string, unknown>;
@@ -151,13 +152,11 @@ export class IttRemindersDatabase {
               sl.package_name, sl.workflow_id::text AS workflow_id,
               w.organization_id::text AS organization_id, w.package_id::text AS package_id,
               d.email_status, d.email_sent_at, d.response,
-              -- The precedence resolveReturnDeadline states, rung 0 first: an approved
-              -- addendum's revised date (migration 027) beats a human's workflow-wide date,
-              -- which beats the date stamped when this package's ITT first went out.
-              -- Without the first term, reminders chase against a deadline the tenderers
-              -- have already been told has moved.
-              COALESCE(sl.revised_tender_return_deadline, ld.tender_return_deadline,
-                       sl.tender_return_deadline)::text AS deadline,
+              -- knownReturnDeadlineSql: an approved addendum's revised date (migration
+              -- 027) beats a human's workflow-wide date, which beats the date stamped when
+              -- this package's ITT first went out. Without the first term, reminders chase
+              -- against a deadline the tenderers have already been told has moved.
+              ${knownReturnDeadlineSql()}::text AS deadline,
               ${SUBMITTED_SQL} AS submitted,
               cfg.confirm_interest_at_fraction, cfg.submit_tender_at_fraction
          FROM shortlists sl
@@ -480,8 +479,7 @@ export class IttRemindersDatabase {
               d.email_status, d.email_sent_at, d.response,
               -- Rung 0 first, exactly as above: a manual reminder must quote the same
               -- deadline the automatic one would.
-              COALESCE(sl.revised_tender_return_deadline, ld.tender_return_deadline,
-                       sl.tender_return_deadline)::text AS deadline,
+              ${knownReturnDeadlineSql()}::text AS deadline,
               ${SUBMITTED_SQL} AS submitted,
               NULL::numeric AS confirm_interest_at_fraction, NULL::numeric AS submit_tender_at_fraction
          FROM itt_dispatch d

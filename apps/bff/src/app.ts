@@ -26,6 +26,7 @@ import { BuildflowTenderPassagesClient } from './buildflowTenderPassagesClient.j
 import { DropboxDocumentLinkProvider } from './documentLinkProvider.js';
 import { EmailService } from './emailService.js';
 import { PricingPortalDatabase } from './pricingPortalDb.js';
+import { QuoteComparisonDatabase } from './quoteComparisonDb.js';
 import { RfiDatabase } from './rfiDb.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
 import { ITT_FROM_ADDRESS, TenderPrepDatabase } from './tenderPrepDb.js';
@@ -131,6 +132,9 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   // every recipient as blocked ('access_unconfigured') and the ITT sends exactly as it
   // did before this feature existed. See config.ts for what each variable gates.
   const portalDb = new PricingPortalDatabase(db);
+  // The levelled quote comparison (BuildFlow #100). Needs only the database, exactly as
+  // portalDb does — its spine is read from pricing_portal_lines, already written above.
+  const quoteDb = new QuoteComparisonDatabase(db);
   // The RFI message store. The `comms` schema is owned by novamerx-comms-worker; this is
   // the read/write half. Unconditional: it needs only the database, as portalDb does.
   const commsDb = new CommsDatabase(db);
@@ -174,7 +178,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const tpDb = new TenderPrepDatabase(
     db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, documentBundles,
     emailService, testEmailOverride, portalDb, accessAdmin, portalBaseUrl, config.PORTAL_LINK_TTL_DAYS,
-    mepBoq, commsDb, commsAttachments, config.CLIENT_LINK_TTL_DAYS, rfiDb, addendumDelta
+    mepBoq, commsDb, commsAttachments, config.CLIENT_LINK_TTL_DAYS, rfiDb, addendumDelta, quoteDb
   );
 
   // ITT reminders and the reading of a firm's emailed reply. Its own module rather than more
@@ -1309,7 +1313,95 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       return tpDb.reattributeCommsMessage(requireActor(request), messageId, input.workflowId);
     });
 
-    // ── Step 3: Comparative ─────────────────────────────────────────────────
+    // ── Step 3: the levelled quote comparison (BuildFlow #100) ──────────────
+    //
+    // Replaces the four-field tps.comparative screen below on the workflow wizard —
+    // migration 008 built that table's chain (tender_returns/tender_return_lines/
+    // trade_analysis/tender_boq_lines) for exactly this and it had gone unread ever
+    // since. The old table and its routes are left in place, unregistered by the new
+    // screen: dropping them for a feature being replaced would add risk for no gain.
+
+    const returnLineStatus = z.enum(['priced', 'included', 'excluded', 'not_addressed']);
+
+    protectedApi.get('/api/tender-prep/:workflowId/quote-comparisons', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.listQuoteComparisons(requireActor(request), workflowId);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/quote-comparisons/:packageName/open', async (request) => {
+      const { workflowId, packageName } = params(request, z.object({ workflowId: uuid, packageName: z.string().trim().min(1).max(200) }));
+      return tpDb.openQuoteComparison(requireActor(request), workflowId, packageName);
+    });
+
+    protectedApi.get('/api/tender-prep/:workflowId/quote-comparisons/:packageName', async (request) => {
+      const { workflowId, packageName } = params(request, z.object({ workflowId: uuid, packageName: z.string().trim().min(1).max(200) }));
+      return tpDb.getQuoteComparison(requireActor(request), workflowId, packageName);
+    });
+
+    protectedApi.patch('/api/tender-prep/:workflowId/quote-comparisons/:comparisonId/cells/:cellId', async (request) => {
+      const { workflowId, comparisonId, cellId } = params(request, z.object({ workflowId: uuid, comparisonId: uuid, cellId: uuid }));
+      const input = body(request, z.object({ estimatorNote: z.string().trim().max(4000).nullable() }));
+      return tpDb.updateQuoteComparisonCellNote(requireActor(request), workflowId, comparisonId, cellId, input.estimatorNote);
+    });
+
+    // An estimator's own row — e.g. the issue's own example, pricing a discrepancy in one
+    // tenderer's description as a separate item so the comparison stays like for like.
+    protectedApi.post('/api/tender-prep/:workflowId/quote-comparisons/:comparisonId/rows', async (request, reply) => {
+      const { workflowId, comparisonId } = params(request, z.object({ workflowId: uuid, comparisonId: uuid }));
+      const input = body(request, z.object({
+        description: z.string().trim().min(1).max(500),
+        unit: z.string().trim().max(50).nullable().optional(),
+        quantity: z.number().nullable().optional()
+      }));
+      return reply.status(201).send(await tpDb.addQuoteComparisonRow(requireActor(request), workflowId, comparisonId, {
+        description: input.description, unit: input.unit ?? null, quantity: input.quantity ?? null
+      }));
+    });
+
+    protectedApi.delete('/api/tender-prep/:workflowId/quote-comparisons/:comparisonId/rows/:rowId', async (request) => {
+      const { workflowId, comparisonId, rowId } = params(request, z.object({ workflowId: uuid, comparisonId: uuid, rowId: uuid }));
+      await tpDb.deleteQuoteComparisonRow(requireActor(request), workflowId, comparisonId, rowId);
+      return { deleted: true };
+    });
+
+    // A return that arrived as an emailed spreadsheet rather than through the portal,
+    // keyed in against the comparison's own spine — see recordManualReturn's doc comment
+    // for why that needs no fuzzy matching.
+    protectedApi.post('/api/tender-prep/:workflowId/quote-comparisons/:packageName/returns', async (request, reply) => {
+      const { workflowId, packageName } = params(request, z.object({ workflowId: uuid, packageName: z.string().trim().min(1).max(200) }));
+      const input = body(request, z.object({
+        tendererName: z.string().trim().min(1).max(240),
+        subcontractorId: z.string().uuid().nullable().optional(),
+        receivedAt: z.string().nullable().optional(),
+        programmeWeeks: z.number().int().min(0).nullable().optional(),
+        qualifications: z.string().trim().max(4000).nullable().optional(),
+        exclusions: z.string().trim().max(4000).nullable().optional(),
+        cells: z.array(z.object({
+          rowId: uuid, quantity: z.number().nullable().optional(), rate: z.number().min(0).nullable().optional(),
+          status: returnLineStatus, note: z.string().trim().max(2000).nullable().optional()
+        })).max(2000),
+        extraLines: z.array(z.object({
+          description: z.string().trim().min(1).max(500), unit: z.string().trim().max(50).nullable().optional(),
+          quantity: z.number().nullable().optional(), rate: z.number().min(0).nullable().optional(),
+          status: returnLineStatus, note: z.string().trim().max(2000).nullable().optional()
+        })).max(200).default([])
+      }));
+      return reply.status(201).send(await tpDb.recordManualQuoteReturn(requireActor(request), workflowId, packageName, {
+        tendererName: input.tendererName, subcontractorId: input.subcontractorId ?? null, receivedAt: input.receivedAt ?? null,
+        programmeWeeks: input.programmeWeeks ?? null, qualifications: input.qualifications ?? null, exclusions: input.exclusions ?? null,
+        cells: input.cells.map((c) => ({ rowId: c.rowId, quantity: c.quantity ?? null, rate: c.rate ?? null, status: c.status, note: c.note ?? null })),
+        extraLines: input.extraLines.map((l) => ({ description: l.description, unit: l.unit ?? null, quantity: l.quantity ?? null, rate: l.rate ?? null, status: l.status, note: l.note ?? null }))
+      }));
+    });
+
+    // Awards the package — the act that leaves a mark on the firm's own bill.
+    protectedApi.post('/api/tender-prep/:workflowId/quote-comparisons/:packageName/approve', async (request) => {
+      const { workflowId, packageName } = params(request, z.object({ workflowId: uuid, packageName: z.string().trim().min(1).max(200) }));
+      const input = body(request, z.object({ awardedReturnId: uuid, notes: z.string().trim().max(2000).nullable().optional() }));
+      return tpDb.approveQuoteComparison(requireActor(request), workflowId, packageName, input.awardedReturnId, input.notes ?? null);
+    });
+
+    // ── Step 3 (legacy): the four-field comparative screen, superseded above ────
 
     protectedApi.get('/api/tender-prep/:workflowId/comparative', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));
