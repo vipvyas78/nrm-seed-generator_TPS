@@ -256,6 +256,9 @@ const STATUS_OPTIONS: QuoteLineStatus[] = ['priced', 'included', 'excluded', 'no
 /** A return that arrived as an emailed spreadsheet, keyed straight against the spine rows
  *  already on screen — see recordManualReturn's doc comment for why that needs no fuzzy
  *  matching. */
+type ExtraLineDraft = { description: string; unit: string; quantity: string; rate: string; status: QuoteLineStatus; note: string };
+const BLANK_EXTRA_LINE: ExtraLineDraft = { description: '', unit: '', quantity: '', rate: '', status: 'priced', note: '' };
+
 function ManualReturnForm({ workflowId, packageName, rows, onDone }: {
   workflowId: string; packageName: string; rows: QuoteComparisonRow[]; onDone: () => void;
 }) {
@@ -264,6 +267,7 @@ function ManualReturnForm({ workflowId, packageName, rows, onDone }: {
   const [qualifications, setQualifications] = useState('');
   const [exclusions, setExclusions] = useState('');
   const [cells, setCells] = useState<Record<string, { rate: string; status: QuoteLineStatus; note: string }>>({});
+  const [extraLines, setExtraLines] = useState<ExtraLineDraft[]>([]);
 
   const setCell = (rowId: string, patch: Partial<{ rate: string; status: QuoteLineStatus; note: string }>) => {
     setCells((current) => {
@@ -271,6 +275,10 @@ function ManualReturnForm({ workflowId, packageName, rows, onDone }: {
       return { ...current, [rowId]: { ...existing, ...patch } };
     });
   };
+  const setExtraLine = (index: number, patch: Partial<ExtraLineDraft>) => {
+    setExtraLines((current) => current.map((line, i) => (i === index ? { ...line, ...patch } : line)));
+  };
+  const removeExtraLine = (index: number) => setExtraLines((current) => current.filter((_, i) => i !== index));
 
   const save = useMutation({
     mutationFn: () => api.recordManualQuoteReturn(workflowId, packageName, {
@@ -283,7 +291,14 @@ function ManualReturnForm({ workflowId, packageName, rows, onDone }: {
         .map((row) => {
           const entry = cells[row.id]!;
           return { rowId: row.id, quantity: row.quantity, rate: entry.rate ? Number(entry.rate) : null, status: entry.status, note: entry.note || null };
-        })
+        }),
+      extraLines: extraLines
+        .filter((line) => line.description.trim())
+        .map((line) => ({
+          description: line.description.trim(), unit: line.unit || null,
+          quantity: line.quantity ? Number(line.quantity) : null, rate: line.rate ? Number(line.rate) : null,
+          status: line.status, note: line.note || null
+        }))
     }),
     onSuccess: onDone
   });
@@ -314,6 +329,29 @@ function ManualReturnForm({ workflowId, packageName, rows, onDone }: {
         </tr>;
       })}</tbody>
     </table>
+
+    <h4 style={{ marginTop: 16 }}>Extra lines</h4>
+    <p className="muted" style={{ fontSize: '0.8rem' }}>This tenderer's own addition — not on the ITT bill, so it has no row of its own yet.</p>
+    <table className="data-table">
+      <thead><tr><th>Description</th><th>Qty</th><th>Unit</th><th>Rate</th><th>Status</th><th>Note</th><th /></tr></thead>
+      <tbody>{extraLines.map((line, i) => <tr key={i}>
+        <td><input value={line.description} onChange={(e) => setExtraLine(i, { description: e.target.value })} placeholder="Description" /></td>
+        <td><input type="number" value={line.quantity} onChange={(e) => setExtraLine(i, { quantity: e.target.value })} style={{ width: 80 }} /></td>
+        <td><input value={line.unit} onChange={(e) => setExtraLine(i, { unit: e.target.value })} style={{ width: 70 }} /></td>
+        <td><input type="number" value={line.rate} onChange={(e) => setExtraLine(i, { rate: e.target.value })} style={{ width: 100 }} /></td>
+        <td>
+          <select value={line.status} onChange={(e) => setExtraLine(i, { status: e.target.value as QuoteLineStatus })}>
+            {STATUS_OPTIONS.map((s) => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+          </select>
+        </td>
+        <td><input value={line.note} onChange={(e) => setExtraLine(i, { note: e.target.value })} placeholder="Optional" /></td>
+        <td><button className="secondary small" onClick={() => removeExtraLine(i)}>Remove</button></td>
+      </tr>)}</tbody>
+    </table>
+    <button className="secondary small" style={{ marginTop: 8 }} onClick={() => setExtraLines((current) => [...current, { ...BLANK_EXTRA_LINE }])}>
+      + Add extra line
+    </button>
+
     <ErrorMessage error={save.error} />
     <div className="button-row" style={{ marginTop: 12 }}>
       <button disabled={!tendererName.trim() || save.isPending} onClick={() => save.mutate()}>{save.isPending ? 'Saving…' : 'Save return'}</button>

@@ -3189,19 +3189,19 @@ export class TenderPrepDatabase {
   async updateQuoteComparisonCellNote(actor: Actor, workflowId: string, comparisonId: string, cellId: string, estimatorNote: string | null): Promise<Row> {
     await this.assertWorkflowAccess(actor, workflowId);
     if (!this.quoteDb) throw notFound('The quote comparison stage is not configured in this environment.');
-    return this.quoteDb.updateCellNote(comparisonId, cellId, estimatorNote);
+    return this.quoteDb.updateCellNote(workflowId, comparisonId, cellId, estimatorNote);
   }
 
   async addQuoteComparisonRow(actor: Actor, workflowId: string, comparisonId: string, input: { description: string; unit: string | null; quantity: number | null }): Promise<Row> {
     await this.assertWorkflowAccess(actor, workflowId);
     if (!this.quoteDb) throw notFound('The quote comparison stage is not configured in this environment.');
-    return this.quoteDb.addEstimatorRow(comparisonId, input);
+    return this.quoteDb.addEstimatorRow(workflowId, comparisonId, input);
   }
 
   async deleteQuoteComparisonRow(actor: Actor, workflowId: string, comparisonId: string, rowId: string): Promise<void> {
     await this.assertWorkflowAccess(actor, workflowId);
     if (!this.quoteDb) throw notFound('The quote comparison stage is not configured in this environment.');
-    return this.quoteDb.deleteEstimatorRow(comparisonId, rowId);
+    return this.quoteDb.deleteEstimatorRow(workflowId, comparisonId, rowId);
   }
 
   /** A quote that arrived by email rather than through the portal, keyed in against the

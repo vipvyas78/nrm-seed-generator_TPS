@@ -718,16 +718,9 @@ export type PortalRfiInput = {
   attachments: Array<{ filename: string; contentBase64: string }>;
 };
 
-export type TenderComparative = {
-  id: string;
-  workflow_id: string;
-  tenderer_name: string;
-  tendered_sum?: number;
-  estimate_sum?: number;
-  scope_compliance?: Record<string, unknown>;
-  qualifications?: string;
-  recommendation?: string;
-};
+// tps.comparative's own type/routes (the four-field screen the levelled comparison below
+// replaced) are left unregistered here — see quoteComparisonDb.ts's header. The BFF routes
+// still exist, unreachable from this app; nothing here calls /comparative any more.
 
 // ── The levelled quote comparison (BuildFlow issue #100) ────────────────────
 // Mirrors apps/bff/src/quoteComparisonDb.ts — see that file's own header for why the
@@ -1158,11 +1151,6 @@ export const api = {
     request(`/api/tender-prep/${workflowId}/quote-comparisons/${encodeURIComponent(packageName)}/returns`, { method: 'POST', body: JSON.stringify(input) }),
   approveQuoteComparison: (workflowId: string, packageName: string, input: { awardedReturnId: string; notes?: string | null }) =>
     request(`/api/tender-prep/${workflowId}/quote-comparisons/${encodeURIComponent(packageName)}/approve`, { method: 'POST', body: JSON.stringify(input) }),
-
-  // Step 3 (legacy): the four-field comparative screen, superseded above
-  listComparative: (workflowId: string) => request<TenderComparative[]>(`/api/tender-prep/${workflowId}/comparative`),
-  upsertComparative: (workflowId: string, input: Omit<TenderComparative, 'id' | 'workflow_id'>) =>
-    request<TenderComparative>(`/api/tender-prep/${workflowId}/comparative`, { method: 'POST', body: JSON.stringify(input) }),
 
   // Step 4: Submission
   getSubmission: (workflowId: string) => request<TenderSubmission | null>(`/api/tender-prep/${workflowId}/submission`),

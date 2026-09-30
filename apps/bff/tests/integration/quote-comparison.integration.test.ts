@@ -322,5 +322,139 @@ describe('the levelled quote comparison', () => {
       await cleanup(db, f);
     }
   });
+
+  // ── Estimator rows (BuildFlow #100 follow-up: they never got cells at all) ───────────
+
+  const mkPricedReturn = async (
+    portalDb: PricingPortalDatabase, entryId: string, workflowId: string, packageName: string, name: string, email: string, rate: number
+  ) => {
+    const link = await portalDb.mintOrRefreshLink({
+      shortlistEntryId: entryId, workflowId, packageName, subcontractorId: null,
+      tendererName: name, recipientEmail: email, isTest: true, ttlDays: 30
+    });
+    await portalDb.snapshotLines(link.id, [
+      { sourceItemId: null, geCode: null, elementCode: null, description: 'Mobilisation', quantity: 1, unit: 'item', isPriceable: true }
+    ]);
+    await portalDb.saveDraft(link.id, {
+      header: { programmeWeeks: null, qualifications: null, exclusions: null },
+      lines: [{ id: String((await portalDb.getLines(link.id))[0]!.id), quantity: 1, rate, status: 'priced', note: null }]
+    });
+    await portalDb.submit(link.id);
+    return link;
+  };
+
+  it('attaches a manual return keyed against an estimator-added row — the issue’s own example, "create a separate item"', async () => {
+    const { db, portalDb, tpDb } = connect();
+    const f = await fixture(db, tpDb);
+    try {
+      await mkPricedReturn(portalDb, f.entryIds[0]!, f.workflowId, f.packageName, 'Firm B', 'b@example.com', 100);
+      const comparison = await tpDb.openQuoteComparison(f.actor, f.workflowId, f.packageName);
+      const comparisonId = String(comparison.id);
+      const estimatorRowResult = await tpDb.addQuoteComparisonRow(f.actor, f.workflowId, comparisonId, {
+        description: 'Reconcile — Firm E’s own wording for the access scaffold', unit: 'item', quantity: 1
+      });
+      const estimatorRowId = String(estimatorRowResult.id);
+
+      // A quote that arrived by email, keyed against the reconciliation row the estimator
+      // is already looking at on screen — Firm E never used the portal at all.
+      await tpDb.recordManualQuoteReturn(f.actor, f.workflowId, f.packageName, {
+        tendererName: 'Firm E', subcontractorId: null, receivedAt: null, programmeWeeks: null, qualifications: null, exclusions: null,
+        cells: [{ rowId: estimatorRowId, quantity: 1, rate: 300, status: 'priced', note: 'Confirmed by phone' }],
+        extraLines: []
+      });
+      await tpDb.openQuoteComparison(f.actor, f.workflowId, f.packageName); // re-run refreshCells
+
+      const detail = await tpDb.getQuoteComparison(f.actor, f.workflowId, f.packageName);
+      const returns = detail.returns as Array<{ id: string; tenderer_name: string }>;
+      const firmE = returns.find((r) => r.tenderer_name === 'Firm E')!;
+      const rows = detail.rows as Array<Row & { id: string; cells: Array<{ returnId: string; status: string; quotedTotal: number | null }> }>;
+      const row = rows.find((r) => String(r.id) === estimatorRowId)!;
+      const cell = row.cells.find((c) => c.returnId === firmE.id)!;
+
+      // Before the fix this line was silently dropped — its `seq` (assigned after the
+      // whole ITT bill) never matched anything in the itt_bill-only lookup.
+      expect(cell.status).toBe('priced');
+      expect(cell.quotedTotal).toBe(300);
+    } finally {
+      await cleanup(db, f);
+    }
+  });
+
+  it('awards a package carrying an estimator-added row nobody priced, without the tender_boq_lines CHECK rejecting "absent"', async () => {
+    const { db, portalDb, tpDb } = connect();
+    const f = await fixture(db, tpDb);
+    try {
+      await mkPricedReturn(portalDb, f.entryIds[0]!, f.workflowId, f.packageName, 'Firm B', 'b@example.com', 100);
+      await mkPricedReturn(portalDb, f.entryIds[1]!, f.workflowId, f.packageName, 'Firm C', 'c@example.com', 110);
+      await mkPricedReturn(portalDb, f.entryIds[2]!, f.workflowId, f.packageName, 'Firm D', 'd@example.com', 120);
+
+      const comparison = await tpDb.openQuoteComparison(f.actor, f.workflowId, f.packageName);
+      expect(comparison.readiness).toBe('quorum_met');
+
+      // The issue's own example: a reconciliation item for a discrepancy — added, but
+      // never priced by anyone. Every cell on this row reads `absent`, the awarded
+      // tenderer's included, which is exactly what used to throw on award.
+      await tpDb.addQuoteComparisonRow(f.actor, f.workflowId, String(comparison.id), {
+        description: 'Reconcile — discrepancy on item 4', unit: 'item', quantity: 1
+      });
+
+      const returns = await db.query<{ id: string; tenderer_name: string }>(`SELECT id, tenderer_name FROM tender_returns WHERE workflow_id = $1`, [f.workflowId]);
+      const firmB = returns.find((r) => r.tenderer_name === 'Firm B')!;
+
+      const tradeAnalysis = await tpDb.approveQuoteComparison(f.actor, f.workflowId, f.packageName, firmB.id, null);
+      expect(tradeAnalysis.status).toBe('approved_with_adjustments');
+
+      const boqLines = await db.query<{ description: string; status: string; adjusted: boolean }>(
+        `SELECT description, status, adjusted FROM tender_boq_lines WHERE workflow_id = $1 AND package_name = $2`,
+        [f.workflowId, f.packageName]
+      );
+      const reconcileLine = boqLines.find((l) => l.description.startsWith('Reconcile'))!;
+      expect(reconcileLine.status).toBe('not_addressed'); // translated from 'absent' — the CHECK does not know that status
+      expect(reconcileLine.adjusted).toBe(true);
+    } finally {
+      await cleanup(db, f);
+    }
+  });
+
+  // ── A comparisonId is attacker-controlled input, not derived from workflowId ─────────
+
+  it('refuses to touch a comparison, row or cell from another workflow, even by real ids', async () => {
+    const { db, portalDb, tpDb } = connect();
+    const f1 = await fixture(db, tpDb);
+    const f2 = await fixture(db, tpDb);
+    try {
+      await mkPricedReturn(portalDb, f1.entryIds[0]!, f1.workflowId, f1.packageName, 'Firm B', 'b@example.com', 100);
+      const comparison1 = await tpDb.openQuoteComparison(f1.actor, f1.workflowId, f1.packageName);
+      const comparisonId1 = String(comparison1.id);
+      const estimatorRowResult = await tpDb.addQuoteComparisonRow(f1.actor, f1.workflowId, comparisonId1, {
+        description: 'Reconcile item', unit: 'item', quantity: 1
+      });
+      const estimatorRowId = String(estimatorRowResult.id);
+      // Give it a real cell to try to reach, not just a row.
+      await tpDb.recordManualQuoteReturn(f1.actor, f1.workflowId, f1.packageName, {
+        tendererName: 'Firm E', subcontractorId: null, receivedAt: null, programmeWeeks: null, qualifications: null, exclusions: null,
+        cells: [{ rowId: estimatorRowId, quantity: 1, rate: 300, status: 'priced', note: null }], extraLines: []
+      });
+      const detail1 = await tpDb.getQuoteComparison(f1.actor, f1.workflowId, f1.packageName);
+      const row = (detail1.rows as Array<{ id: string; cells: Array<{ cellId: string | null }> }>).find((r) => r.id === estimatorRowId)!;
+      const cellId = row.cells.find((c) => c.cellId)!.cellId!;
+
+      // f2's actor has ordinary access to ITS OWN workflow — never to f1's — and tries
+      // f1's comparison/row/cell ids under that cover.
+      await expect(tpDb.addQuoteComparisonRow(f2.actor, f2.workflowId, comparisonId1, { description: 'x', unit: null, quantity: null }))
+        .rejects.toThrow(/does not belong/);
+      await expect(tpDb.deleteQuoteComparisonRow(f2.actor, f2.workflowId, comparisonId1, estimatorRowId)).rejects.toThrow();
+      await expect(tpDb.updateQuoteComparisonCellNote(f2.actor, f2.workflowId, comparisonId1, cellId, 'hijacked note')).rejects.toThrow();
+
+      // f1's own data is exactly as it was.
+      const stillThere = await tpDb.getQuoteComparison(f1.actor, f1.workflowId, f1.packageName);
+      const stillRow = (stillThere.rows as Array<{ id: string; cells: Array<{ estimatorNote: string | null }> }>).find((r) => r.id === estimatorRowId)!;
+      expect(stillRow).toBeDefined();
+      expect(stillRow.cells.every((c) => c.estimatorNote !== 'hijacked note')).toBe(true);
+    } finally {
+      await db.query(`DELETE FROM workflows WHERE id = ANY($1::uuid[])`, [[f1.workflowId, f2.workflowId]]);
+      await db.close();
+    }
+  });
 });
 

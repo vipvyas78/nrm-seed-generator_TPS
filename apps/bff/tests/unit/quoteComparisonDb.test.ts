@@ -9,7 +9,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  computeReadiness, findLowestQuote, levelCell, moneyGBP, sumTotals, QUOTE_QUORUM
+  boqStatusFor, computeReadiness, findLowestQuote, levelCell, moneyGBP, sumTotals, QUOTE_QUORUM
 } from '../../src/quoteComparisonDb.js';
 
 const LOWEST = { rate: 10, total: 500, tendererName: 'Acme Roofing' };
@@ -153,6 +153,21 @@ describe('computeReadiness', () => {
 
   it('quorum outranks a passed deadline', () => {
     expect(computeReadiness(3, past, now)).toBe('quorum_met');
+  });
+});
+
+describe('boqStatusFor', () => {
+  it('translates absent to not_addressed — the one status tender_boq_lines never learned', () => {
+    // A row a tenderer never had the chance to address (an estimator's own reconciliation
+    // row, or a short return) is `absent` on the comparison, but 008's CHECK on
+    // tender_boq_lines predates that status. Awarding it must not throw.
+    expect(boqStatusFor('absent')).toBe('not_addressed');
+  });
+
+  it('carries every other status through unchanged', () => {
+    for (const status of ['priced', 'included', 'excluded', 'not_addressed'] as const) {
+      expect(boqStatusFor(status)).toBe(status);
+    }
   });
 });
 

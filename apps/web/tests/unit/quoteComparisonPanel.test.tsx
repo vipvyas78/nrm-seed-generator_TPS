@@ -98,6 +98,29 @@ describe('QuoteComparisonPanel', () => {
     await waitFor(() => expect(approveSpy).toHaveBeenCalledWith('w1', 'Roofing', { awardedReturnId: 'r1', notes: null }));
   });
 
+  it('sends an extra line typed into the manual-return form — not silently dropped', async () => {
+    vi.spyOn(api, 'listQuoteComparisons').mockResolvedValue([
+      { package_name: 'Roofing', comparison_id: 'c1', opened_at: null, expected_count: 3, received_count: 1, return_deadline: null, readiness: 'awaiting_returns' }
+    ]);
+    vi.spyOn(api, 'getQuoteComparison').mockResolvedValue(detail());
+    const recordSpy = vi.spyOn(api, 'recordManualQuoteReturn').mockResolvedValue({} as never);
+
+    renderWithClient(<QuoteComparisonPanel workflowId="w1" />);
+    await screen.findByText('Roofing');
+
+    await userEvent.click(await screen.findByRole('button', { name: '+ Enter a return by hand' }));
+    await userEvent.type(screen.getByPlaceholderText('Tenderer name'), 'Firm D');
+    await userEvent.click(screen.getByRole('button', { name: '+ Add extra line' }));
+    await userEvent.type(screen.getByPlaceholderText('Description'), 'Extra access scaffold');
+    const rateInputs = screen.getAllByRole('spinbutton');
+    await userEvent.type(rateInputs[rateInputs.length - 1]!, '250');
+    await userEvent.click(screen.getByRole('button', { name: 'Save return' }));
+
+    await waitFor(() => expect(recordSpy).toHaveBeenCalled());
+    const input = recordSpy.mock.calls[0]![2] as { extraLines: Array<{ description: string; rate: number | null }> };
+    expect(input.extraLines).toEqual([{ description: 'Extra access scaffold', unit: null, quantity: null, rate: 250, status: 'priced', note: null }]);
+  });
+
   it('shows the exclusions and qualifications a tenderer stated, verbatim', async () => {
     vi.spyOn(api, 'listQuoteComparisons').mockResolvedValue([
       { package_name: 'Roofing', comparison_id: 'c1', opened_at: null, expected_count: 3, received_count: 1, return_deadline: null, readiness: 'awaiting_returns' }

@@ -131,6 +131,19 @@ export function findLowestQuote(quotes: Array<{ total: number | null; rate: numb
   return lowest;
 }
 
+/**
+ * `tender_boq_lines.status` (008) only ever allowed the four statuses a tenderer can
+ * actually choose — it predates `absent`, which `quote_comparison_cells` added for a row
+ * a tenderer never had the chance to address at all (an estimator's own reconciliation
+ * row, or a short return). Awarding such a row is not a status the CHECK recognises, so
+ * this is the one place `absent` must be translated rather than carried through verbatim
+ * — into `not_addressed`, which is what it is from the awarded firm's own bill's point of
+ * view: a line they did not price, for whatever reason.
+ */
+export function boqStatusFor(status: CellStatus): ReturnLineStatus {
+  return status === 'absent' ? 'not_addressed' : status;
+}
+
 /** One tenderer's two totals — what they actually quoted, and what the comparison
  * carries once every gap is levelled. The gap between them IS the point of the stage:
  * the cheapest substitution flatters whoever omitted the most, so the two must both be
@@ -298,6 +311,14 @@ export class QuoteComparisonDatabase {
     const spineRows = await this.db.query<Row>(
       `SELECT * FROM tps.quote_comparison_rows WHERE comparison_id = $1 ORDER BY seq`, [comparisonId], client
     );
+    const byId = new Map(spineRows.map((r) => [String(r.id), r]));
+    // `seq` is only a safe key among the ORIGINAL bill rows (see this file's header) — a
+    // row added after the fact (tenderer- or estimator-added) is assigned the next free
+    // seq once, which a later addition can reuse no differently from any other integer.
+    // A manual return keyed in by hand instead carries `comparison_row_id` (see
+    // `recordManualReturn`), pointing at the exact row the estimator typed the figure
+    // against; `seq` remains the fallback for lines that never went through that path
+    // (a portal submission, or data written before this column existed).
     const bySeq = new Map(spineRows.filter((r) => r.origin === 'itt_bill').map((r) => [Number(r.seq), r]));
 
     for (const ret of returns) {
@@ -332,7 +353,8 @@ export class QuoteComparisonDatabase {
           continue;
         }
 
-        const row = line.seq != null ? bySeq.get(Number(line.seq)) : undefined;
+        const row = (line.comparison_row_id ? byId.get(String(line.comparison_row_id)) : undefined)
+          ?? (line.seq != null ? bySeq.get(Number(line.seq)) : undefined);
         if (!row) continue; // No seq, or beyond the reference bill's own length — nothing to attach to.
         const mismatched = row.description !== line.description || (row.unit ?? null) !== (line.unit ?? null);
         await this.upsertCell(client, String(row.id), String(ret.id), line, mismatched
@@ -493,13 +515,20 @@ export class QuoteComparisonDatabase {
     return { comparison, returns, rows: grid, totals };
   }
 
-  async updateCellNote(comparisonId: string, cellId: string, estimatorNote: string | null): Promise<Row> {
+  /**
+   * A `comparisonId` arrives from the request body, not derived from `workflowId` the way
+   * `packageName` is on every other route here — so every method taking one must confirm
+   * it actually belongs to that workflow before touching it, or a caller with access to
+   * one tender could reach another's comparison by id alone. Folded into each statement's
+   * own WHERE/EXISTS below rather than a separate round trip.
+   */
+  async updateCellNote(workflowId: string, comparisonId: string, cellId: string, estimatorNote: string | null): Promise<Row> {
     const [row] = await this.db.query<Row>(
-      `UPDATE tps.quote_comparison_cells c SET estimator_note = $3, updated_at = NOW()
-         FROM tps.quote_comparison_rows r
-        WHERE c.id = $2 AND c.row_id = r.id AND r.comparison_id = $1
+      `UPDATE tps.quote_comparison_cells c SET estimator_note = $4, updated_at = NOW()
+         FROM tps.quote_comparison_rows r, tps.quote_comparisons qc
+        WHERE c.id = $3 AND c.row_id = r.id AND r.comparison_id = $2 AND qc.id = r.comparison_id AND qc.workflow_id = $1
         RETURNING c.*`,
-      [comparisonId, cellId, estimatorNote]
+      [workflowId, comparisonId, cellId, estimatorNote]
     );
     if (!row) throw notFound('Comparison cell not found');
     return row;
@@ -507,21 +536,26 @@ export class QuoteComparisonDatabase {
 
   /** An estimator's own line — e.g. to price a discrepancy the issue names directly:
    * "if there is a slight discrepancy … create a separate item describing the pricing." */
-  async addEstimatorRow(comparisonId: string, input: { description: string; unit: string | null; quantity: number | null }): Promise<Row> {
+  async addEstimatorRow(workflowId: string, comparisonId: string, input: { description: string; unit: string | null; quantity: number | null }): Promise<Row> {
     const [row] = await this.db.query<Row>(
       `INSERT INTO tps.quote_comparison_rows (comparison_id, seq, description, unit, quantity, is_priceable, origin)
-       VALUES ($1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM tps.quote_comparison_rows WHERE comparison_id = $1),
-               $2, $3, $4, TRUE, 'estimator_added')
+       SELECT $2, COALESCE((SELECT MAX(seq) FROM tps.quote_comparison_rows WHERE comparison_id = $2), 0) + 1,
+              $3, $4, $5, TRUE, 'estimator_added'
+        WHERE EXISTS (SELECT 1 FROM tps.quote_comparisons WHERE id = $2 AND workflow_id = $1)
        RETURNING *`,
-      [comparisonId, input.description, input.unit, input.quantity]
+      [workflowId, comparisonId, input.description, input.unit, input.quantity]
     );
-    return row!;
+    if (!row) throw notFound('This comparison does not belong to that tender.');
+    return row;
   }
 
-  async deleteEstimatorRow(comparisonId: string, rowId: string): Promise<void> {
+  async deleteEstimatorRow(workflowId: string, comparisonId: string, rowId: string): Promise<void> {
     const deleted = await this.db.query(
-      `DELETE FROM tps.quote_comparison_rows WHERE id = $1 AND comparison_id = $2 AND origin = 'estimator_added' RETURNING id`,
-      [rowId, comparisonId]
+      `DELETE FROM tps.quote_comparison_rows r USING tps.quote_comparisons qc
+        WHERE r.id = $3 AND r.comparison_id = $2 AND r.origin = 'estimator_added'
+          AND qc.id = r.comparison_id AND qc.workflow_id = $1
+        RETURNING r.id`,
+      [workflowId, comparisonId, rowId]
     );
     if (deleted.length === 0) throw notFound('No estimator-added row to delete with that id.');
   }
@@ -559,7 +593,8 @@ export class QuoteComparisonDatabase {
       const bySpineId = new Map(spineRows.map((r) => [String(r.id), r]));
 
       const lineValues: { seq: number; ge: string | null; el: string | null; descr: string; qty: number | null;
-        unit: string | null; rate: number | null; total: number | null; status: string; note: string | null; added: boolean }[] = [];
+        unit: string | null; rate: number | null; total: number | null; status: string; note: string | null;
+        added: boolean; rowId: string | null }[] = [];
 
       for (const cell of input.cells) {
         const spine = bySpineId.get(cell.rowId);
@@ -568,7 +603,7 @@ export class QuoteComparisonDatabase {
         lineValues.push({
           seq: Number(spine.seq), ge: spine.ge_code as string | null, el: spine.element_code as string | null,
           descr: String(spine.description), qty: cell.quantity, unit: spine.unit as string | null,
-          rate: cell.rate, total, status: cell.status, note: cell.note, added: false
+          rate: cell.rate, total, status: cell.status, note: cell.note, added: false, rowId: String(spine.id)
         });
       }
       let nextSeq = Math.max(0, ...spineRows.map((r) => Number(r.seq))) + 1;
@@ -576,20 +611,20 @@ export class QuoteComparisonDatabase {
         const total = extra.rate != null && extra.quantity != null ? extra.rate * extra.quantity : null;
         lineValues.push({
           seq: nextSeq++, ge: null, el: null, descr: extra.description, qty: extra.quantity, unit: extra.unit,
-          rate: extra.rate, total, status: extra.status, note: extra.note, added: true
+          rate: extra.rate, total, status: extra.status, note: extra.note, added: true, rowId: null
         });
       }
 
       if (lineValues.length > 0) {
         await this.db.query(
-          `INSERT INTO tender_return_lines (return_id, seq, ge_code, element_code, description, quantity, unit, rate, total, status, note, added_by_tenderer)
-           SELECT $1, s, ge, el, descr, qty, unit, rate, total, status, note, added
-             FROM unnest($2::int[], $3::text[], $4::text[], $5::text[], $6::numeric[], $7::text[], $8::numeric[], $9::numeric[], $10::text[], $11::text[], $12::boolean[])
-               AS t(s, ge, el, descr, qty, unit, rate, total, status, note, added)`,
+          `INSERT INTO tender_return_lines (return_id, seq, ge_code, element_code, description, quantity, unit, rate, total, status, note, added_by_tenderer, comparison_row_id)
+           SELECT $1, s, ge, el, descr, qty, unit, rate, total, status, note, added, row_id
+             FROM unnest($2::int[], $3::text[], $4::text[], $5::text[], $6::numeric[], $7::text[], $8::numeric[], $9::numeric[], $10::text[], $11::text[], $12::boolean[], $13::uuid[])
+               AS t(s, ge, el, descr, qty, unit, rate, total, status, note, added, row_id)`,
           [ret!.id, lineValues.map((l) => l.seq), lineValues.map((l) => l.ge), lineValues.map((l) => l.el),
            lineValues.map((l) => l.descr), lineValues.map((l) => l.qty), lineValues.map((l) => l.unit),
            lineValues.map((l) => l.rate), lineValues.map((l) => l.total), lineValues.map((l) => l.status),
-           lineValues.map((l) => l.note), lineValues.map((l) => l.added)],
+           lineValues.map((l) => l.note), lineValues.map((l) => l.added), lineValues.map((l) => l.rowId)],
           client
         );
         const tenderedSum = lineValues.filter((l) => l.status === 'priced' && l.total != null)
@@ -660,7 +695,7 @@ export class QuoteComparisonDatabase {
           return {
             ge: row.ge_code, el: row.element_code, descr: row.description, qty: row.quantity, unit: row.unit,
             submittedRate: cell?.quotedRate ?? null, approvedRate: cell?.levelledRate ?? null, approvedTotal: cell?.levelledTotal ?? null,
-            status: cell?.status ?? 'absent', adjusted,
+            status: boqStatusFor(cell?.status ?? 'absent'), adjusted,
             adjustmentNote: adjusted ? (cell?.assumptionBasis ?? 'No return on file for this line; no substitution was available.') : null
           };
         });
