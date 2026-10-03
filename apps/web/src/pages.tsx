@@ -33,7 +33,13 @@ export function AppShell() {
   const session = typeof sessionQuery.data?.authorisationLevel === 'string' ? sessionQuery.data : undefined;
   return <main className="shell">
     <header>
-      <Link to="/" className="brand">BuildFlow</Link>
+      {/* `BASE_URL`, not a leading slash: this app is built with `base: '/tps/'` and
+          served under that prefix, so "/novamerx-wordmark.png" would resolve to the
+          site root — which serves BuildFlow, not this. Vite rewrites asset paths in
+          index.html but not inside JS strings, so it has to be explicit here. */}
+      <Link to="/" className="brand" aria-label="Novamerx">
+        <img src={`${import.meta.env.BASE_URL}novamerx-wordmark.png`} alt="Novamerx" />
+      </Link>
       <span className="header-sub">Tender Preparation</span>
       {/* One element claims the auto margin, not each control: `.link-button` sets
           margin-left:auto, so two of them split the free space and leave a gap. */}
