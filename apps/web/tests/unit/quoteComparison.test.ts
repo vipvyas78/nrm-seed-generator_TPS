@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { QuoteComparisonSummary } from '../../src/api';
 import {
-  formatMoney, isReadyToApprove, readinessBadgeClass, readinessLabel, sortComparisonSummaries
+  formatMoney, isReadyToApprove, priceCellDisplay, readinessBadgeClass, readinessLabel, sortComparisonSummaries
 } from '../../src/quoteComparison';
 
 function summary(over: Partial<QuoteComparisonSummary> = {}): QuoteComparisonSummary {
@@ -57,6 +57,39 @@ describe('formatMoney', () => {
     expect(formatMoney(1234.5)).toBe('£1,234.50');
     expect(formatMoney(null)).toBe('—');
     expect(formatMoney(undefined)).toBe('—');
+  });
+});
+
+describe('priceCellDisplay', () => {
+  it('shows the rate beside the total for a genuine quote', () => {
+    const display = priceCellDisplay({ status: 'priced', levelledTotal: 6000, levelledRate: 12, isAssumed: false }, 'm2');
+    expect(display.primary).toBe('£6,000.00');
+    expect(display.secondary).toBe('£12.00/m2');
+    expect(display.tone).toBe('priced');
+  });
+
+  it('omits the rate when there is none to show, without hiding the total', () => {
+    const display = priceCellDisplay({ status: 'included', levelledTotal: 0, levelledRate: 0, isAssumed: true }, null);
+    expect(display.primary).toBe('£0.00');
+  });
+
+  it('marks a substituted figure as assumed', () => {
+    const display = priceCellDisplay({ status: 'excluded', levelledTotal: 500, levelledRate: 10, isAssumed: true }, 'nr');
+    expect(display.tone).toBe('assumed');
+  });
+
+  it('points at the variant row rather than showing a real total for priced_as_variant', () => {
+    const display = priceCellDisplay({ status: 'priced_as_variant', levelledTotal: 0, levelledRate: 0, isAssumed: true }, 'm2');
+    expect(display.primary).toBe('£0.00');
+    expect(display.secondary).toContain('own wording');
+    expect(display.tone).toBe('variant');
+  });
+
+  it('shows no return rather than a figure when nobody priced it and there is nothing to substitute', () => {
+    const display = priceCellDisplay({ status: 'absent', levelledTotal: null, levelledRate: null, isAssumed: true }, 'nr');
+    expect(display.primary).toBe('—');
+    expect(display.secondary).toBe('no return');
+    expect(display.tone).toBe('absent');
   });
 });
 

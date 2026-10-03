@@ -4,7 +4,7 @@ import {
   api, type QuoteComparisonCell, type QuoteComparisonReturn, type QuoteComparisonRow, type QuoteLineStatus
 } from './api';
 import { Busy, ErrorMessage } from './pages';
-import { formatMoney, isReadyToApprove, readinessBadgeClass, readinessLabel, sortComparisonSummaries } from './quoteComparison';
+import { formatMoney, isReadyToApprove, priceCellDisplay, readinessBadgeClass, readinessLabel, sortComparisonSummaries } from './quoteComparison';
 
 /**
  * Step 3: the levelled quote comparison (BuildFlow issue #100).
@@ -101,7 +101,7 @@ function PackageComparison({ workflowId, packageName }: { workflowId: string; pa
   }
   if (detail.isLoading || !detail.data) return <div className="panel"><Busy /></div>;
 
-  const { comparison, returns, rows, totals } = detail.data;
+  const { comparison, returns, rows, totals, scopeNotes } = detail.data;
   const readyToApprove = isReadyToApprove(comparison.readiness);
 
   return <div className="panel">
@@ -159,14 +159,28 @@ function PackageComparison({ workflowId, packageName }: { workflowId: string; pa
 
     {returns.length > 0 && <>
       <h4 style={{ marginTop: 16 }}>Inclusions and exclusions</h4>
+      <p className="muted" style={{ fontSize: '0.8rem' }}>
+        Every subcontractor's own qualifications and exclusions, and every line on the bill
+        they specifically marked included or excluded — for a complete comparison, not just
+        the headline figures above.
+      </p>
       <table className="data-table">
-        <thead><tr><th>Tenderer</th><th>Qualifications</th><th>Exclusions</th><th>Programme</th></tr></thead>
-        <tbody>{returns.map((ret) => <tr key={ret.id}>
-          <td><strong>{ret.tenderer_name}</strong></td>
-          <td>{ret.qualifications ?? '—'}</td>
-          <td>{ret.exclusions ?? '—'}</td>
-          <td>{ret.programme_weeks != null ? `${ret.programme_weeks} weeks` : '—'}</td>
-        </tr>)}</tbody>
+        <thead><tr><th>Tenderer</th><th>Qualifications</th><th>Exclusions</th><th>Programme</th><th>Items stated included</th><th>Items stated excluded</th></tr></thead>
+        <tbody>{returns.map((ret) => {
+          const notes = scopeNotes.find((s) => s.returnId === ret.id);
+          return <tr key={ret.id}>
+            <td><strong>{ret.tenderer_name}</strong></td>
+            <td>{notes?.qualifications ?? '—'}</td>
+            <td>{notes?.exclusions ?? '—'}</td>
+            <td>{notes?.programmeWeeks != null ? `${notes.programmeWeeks} weeks` : '—'}</td>
+            <td>{notes && notes.includedItems.length > 0
+              ? <ul style={{ margin: 0, paddingLeft: 16 }}>{notes.includedItems.map((it) => <li key={it.seq}>{it.description}</li>)}</ul>
+              : '—'}</td>
+            <td>{notes && notes.excludedItems.length > 0
+              ? <ul style={{ margin: 0, paddingLeft: 16 }}>{notes.excludedItems.map((it) => <li key={it.seq}>{it.description}</li>)}</ul>
+              : '—'}</td>
+          </tr>;
+        })}</tbody>
       </table>
     </>}
 
@@ -213,32 +227,39 @@ function PackageComparison({ workflowId, packageName }: { workflowId: string; pa
 function ComparisonRow({ row, returns, onNote }: {
   row: QuoteComparisonRow; returns: QuoteComparisonReturn[]; onNote: (cellId: string, note: string | null) => void;
 }) {
+  const isVariant = row.origin === 'tenderer_variant';
   return <tr>
-    <td>
+    <td style={isVariant ? { paddingLeft: 24 } : undefined}>
       {row.description}
       {row.unit && <span className="muted"> ({row.quantity ?? '—'} {row.unit})</span>}
       {row.origin === 'tenderer_added' && <span className="badge badge-blue" style={{ marginLeft: 6 }}>added by tenderer</span>}
+      {isVariant && <span className="badge badge-blue" style={{ marginLeft: 6 }}>their own wording</span>}
       {row.origin === 'estimator_added' && <span className="badge badge-grey" style={{ marginLeft: 6 }}>added by estimator</span>}
     </td>
     {returns.map((ret) => {
       const cell = row.cells.find((c) => c.returnId === ret.id);
-      return cell ? <ComparisonCell key={ret.id} cell={cell} onNote={onNote} /> : <><td /><td /></>;
+      return cell ? <ComparisonCell key={ret.id} cell={cell} unit={row.unit} onNote={onNote} /> : <><td /><td /></>;
     })}
-    <td>{row.lowest ? `${formatMoney(row.lowest.total)} (${row.lowest.tendererName})` : '—'}</td>
+    <td>{!isVariant && row.lowest ? `${formatMoney(row.lowest.total)} (${row.lowest.tendererName})` : '—'}</td>
   </tr>;
 }
 
-function ComparisonCell({ cell, onNote }: { cell: QuoteComparisonCell; onNote: (cellId: string, note: string | null) => void }) {
+function ComparisonCell({ cell, unit, onNote }: {
+  cell: QuoteComparisonCell; unit: string | null; onNote: (cellId: string, note: string | null) => void;
+}) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(cell.estimatorNote ?? '');
+  const display = priceCellDisplay(cell, unit);
+  const toneClass = display.tone === 'variant' ? 'qc-variant' : display.tone === 'assumed' ? 'qc-assumed' : undefined;
 
   return <>
-    <td className={cell.isAssumed ? 'qc-assumed' : undefined}>
-      {formatMoney(cell.levelledTotal)}
-      {cell.status === 'absent' && <div className="muted" style={{ fontSize: '0.7rem' }}>no return</div>}
+    <td className={toneClass}>
+      {display.primary}
+      {display.secondary && <div className="muted" style={{ fontSize: '0.7rem' }}>{display.secondary}</div>}
     </td>
-    <td className={cell.isAssumed ? 'qc-assumed' : undefined} style={{ minWidth: 180 }}>
+    <td className={toneClass} style={{ minWidth: 180 }}>
       {cell.isAssumed && cell.assumptionBasis && <div className="text-red" style={{ fontSize: '0.72rem', marginBottom: 4 }}>{cell.assumptionBasis}</div>}
+      {cell.tendererDescription && <div className="muted" style={{ fontSize: '0.72rem', marginBottom: 4 }}>their wording: “{cell.tendererDescription}”</div>}
       {cell.tendererNote && <div className="muted" style={{ fontSize: '0.72rem', marginBottom: 4 }}>“{cell.tendererNote}”</div>}
       {cell.cellId && (editing
         ? <div className="inline-form">
@@ -315,7 +336,7 @@ function ManualReturnForm({ workflowId, packageName, rows, onDone }: {
     </div>
     <table className="data-table" style={{ marginTop: 12 }}>
       <thead><tr><th>Item</th><th>Rate</th><th>Status</th><th>Note</th></tr></thead>
-      <tbody>{rows.filter((row) => row.origin !== 'tenderer_added').map((row) => {
+      <tbody>{rows.filter((row) => row.origin !== 'tenderer_added' && row.origin !== 'tenderer_variant').map((row) => {
         const entry = cells[row.id];
         return <tr key={row.id}>
           <td>{row.description}</td>

@@ -9,7 +9,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  boqStatusFor, computeReadiness, findLowestQuote, levelCell, moneyGBP, sumTotals, QUOTE_QUORUM
+  boqStatusFor, collectScopeNotes, computeReadiness, findLowestQuote, levelCell, moneyGBP, sameItem, sumTotals, QUOTE_QUORUM
 } from '../../src/quoteComparisonDb.js';
 
 const LOWEST = { rate: 10, total: 500, tendererName: 'Acme Roofing' };
@@ -168,6 +168,67 @@ describe('boqStatusFor', () => {
     for (const status of ['priced', 'included', 'excluded', 'not_addressed'] as const) {
       expect(boqStatusFor(status)).toBe(status);
     }
+  });
+});
+
+describe('sameItem', () => {
+  it('is true for an exact match', () => {
+    expect(sameItem({ description: 'Supply and fix roof tiles', unit: 'm2' }, { description: 'Supply and fix roof tiles', unit: 'm2' })).toBe(true);
+  });
+
+  it('ignores case, leading/trailing space and doubled internal space', () => {
+    expect(sameItem({ description: 'Supply and fix roof tiles', unit: 'm2' }, { description: '  SUPPLY  and FIX roof   tiles ', unit: 'm2' })).toBe(true);
+  });
+
+  it('treats common unit spellings as the same unit', () => {
+    expect(sameItem({ description: 'Roof tiles', unit: 'm2' }, { description: 'Roof tiles', unit: 'sq m' })).toBe(true);
+    expect(sameItem({ description: 'Roof tiles', unit: 'm²' }, { description: 'Roof tiles', unit: 'sqm' })).toBe(true);
+    expect(sameItem({ description: 'Concrete', unit: 'm3' }, { description: 'Concrete', unit: 'cu m' })).toBe(true);
+  });
+
+  it('is false for a genuine discrepancy — the issue’s own example', () => {
+    expect(sameItem({ description: 'Supply and fix roof tiles', unit: 'm2' }, { description: 'Supply and fix roof SLATES', unit: 'm2' })).toBe(false);
+  });
+
+  it('is false when only the unit disagrees and the two are not known synonyms', () => {
+    expect(sameItem({ description: 'Fencing', unit: 'lm' }, { description: 'Fencing', unit: 'nr' })).toBe(false);
+  });
+
+  it('treats a missing unit on either side as its own thing, not a wildcard', () => {
+    expect(sameItem({ description: 'Fencing', unit: null }, { description: 'Fencing', unit: 'lm' })).toBe(false);
+    expect(sameItem({ description: 'Fencing', unit: null }, { description: 'Fencing', unit: null })).toBe(true);
+  });
+});
+
+describe('collectScopeNotes', () => {
+  const returns = [
+    { id: 'r1', qualifications: 'Standard hours only', exclusions: 'Scaffold by others', programmeWeeks: 6 },
+    { id: 'r2', qualifications: null, exclusions: null, programmeWeeks: null }
+  ];
+
+  it('carries each return’s own header text through verbatim', () => {
+    const notes = collectScopeNotes(returns, []);
+    expect(notes).toHaveLength(2);
+    expect(notes[0]).toMatchObject({ returnId: 'r1', qualifications: 'Standard hours only', exclusions: 'Scaffold by others', programmeWeeks: 6 });
+    expect(notes[1]).toMatchObject({ returnId: 'r2', qualifications: null, exclusions: null, programmeWeeks: null });
+  });
+
+  it('lists every line a tenderer marked included or excluded, by name — not just their header text', () => {
+    const rows = [
+      { seq: 1, description: 'Scaffold', cells: [{ returnId: 'r1', status: 'excluded' as const }, { returnId: 'r2', status: 'priced' as const }] },
+      { seq: 2, description: 'Attendance on others', cells: [{ returnId: 'r1', status: 'included' as const }, { returnId: 'r2', status: 'not_addressed' as const }] }
+    ];
+    const notes = collectScopeNotes(returns, rows);
+    expect(notes[0]!.excludedItems).toEqual([{ seq: 1, description: 'Scaffold' }]);
+    expect(notes[0]!.includedItems).toEqual([{ seq: 2, description: 'Attendance on others' }]);
+    expect(notes[1]!.excludedItems).toEqual([]);
+    expect(notes[1]!.includedItems).toEqual([]);
+  });
+
+  it('skips a row with no cell at all for a return, rather than throwing', () => {
+    const rows = [{ seq: 1, description: 'Added by someone else', cells: [{ returnId: 'r2', status: 'priced' as const }] }];
+    expect(() => collectScopeNotes(returns, rows)).not.toThrow();
+    expect(collectScopeNotes(returns, rows)[0]!.includedItems).toEqual([]);
   });
 });
 

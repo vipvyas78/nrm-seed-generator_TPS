@@ -1,4 +1,4 @@
-import type { QuoteComparisonReadiness, QuoteComparisonSummary } from './api';
+import type { QuoteCellStatus, QuoteComparisonReadiness, QuoteComparisonSummary } from './api';
 
 /**
  * Pure presentation helpers for the levelled quote comparison (BuildFlow issue #100).
@@ -37,6 +37,33 @@ export function isReadyToApprove(readiness: QuoteComparisonReadiness): boolean {
 export function formatMoney(amount: number | null | undefined): string {
   if (amount == null) return '—';
   return `£${amount.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+export interface PriceCellDisplay {
+  /** The headline figure — the levelled total this comparison actually carries. */
+  primary: string;
+  /** The per-unit rate behind that total, shown beside it — the issue's own three-column
+   *  example asks for a price per quote, and a bare total hides whether a cheap-looking
+   *  figure came from a cheap rate or a tenderer quietly priced their own smaller quantity. */
+  secondary: string | null;
+  tone: 'priced' | 'assumed' | 'variant' | 'absent';
+}
+
+/** How one cell's price column reads — never re-deriving a figure, only formatting
+ *  exactly what the server already levelled (see quoteComparisonPanel.tsx's own doc
+ *  comment on why that line is never crossed from this side). */
+export function priceCellDisplay(
+  cell: { status: QuoteCellStatus; levelledTotal: number | null; levelledRate: number | null; isAssumed: boolean },
+  unit: string | null
+): PriceCellDisplay {
+  if (cell.status === 'priced_as_variant') {
+    return { primary: formatMoney(0), secondary: 'priced under their own wording — see below', tone: 'variant' };
+  }
+  if (cell.levelledTotal == null) {
+    return { primary: '—', secondary: cell.status === 'absent' ? 'no return' : null, tone: 'absent' };
+  }
+  const secondary = cell.levelledRate != null ? `${formatMoney(cell.levelledRate)}${unit ? `/${unit}` : ''}` : null;
+  return { primary: formatMoney(cell.levelledTotal), secondary, tone: cell.isAssumed ? 'assumed' : 'priced' };
 }
 
 /** Packages worth the estimator's attention first: not yet opened, or open and ready. A

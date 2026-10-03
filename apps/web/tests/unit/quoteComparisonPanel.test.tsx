@@ -20,15 +20,17 @@ function detail(over: Partial<QuoteComparisonDetail> = {}): QuoteComparisonDetai
     ],
     rows: [{
       id: 'row1', seq: 1, ge_code: null, element_code: null, description: 'Supply and fix roof tiles',
-      quantity: 500, unit: 'm2', is_priceable: true, origin: 'itt_bill', added_by_return_id: null,
+      quantity: 500, unit: 'm2', is_priceable: true, origin: 'itt_bill', added_by_return_id: null, variant_of_row_id: null,
       lowest: { rate: null, total: 4000, tendererName: 'Acme Roofing' },
       cells: [{
         returnId: 'r1', status: 'not_addressed', levelledRate: 8, levelledTotal: 4000,
         isAssumed: true, assumptionBasis: 'Not addressed by this tenderer. Levelled at the lowest quoted price (Acme Roofing, £4,000.00).',
-        tendererNote: null, estimatorNote: null, cellId: 'cell1', quotedRate: null, quotedTotal: null
+        tendererNote: null, estimatorNote: null, cellId: 'cell1', quotedRate: null, quotedTotal: null,
+        tendererDescription: null, pricedAsVariantRowId: null
       }]
     }],
     totals: [{ returnId: 'r1', tendererName: 'Acme Roofing', quotedSum: 0, levelledSum: 4000, pricedCount: 0, assumedCount: 1 }],
+    scopeNotes: [{ returnId: 'r1', qualifications: 'Standard hours', exclusions: 'Scaffold by others', programmeWeeks: 6, includedItems: [], excludedItems: [] }],
     ...over
   };
 }
@@ -119,6 +121,48 @@ describe('QuoteComparisonPanel', () => {
     await waitFor(() => expect(recordSpy).toHaveBeenCalled());
     const input = recordSpy.mock.calls[0]![2] as { extraLines: Array<{ description: string; rate: number | null }> };
     expect(input.extraLines).toEqual([{ description: 'Extra access scaffold', unit: null, quantity: null, rate: 250, status: 'priced', note: null }]);
+  });
+
+  it('shows a drifted line as the tenderer’s own variant, and lists it in the footer by name', async () => {
+    vi.spyOn(api, 'listQuoteComparisons').mockResolvedValue([
+      { package_name: 'Roofing', comparison_id: 'c1', opened_at: null, expected_count: 3, received_count: 1, return_deadline: null, readiness: 'awaiting_returns' }
+    ]);
+    vi.spyOn(api, 'getQuoteComparison').mockResolvedValue(detail({
+      rows: [
+        {
+          id: 'row1', seq: 1, ge_code: null, element_code: null, description: 'Supply and fix roof tiles',
+          quantity: 500, unit: 'm2', is_priceable: true, origin: 'itt_bill', added_by_return_id: null, variant_of_row_id: null,
+          lowest: { rate: null, total: 6000, tendererName: 'Acme Roofing' },
+          cells: [{
+            returnId: 'r1', status: 'priced_as_variant', levelledRate: 0, levelledTotal: 0,
+            isAssumed: true, assumptionBasis: 'Priced under their own wording — see "Supply and fix roof SLATES" below.',
+            tendererNote: null, estimatorNote: null, cellId: 'cell1', quotedRate: null, quotedTotal: null,
+            tendererDescription: 'Supply and fix roof SLATES', pricedAsVariantRowId: 'row1v'
+          }]
+        },
+        {
+          id: 'row1v', seq: 2, ge_code: null, element_code: null, description: 'Supply and fix roof SLATES',
+          quantity: 500, unit: 'm2', is_priceable: true, origin: 'tenderer_variant', added_by_return_id: 'r1', variant_of_row_id: 'row1',
+          lowest: { rate: 15, total: 7500, tendererName: 'Acme Roofing' },
+          cells: [{
+            returnId: 'r1', status: 'priced', levelledRate: 15, levelledTotal: 7500,
+            isAssumed: false, assumptionBasis: null, tendererNote: null, estimatorNote: null, cellId: 'cell2',
+            quotedRate: 15, quotedTotal: 7500, tendererDescription: null, pricedAsVariantRowId: null
+          }]
+        }
+      ],
+      totals: [{ returnId: 'r1', tendererName: 'Acme Roofing', quotedSum: 7500, levelledSum: 7500, pricedCount: 1, assumedCount: 1 }],
+      scopeNotes: [{ returnId: 'r1', qualifications: null, exclusions: null, programmeWeeks: null, includedItems: [], excludedItems: [{ seq: 3, description: 'Scaffold' }] }]
+    }));
+
+    renderWithClient(<QuoteComparisonPanel workflowId="w1" />);
+    await screen.findByText('Roofing');
+
+    expect(await screen.findByText('their own wording')).toBeInTheDocument();
+    expect(screen.getByText('Supply and fix roof SLATES')).toBeInTheDocument();
+    expect(screen.getByText(/their wording: “Supply and fix roof SLATES”/)).toBeInTheDocument();
+    // The footer lists the line by name, not just the header text.
+    expect(screen.getByText('Scaffold')).toBeInTheDocument();
   });
 
   it('shows the exclusions and qualifications a tenderer stated, verbatim', async () => {

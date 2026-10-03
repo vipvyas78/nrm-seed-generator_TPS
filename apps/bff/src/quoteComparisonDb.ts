@@ -38,8 +38,40 @@ import { knownReturnDeadlineSql } from './tenderReturnPeriod.js';
 // ─────────────────────────────────────────────────────────────── pure levelling rules
 
 export type ReturnLineStatus = 'priced' | 'included' | 'excluded' | 'not_addressed';
-export type CellStatus = ReturnLineStatus | 'absent';
+export type CellStatus = ReturnLineStatus | 'absent' | 'priced_as_variant';
 export type ComparisonReadiness = 'awaiting_returns' | 'quorum_met' | 'deadline_passed';
+
+// Construction shorthand this trade routinely spells three or four different ways for the
+// same unit — a tenderer writing "sq m" against a bill that reads "m2" is not a different
+// item, and must not be read as one.
+const UNIT_SYNONYMS: Record<string, string> = {
+  m2: 'm2', 'm²': 'm2', sqm: 'm2', 'sq.m': 'm2', 'sq m': 'm2', 'sq.m.': 'm2',
+  m3: 'm3', 'm³': 'm3', cum: 'm3', 'cu.m': 'm3', 'cu m': 'm3', 'cu.m.': 'm3',
+  lm: 'lm', 'l.m': 'lm', 'l.m.': 'lm', 'lin m': 'lm', 'linear m': 'lm', 'linear metre': 'lm', 'linear metres': 'lm',
+  nr: 'nr', no: 'nr', 'no.': 'nr', each: 'nr', ea: 'nr', item: 'item', item2: 'item'
+};
+
+function normalizeUnit(unit: string | null): string {
+  if (!unit) return '';
+  const key = unit.trim().toLowerCase().replace(/\s+/g, ' ');
+  return UNIT_SYNONYMS[key] ?? key;
+}
+
+function normalizeDescription(description: string): string {
+  return description.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/**
+ * Whether a tenderer's own line is the SAME item as the reference bill line at that
+ * position, or a genuine discrepancy — the issue's own "slight discrepancy within the
+ * description" is exactly what a strict string comparison would over-report: a trailing
+ * space, a capital letter, or "sq m" against "m2" is not a different item, and treating it
+ * as one would spawn a variant row (and hide the tenderer's own money on it) for nothing.
+ */
+export function sameItem(a: { description: string; unit: string | null }, b: { description: string; unit: string | null }): boolean {
+  return normalizeDescription(a.description) === normalizeDescription(b.description)
+    && normalizeUnit(a.unit) === normalizeUnit(b.unit);
+}
 
 /** The issue's own number: "app should expect at least three quotes." */
 export const QUOTE_QUORUM = 3;
@@ -141,7 +173,12 @@ export function findLowestQuote(quotes: Array<{ total: number | null; rate: numb
  * view: a line they did not price, for whatever reason.
  */
 export function boqStatusFor(status: CellStatus): ReturnLineStatus {
-  return status === 'absent' ? 'not_addressed' : status;
+  if (status === 'absent') return 'not_addressed';
+  // Never actually reaches this far — `approve()` skips a row entirely once its cell is
+  // `priced_as_variant`, since the variant row sitting under it becomes the real BoQ line
+  // (see `approve`'s own filter). Kept total and type-safe regardless.
+  if (status === 'priced_as_variant') return 'excluded';
+  return status;
 }
 
 /** One tenderer's two totals — what they actually quoted, and what the comparison
@@ -158,6 +195,38 @@ export function sumTotals(cells: Array<{ status: CellStatus; quotedTotal: number
     if (cell.levelledTotal != null) levelledSum += cell.levelledTotal;
   }
   return { quotedSum, levelledSum, pricedCount, assumedCount };
+}
+
+export interface ScopeNoteRow { seq: number; description: string; cells: Array<{ returnId: string; status: CellStatus }> }
+export interface ScopeNotes {
+  returnId: string; qualifications: string | null; exclusions: string | null; programmeWeeks: number | null;
+  includedItems: Array<{ seq: number; description: string }>;
+  excludedItems: Array<{ seq: number; description: string }>;
+}
+
+/**
+ * The issue's own closing instruction: "list out all the exclusions and inclusions made
+ * by the subcontractors so that it is a complete comparison for estimators to review" —
+ * not just the free-text header a return carries (`qualifications`/`exclusions`), but
+ * every LINE a tenderer marked included or excluded, by name. Reusing the already-levelled
+ * grid rather than re-reading raw cells means an own-wording variant or an own-added line
+ * a tenderer excluded is picked up exactly the same way a bill line is.
+ */
+export function collectScopeNotes(
+  returns: Array<{ id: string; qualifications: string | null; exclusions: string | null; programmeWeeks: number | null }>,
+  rows: ScopeNoteRow[]
+): ScopeNotes[] {
+  return returns.map((ret) => {
+    const includedItems: Array<{ seq: number; description: string }> = [];
+    const excludedItems: Array<{ seq: number; description: string }> = [];
+    for (const row of rows) {
+      const cell = row.cells.find((c) => c.returnId === ret.id);
+      if (!cell) continue;
+      if (cell.status === 'included') includedItems.push({ seq: row.seq, description: row.description });
+      else if (cell.status === 'excluded') excludedItems.push({ seq: row.seq, description: row.description });
+    }
+    return { returnId: ret.id, qualifications: ret.qualifications, exclusions: ret.exclusions, programmeWeeks: ret.programmeWeeks, includedItems, excludedItems };
+  });
 }
 
 // ──────────────────────────────────────────────────────────────────── the database
@@ -356,10 +425,7 @@ export class QuoteComparisonDatabase {
         const row = (line.comparison_row_id ? byId.get(String(line.comparison_row_id)) : undefined)
           ?? (line.seq != null ? bySeq.get(Number(line.seq)) : undefined);
         if (!row) continue; // No seq, or beyond the reference bill's own length — nothing to attach to.
-        const mismatched = row.description !== line.description || (row.unit ?? null) !== (line.unit ?? null);
-        await this.upsertCell(client, String(row.id), String(ret.id), line, mismatched
-          ? `This tenderer’s own line here (“${line.description}”) does not match the reference bill line (“${row.description}”) — reconcile by hand.`
-          : null);
+        await this.upsertMatchedLine(client, comparisonId, row, ret, line);
       }
       // A return with fewer lines than the spine has rows it never even listed — those
       // stay `absent` at read time (getComparison) rather than a manufactured row here;
@@ -367,25 +433,78 @@ export class QuoteComparisonDatabase {
     }
   }
 
-  private async upsertCell(client: PoolClient, rowId: string, returnId: string, line: Row, mismatchNote: string | null = null): Promise<void> {
-    if (mismatchNote) {
-      await this.db.query(
-        `INSERT INTO tps.quote_comparison_cells (row_id, return_id, quoted_rate, quoted_total, status, is_assumed, assumption_basis, tenderer_note)
-         VALUES ($1, $2, NULL, NULL, 'not_addressed', TRUE, $3, $4)
-         ON CONFLICT (row_id, return_id) DO UPDATE SET
-           quoted_rate = NULL, quoted_total = NULL, status = 'not_addressed', is_assumed = TRUE,
-           assumption_basis = EXCLUDED.assumption_basis, tenderer_note = EXCLUDED.tenderer_note, updated_at = NOW()`,
-        [rowId, returnId, mismatchNote, line.note], client
-      );
+  /**
+   * One tenderer's own line against the spine row it was matched to (by `comparison_row_id`
+   * or `seq` — see `refreshCells`). Not the same item at all is `sameItem`'s job to say —
+   * this decides what to do once it has: a genuine discrepancy with a figure behind it
+   * becomes its OWN row (the issue's own example, "create a separate item describing the
+   * pricing"), never a cell whose money was simply discarded.
+   */
+  private async upsertMatchedLine(client: PoolClient, comparisonId: string, row: Row, ret: Row, line: Row): Promise<void> {
+    const drifted = !sameItem(
+      { description: String(row.description), unit: (row.unit as string | null) ?? null },
+      { description: String(line.description), unit: (line.unit as string | null) ?? null }
+    );
+    const hasFigure = drifted && (line.status === 'priced' || line.status === 'included') && line.total != null;
+
+    // Any variant from a PREVIOUS refresh of this exact (spine row, return) pair is
+    // cleared before deciding what THIS pass needs — a resubmission whose wording now
+    // matches, or one that stopped pricing the item altogether, must not leave a stale
+    // item behind with money nobody stands behind any more. Harmless, and a no-op, on
+    // every line that never had a variant to begin with.
+    await this.db.query(
+      `DELETE FROM tps.quote_comparison_rows WHERE variant_of_row_id = $1 AND added_by_return_id = $2`,
+      [row.id, ret.id], client
+    );
+
+    if (!hasFigure) {
+      // Either the same item, or a drifted wording with no money behind it (excluded, not
+      // addressed, or "priced" with no rate given) — nothing to preserve as its own line.
+      // Level normally; `tenderer_description`, when set, is shown for transparency only.
+      await this.upsertCell(client, String(row.id), String(ret.id), line, { tendererDescription: drifted ? String(line.description) : null });
       return;
     }
+
+    const [variantRow] = await this.db.query<{ id: string }>(
+      `INSERT INTO tps.quote_comparison_rows
+         (comparison_id, seq, ge_code, element_code, description, quantity, unit, is_priceable, origin, added_by_return_id, variant_of_row_id)
+       VALUES ($1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM tps.quote_comparison_rows WHERE comparison_id = $1),
+               $2, $3, $4, $5, $6, TRUE, 'tenderer_variant', $7, $8)
+       RETURNING id`,
+      [comparisonId, row.ge_code, row.element_code, line.description, line.quantity, line.unit, ret.id, row.id],
+      client
+    );
+    await this.upsertCell(client, String(variantRow!.id), String(ret.id), line, {});
+
+    // The spine cell records that this tenderer priced it under their own wording rather
+    // than competing for the row's normal substitution — the variant row above carries the
+    // actual figure, so this one levels to zero rather than being counted twice.
     await this.db.query(
-      `INSERT INTO tps.quote_comparison_cells (row_id, return_id, quoted_rate, quoted_total, status, is_assumed, assumption_basis, tenderer_note)
-       VALUES ($1, $2, $3, $4, $5, FALSE, NULL, $6)
+      `INSERT INTO tps.quote_comparison_cells
+         (row_id, return_id, status, is_assumed, assumption_basis, tenderer_note, priced_as_variant_row_id, tenderer_description)
+       VALUES ($1, $2, 'priced_as_variant', TRUE, $3, $4, $5, $6)
+       ON CONFLICT (row_id, return_id) DO UPDATE SET
+         quoted_rate = NULL, quoted_total = NULL, status = 'priced_as_variant', is_assumed = TRUE,
+         assumption_basis = EXCLUDED.assumption_basis, tenderer_note = EXCLUDED.tenderer_note,
+         priced_as_variant_row_id = EXCLUDED.priced_as_variant_row_id,
+         tenderer_description = EXCLUDED.tenderer_description, updated_at = NOW()`,
+      [row.id, ret.id, `Priced under their own wording — see “${line.description}” below.`, line.note, variantRow!.id, line.description],
+      client
+    );
+  }
+
+  private async upsertCell(
+    client: PoolClient, rowId: string, returnId: string, line: Row,
+    opts: { tendererDescription?: string | null } = {}
+  ): Promise<void> {
+    await this.db.query(
+      `INSERT INTO tps.quote_comparison_cells (row_id, return_id, quoted_rate, quoted_total, status, is_assumed, assumption_basis, tenderer_note, tenderer_description)
+       VALUES ($1, $2, $3, $4, $5, FALSE, NULL, $6, $7)
        ON CONFLICT (row_id, return_id) DO UPDATE SET
          quoted_rate = EXCLUDED.quoted_rate, quoted_total = EXCLUDED.quoted_total, status = EXCLUDED.status,
-         is_assumed = FALSE, assumption_basis = NULL, tenderer_note = EXCLUDED.tenderer_note, updated_at = NOW()`,
-      [rowId, returnId, line.rate, line.total, line.status, line.note], client
+         is_assumed = FALSE, assumption_basis = NULL, tenderer_note = EXCLUDED.tenderer_note,
+         tenderer_description = EXCLUDED.tenderer_description, updated_at = NOW()`,
+      [rowId, returnId, line.rate, line.total, line.status, line.note, opts.tendererDescription ?? null], client
     );
   }
 
@@ -436,7 +555,17 @@ export class QuoteComparisonDatabase {
       `SELECT * FROM tender_returns WHERE workflow_id = $1 AND package_name = $2 ORDER BY received_at`,
       [workflowId, packageName], client
     );
-    const rows = await this.db.query<Row>(`SELECT * FROM tps.quote_comparison_rows WHERE comparison_id = $1 ORDER BY seq`, [comparison.id], client);
+    // Variant rows sort directly under the spine row they are a variant OF — a self-join
+    // on that (nullable) link, spine rows first within a group, then their variants by
+    // their own seq — rather than at the end of the table wherever `MAX(seq)+1` happened
+    // to land them when they were created.
+    const rows = await this.db.query<Row>(
+      `SELECT r.* FROM tps.quote_comparison_rows r
+         LEFT JOIN tps.quote_comparison_rows parent ON parent.id = r.variant_of_row_id
+        WHERE r.comparison_id = $1
+        ORDER BY COALESCE(parent.seq, r.seq), (r.origin = 'tenderer_variant')::int, r.seq`,
+      [comparison.id], client
+    );
     const cells = await this.db.query<Row>(
       `SELECT c.* FROM tps.quote_comparison_cells c
          JOIN tps.quote_comparison_rows r ON r.id = c.row_id
@@ -449,18 +578,35 @@ export class QuoteComparisonDatabase {
       list.push(cell);
       cellsByRow.set(String(cell.row_id), list);
     }
+    // A spine row's own variants, so their quoted figures count toward "the cheapest price
+    // among the different quotations received" too — the issue's own wording — rather than
+    // only the literal item's own cells. A tenderer who never mentioned the literal item at
+    // all should still be substituted against a price another tenderer gave for it, even if
+    // that other tenderer gave it under their own wording.
+    const variantRowsByParent = new Map<string, Row[]>();
+    for (const r of rows) {
+      if (r.origin === 'tenderer_variant' && r.variant_of_row_id != null) {
+        const key = String(r.variant_of_row_id);
+        const list = variantRowsByParent.get(key) ?? [];
+        list.push(r);
+        variantRowsByParent.set(key, list);
+      }
+    }
 
     type GridCell = {
       returnId: string; status: CellStatus; levelledRate: number | null; levelledTotal: number | null;
       isAssumed: boolean; assumptionBasis: string | null; tendererNote: string | null; estimatorNote: string | null;
       cellId: string | null; quotedRate: number | null; quotedTotal: number | null;
+      tendererDescription: string | null; pricedAsVariantRowId: string | null;
     };
 
     const grid = rows.map((row) => {
       const present = cellsByRow.get(String(row.id)) ?? [];
       const byReturn = new Map(present.map((c) => [String(c.return_id), c]));
+      const variantCandidates = (variantRowsByParent.get(String(row.id)) ?? [])
+        .flatMap((v) => cellsByRow.get(String(v.id)) ?? []);
       const lowest = findLowestQuote(
-        present.filter((c) => c.status === 'priced' && c.quoted_total != null)
+        [...present, ...variantCandidates].filter((c) => c.status === 'priced' && c.quoted_total != null)
           .map((c) => ({
             total: Number(c.quoted_total), rate: c.quoted_rate != null ? Number(c.quoted_rate) : null,
             tendererName: String(returns.find((r) => String(r.id) === String(c.return_id))?.tenderer_name ?? '')
@@ -469,21 +615,25 @@ export class QuoteComparisonDatabase {
 
       const levelledCells: GridCell[] = returns.map((ret) => {
         const returnId = String(ret.id);
-        // A tenderer-added row is, by construction, absent for every OTHER tenderer.
-        if (row.origin === 'tenderer_added' && String(row.added_by_return_id) !== returnId) {
+        // A tenderer- or variant-added row is, by construction, absent for every OTHER
+        // tenderer — someone else's own wording or own reconciliation line is simply not
+        // theirs to have priced.
+        if ((row.origin === 'tenderer_added' || row.origin === 'tenderer_variant') && String(row.added_by_return_id) !== returnId) {
           const l = levelCell({ lineStatus: null, quotedRate: null, quotedTotal: null, lowest: null });
-          return { returnId, ...l, tendererNote: null, estimatorNote: null, cellId: null, quotedRate: null, quotedTotal: null };
+          return { returnId, ...l, tendererNote: null, estimatorNote: null, cellId: null, quotedRate: null, quotedTotal: null, tendererDescription: null, pricedAsVariantRowId: null };
         }
         const existing = byReturn.get(returnId);
-        if (existing && typeof existing.assumption_basis === 'string' && existing.assumption_basis.includes('reconcile by hand')) {
-          // A seq collision the reference bill did not expect — surfaced as-is, not
-          // re-levelled, since there is nothing safe to substitute for a line that may not
-          // even be the same item.
+        if (existing?.status === 'priced_as_variant') {
+          // Priced, just under this tenderer's own wording — the variant row alongside
+          // this one carries the actual figure, so this cell levels to zero rather than
+          // competing for the same money twice (see `upsertMatchedLine`).
           return {
-            returnId, status: 'not_addressed', levelledRate: null, levelledTotal: null,
-            isAssumed: true, assumptionBasis: existing.assumption_basis,
+            returnId, status: 'priced_as_variant', levelledRate: 0, levelledTotal: 0,
+            isAssumed: true, assumptionBasis: (existing.assumption_basis as string | null) ?? null,
             tendererNote: (existing.tenderer_note as string | null) ?? null, estimatorNote: (existing.estimator_note as string | null) ?? null,
-            cellId: String(existing.id), quotedRate: null, quotedTotal: null
+            cellId: String(existing.id), quotedRate: null, quotedTotal: null,
+            tendererDescription: (existing.tenderer_description as string | null) ?? null,
+            pricedAsVariantRowId: existing.priced_as_variant_row_id ? String(existing.priced_as_variant_row_id) : null
           };
         }
         const levelled = levelCell({
@@ -497,7 +647,9 @@ export class QuoteComparisonDatabase {
           tendererNote: (existing?.tenderer_note as string | null) ?? null, estimatorNote: (existing?.estimator_note as string | null) ?? null,
           cellId: existing?.id ? String(existing.id) : null,
           quotedRate: existing?.quoted_rate != null ? Number(existing.quoted_rate) : null,
-          quotedTotal: existing?.quoted_total != null ? Number(existing.quoted_total) : null
+          quotedTotal: existing?.quoted_total != null ? Number(existing.quoted_total) : null,
+          tendererDescription: (existing?.tenderer_description as string | null) ?? null,
+          pricedAsVariantRowId: null
         };
       });
       return { ...row, lowest, cells: levelledCells };
@@ -512,7 +664,15 @@ export class QuoteComparisonDatabase {
       return { returnId, tendererName: ret.tenderer_name, ...summed };
     });
 
-    return { comparison, returns, rows: grid, totals };
+    const scopeNotes = collectScopeNotes(
+      returns.map((r) => ({
+        id: String(r.id), qualifications: (r.qualifications as string | null) ?? null,
+        exclusions: (r.exclusions as string | null) ?? null, programmeWeeks: r.programme_weeks != null ? Number(r.programme_weeks) : null
+      })),
+      (grid as Array<Row & { cells: GridCell[] }>).map((row) => ({ seq: Number(row.seq), description: String(row.description), cells: row.cells }))
+    );
+
+    return { comparison, returns, rows: grid, totals, scopeNotes };
   }
 
   /**
@@ -688,7 +848,17 @@ export class QuoteComparisonDatabase {
       await this.db.query(`DELETE FROM tender_boq_lines WHERE workflow_id = $1 AND package_name = $2`, [workflowId, packageName], client);
 
       const values = rows
-        .filter((r) => r.origin !== 'tenderer_added' || String(r.added_by_return_id) === awardedReturnId)
+        .filter((r) => {
+          // Someone else's own wording or own reconciliation line is never this award's to
+          // carry — only the winner's own.
+          const isAddedRowType = r.origin === 'tenderer_added' || r.origin === 'tenderer_variant';
+          if (isAddedRowType && String(r.added_by_return_id) !== awardedReturnId) return false;
+          // The winner priced THIS spine line under their own wording — the variant row
+          // just below it (origin 'tenderer_variant', caught by the branch above) becomes
+          // its own BoQ line instead, so the spine line itself is not also emitted at zero.
+          if (cellByRow.get(String(r.id))?.status === 'priced_as_variant') return false;
+          return true;
+        })
         .map((row) => {
           const cell = cellByRow.get(String(row.id));
           const adjusted = cell ? cell.isAssumed : true;

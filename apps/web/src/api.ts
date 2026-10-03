@@ -729,7 +729,7 @@ export type PortalRfiInput = {
 
 export type QuoteComparisonReadiness = 'awaiting_returns' | 'quorum_met' | 'deadline_passed';
 export type QuoteLineStatus = 'priced' | 'included' | 'excluded' | 'not_addressed';
-export type QuoteCellStatus = QuoteLineStatus | 'absent';
+export type QuoteCellStatus = QuoteLineStatus | 'absent' | 'priced_as_variant';
 
 export type QuoteComparisonSummary = {
   package_name: string;
@@ -766,6 +766,12 @@ export type QuoteComparisonCell = {
   cellId: string | null;
   quotedRate: number | null;
   quotedTotal: number | null;
+  /** The tenderer's own wording for this line, kept for display even when it drifted with
+   *  no figure behind it (excluded/not addressed under a different description). */
+  tendererDescription: string | null;
+  /** Set only when `status` is 'priced_as_variant' — the row carrying this tenderer's own
+   *  figure for the item, directly below this one in `rows`. */
+  pricedAsVariantRowId: string | null;
 };
 
 export type QuoteComparisonLowest = { rate: number | null; total: number; tendererName: string } | null;
@@ -779,8 +785,10 @@ export type QuoteComparisonRow = {
   quantity: number | null;
   unit: string | null;
   is_priceable: boolean;
-  origin: 'itt_bill' | 'tenderer_added' | 'estimator_added';
+  origin: 'itt_bill' | 'tenderer_added' | 'tenderer_variant' | 'estimator_added';
   added_by_return_id: string | null;
+  /** Set only for origin 'tenderer_variant' — the spine row this is a variant OF. */
+  variant_of_row_id: string | null;
   lowest: QuoteComparisonLowest;
   cells: QuoteComparisonCell[];
 };
@@ -794,6 +802,19 @@ export type QuoteComparisonTotal = {
   assumedCount: number;
 };
 
+/** One tenderer's inclusions and exclusions, gathered from both their header text and
+ *  every line they actually marked included/excluded — the issue's own closing
+ *  instruction: "list out all the exclusions and inclusions ... for a complete
+ *  comparison." */
+export type QuoteComparisonScopeNotes = {
+  returnId: string;
+  qualifications: string | null;
+  exclusions: string | null;
+  programmeWeeks: number | null;
+  includedItems: Array<{ seq: number; description: string }>;
+  excludedItems: Array<{ seq: number; description: string }>;
+};
+
 export type QuoteComparisonDetail = {
   comparison: {
     id: string; readiness: QuoteComparisonReadiness; expected_count: number;
@@ -802,6 +823,7 @@ export type QuoteComparisonDetail = {
   returns: QuoteComparisonReturn[];
   rows: QuoteComparisonRow[];
   totals: QuoteComparisonTotal[];
+  scopeNotes: QuoteComparisonScopeNotes[];
 };
 
 export type ManualQuoteReturnInput = {

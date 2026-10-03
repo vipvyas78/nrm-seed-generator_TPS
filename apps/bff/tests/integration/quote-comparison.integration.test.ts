@@ -101,7 +101,7 @@ describe('the levelled quote comparison', () => {
     }
   });
 
-  it('aligns two real portal snapshots on seq, and reports a snapshot that has drifted', async () => {
+  it('aligns two real portal snapshots on seq, and keeps a drifted line’s own figure as a variant rather than discarding it', async () => {
     const { db, portalDb, tpDb } = connect();
     const f = await fixture(db, tpDb);
     try {
@@ -148,8 +148,8 @@ describe('the levelled quote comparison', () => {
       expect(comparison.readiness).toBe('awaiting_returns'); // 2 of 3 expected, no deadline set
 
       const detail = await tpDb.getQuoteComparison(f.actor, f.workflowId, f.packageName);
-      const rows = detail.rows as Array<Row & { description: string; cells: Array<Row & { returnId: string; status: string; quotedTotal: number | null; isAssumed: boolean; assumptionBasis: string | null }> }>;
-      expect(rows).toHaveLength(3); // B's bill (the reference) is the whole spine
+      const rows = detail.rows as Array<Row & { description: string; origin: string; cells: Array<Row & { returnId: string; status: string; quotedTotal: number | null; levelledTotal: number | null; isAssumed: boolean; assumptionBasis: string | null }> }>;
+      expect(rows).toHaveLength(4); // B's three-line bill, plus A's own variant of the roofing line
 
       const returns = detail.returns as Array<{ id: string; tenderer_name: string }>;
       const firmA = returns.find((r) => r.tenderer_name.startsWith('Firm A'))!;
@@ -162,16 +162,26 @@ describe('the levelled quote comparison', () => {
 
       const roofing = rows.find((r) => r.description === 'Supply and fix roof tiles')!;
       const aOnRoofing = roofing.cells.find((c) => c.returnId === firmA.id)!;
-      // The drifted line: not paired as a priced quote, and said so rather than guessed.
-      expect(aOnRoofing.status).toBe('not_addressed');
+      // The drifted line — priced under A's own wording rather than discarded. The spine
+      // cell says so and points at the variant row below it; nothing was guessed.
+      expect(aOnRoofing.status).toBe('priced_as_variant');
       expect(aOnRoofing.quotedTotal).toBeNull();
+      expect(aOnRoofing.levelledTotal).toBe(0); // the variant row below carries the real figure
       expect(aOnRoofing.isAssumed).toBe(true);
-      expect(aOnRoofing.assumptionBasis).toContain('reconcile by hand');
+      expect(aOnRoofing.assumptionBasis).toContain('own wording');
       expect(aOnRoofing.assumptionBasis).toContain('roof SLATES');
 
       const bOnRoofing = roofing.cells.find((c) => c.returnId === firmB.id)!;
       expect(bOnRoofing.status).toBe('priced');
-      expect(bOnRoofing.quotedTotal).toBe(6000); // 500 x 12, untouched by A's mismatch
+      expect(bOnRoofing.quotedTotal).toBe(6000); // 500 x 12, untouched by A's own wording
+
+      const slateVariant = rows.find((r) => r.description === 'Supply and fix roof SLATES')!;
+      expect(slateVariant.origin).toBe('tenderer_variant');
+      const aOnVariant = slateVariant.cells.find((c) => c.returnId === firmA.id)!;
+      expect(aOnVariant.status).toBe('priced');
+      expect(aOnVariant.quotedTotal).toBe(7500); // 500 x 15 — A's own figure, finally counted
+      const bOnVariant = slateVariant.cells.find((c) => c.returnId === firmB.id)!;
+      expect(bOnVariant.status).toBe('absent'); // not theirs to have priced
 
       const testing = rows.find((r) => r.description === 'Testing and commissioning')!;
       const aOnTesting = testing.cells.find((c) => c.returnId === firmA.id)!;
@@ -180,6 +190,80 @@ describe('the levelled quote comparison', () => {
       expect(aOnTesting.assumptionBasis).toContain('Not in this tenderer’s return');
       expect(aOnTesting.quotedTotal).toBeNull();
       expect(aOnTesting.levelledTotal).toBe(1000); // substituted from B, the only priced quote
+    } finally {
+      await cleanup(db, f);
+    }
+  });
+
+  it('keeps exactly one variant across repeated refreshes, and carries it as the awarded tenderer’s own BoQ line', async () => {
+    const { db, portalDb, tpDb } = connect();
+    const f = await fixture(db, tpDb);
+    try {
+      // A real deadline, stamped and past — readiness only needs to allow approve() to run
+      // at all; the variant behaviour is the same with 2 returns or 3.
+      await db.query(`INSERT INTO itt_letter_details (workflow_id, tender_return_deadline) VALUES ($1, '2020-01-01')`, [f.workflowId]);
+
+      const linkB = await portalDb.mintOrRefreshLink({
+        shortlistEntryId: f.entryIds[0]!, workflowId: f.workflowId, packageName: f.packageName,
+        subcontractorId: null, tendererName: 'Firm B (reference)', recipientEmail: 'b@example.com', isTest: true, ttlDays: 30
+      });
+      await portalDb.snapshotLines(linkB.id, [
+        { sourceItemId: null, geCode: null, elementCode: null, description: 'Mobilisation', quantity: 1, unit: 'item', isPriceable: true },
+        { sourceItemId: null, geCode: null, elementCode: null, description: 'Supply and fix roof tiles', quantity: 500, unit: 'm2', isPriceable: true },
+        { sourceItemId: null, geCode: null, elementCode: null, description: 'Testing and commissioning', quantity: 1, unit: 'item', isPriceable: true }
+      ]);
+      await portalDb.saveDraft(linkB.id, {
+        header: { programmeWeeks: null, qualifications: null, exclusions: null },
+        lines: (await portalDb.getLines(linkB.id)).map((l, i) => ({ id: String(l.id), quantity: Number(l.quantity), rate: [200, 12, 1000][i]!, status: 'priced', note: null }))
+      });
+      await portalDb.submit(linkB.id);
+
+      const linkA = await portalDb.mintOrRefreshLink({
+        shortlistEntryId: f.entryIds[1]!, workflowId: f.workflowId, packageName: f.packageName,
+        subcontractorId: null, tendererName: 'Firm A (older bill)', recipientEmail: 'a@example.com', isTest: true, ttlDays: 30
+      });
+      await portalDb.snapshotLines(linkA.id, [
+        { sourceItemId: null, geCode: null, elementCode: null, description: 'Mobilisation', quantity: 1, unit: 'item', isPriceable: true },
+        { sourceItemId: null, geCode: null, elementCode: null, description: 'Supply and fix roof SLATES', quantity: 500, unit: 'm2', isPriceable: true }
+      ]);
+      await portalDb.saveDraft(linkA.id, {
+        header: { programmeWeeks: null, qualifications: null, exclusions: null },
+        lines: (await portalDb.getLines(linkA.id)).map((l, i) => ({ id: String(l.id), quantity: Number(l.quantity), rate: [200, 10][i]!, status: 'priced', note: null }))
+      });
+      await portalDb.submit(linkA.id);
+
+      await tpDb.openQuoteComparison(f.actor, f.workflowId, f.packageName);
+      await tpDb.openQuoteComparison(f.actor, f.workflowId, f.packageName); // "Refresh", pressed twice more
+      await tpDb.openQuoteComparison(f.actor, f.workflowId, f.packageName);
+
+      const variantRows = await db.query<{ id: string }>(
+        `SELECT r.id FROM tps.quote_comparison_rows r
+           JOIN tps.quote_comparisons c ON c.id = r.comparison_id
+          WHERE c.workflow_id = $1 AND c.package_name = $2 AND r.origin = 'tenderer_variant'`,
+        [f.workflowId, f.packageName]
+      );
+      expect(variantRows).toHaveLength(1); // three refreshes of the same data, still exactly one variant
+
+      const detail = await tpDb.getQuoteComparison(f.actor, f.workflowId, f.packageName);
+      expect(detail.scopeNotes).toBeDefined(); // wired through getQuoteComparison, not just computed and dropped
+
+      const returns = await db.query<{ id: string; tenderer_name: string }>(`SELECT id, tenderer_name FROM tender_returns WHERE workflow_id = $1`, [f.workflowId]);
+      const firmA = returns.find((r) => r.tenderer_name.startsWith('Firm A'))!;
+
+      // Firm A is cheaper on the roofing line (10 vs 12) but priced it under their own
+      // wording — awarding them must carry THAT line, not a zero-value duplicate of the
+      // spine's own wording for the same item.
+      await tpDb.approveQuoteComparison(f.actor, f.workflowId, f.packageName, firmA.id, null);
+
+      const boqLines = await db.query<{ description: string; approved_total: string | null }>(
+        `SELECT description, approved_total FROM tender_boq_lines WHERE workflow_id = $1 AND package_name = $2 ORDER BY description`,
+        [f.workflowId, f.packageName]
+      );
+      const descriptions = boqLines.map((l) => l.description);
+      expect(descriptions).not.toContain('Supply and fix roof tiles'); // the spine line — skipped, the variant below carries the item
+      expect(descriptions).toContain('Supply and fix roof SLATES');
+      const roofingLine = boqLines.find((l) => l.description === 'Supply and fix roof SLATES')!;
+      expect(Number(roofingLine.approved_total)).toBe(5000); // 500 x 10, Firm A's own figure
     } finally {
       await cleanup(db, f);
     }
