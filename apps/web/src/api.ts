@@ -772,6 +772,28 @@ export type QuoteComparisonCell = {
   /** Set only when `status` is 'priced_as_variant' — the row carrying this tenderer's own
    *  figure for the item, directly below this one in `rows`. */
   pricedAsVariantRowId: string | null;
+  /** Final adjustments (BuildFlow issue #100's own closing step). `levelledRate`/
+   *  `levelledTotal` above are already override-aware; these carry what the automatic
+   *  rule alone would have said, and whether a human has since overridden it. */
+  hasOverride: boolean;
+  overrideStale: boolean;
+  adjustmentReason: string | null;
+  autoLevelledRate: number | null;
+  autoLevelledTotal: number | null;
+};
+
+/** One entry in a cell's adjustment history — set, then cleared, then set again
+ *  differently — kept so a figure changed more than once stays visible, not just the
+ *  latest. */
+export type QuoteComparisonAdjustment = {
+  id: number;
+  action: 'set' | 'cleared';
+  previous_rate: number | null;
+  previous_total: number | null;
+  new_rate: number | null;
+  new_total: number | null;
+  reason: string;
+  occurred_at: string;
 };
 
 export type QuoteComparisonLowest = { rate: number | null; total: number; tendererName: string } | null;
@@ -1216,6 +1238,21 @@ export const api = {
       `/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/queries/send`,
       { method: 'POST', body: JSON.stringify({ returnId, recipientEmail }) }
     ),
+
+  // Final adjustments (BuildFlow issue #100)
+  setQuoteComparisonAdjustment: (
+    workflowId: string, comparisonId: string, cellId: string,
+    input: { rate?: number | null; total?: number | null; reason: string; queryId?: string | null }
+  ) =>
+    request<QuoteComparisonCell>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/cells/${cellId}/adjustment`, {
+      method: 'PUT', body: JSON.stringify(input)
+    }),
+  clearQuoteComparisonAdjustment: (workflowId: string, comparisonId: string, cellId: string, reason: string) =>
+    request<QuoteComparisonCell>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/cells/${cellId}/adjustment/clear`, {
+      method: 'POST', body: JSON.stringify({ reason })
+    }),
+  quoteComparisonAdjustmentHistory: (workflowId: string, comparisonId: string, cellId: string) =>
+    request<QuoteComparisonAdjustment[]>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/cells/${cellId}/adjustments`),
 
   // Step 4: Submission
   getSubmission: (workflowId: string) => request<TenderSubmission | null>(`/api/tender-prep/${workflowId}/submission`),

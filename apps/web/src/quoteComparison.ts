@@ -40,30 +40,40 @@ export function formatMoney(amount: number | null | undefined): string {
 }
 
 export interface PriceCellDisplay {
-  /** The headline figure — the levelled total this comparison actually carries. */
+  /** The headline figure — what this comparison actually carries, override included. */
   primary: string;
   /** The per-unit rate behind that total, shown beside it — the issue's own three-column
    *  example asks for a price per quote, and a bare total hides whether a cheap-looking
    *  figure came from a cheap rate or a tenderer quietly priced their own smaller quantity. */
   secondary: string | null;
-  tone: 'priced' | 'assumed' | 'variant' | 'absent';
+  /** The automatic figure an override replaced — shown struck through alongside it, so a
+   *  reviewer sees what it WAS as well as what it reads now. Set only when `hasOverride`. */
+  strikethrough: string | null;
+  tone: 'priced' | 'assumed' | 'variant' | 'absent' | 'override';
 }
 
 /** How one cell's price column reads — never re-deriving a figure, only formatting
  *  exactly what the server already levelled (see quoteComparisonPanel.tsx's own doc
  *  comment on why that line is never crossed from this side). */
 export function priceCellDisplay(
-  cell: { status: QuoteCellStatus; levelledTotal: number | null; levelledRate: number | null; isAssumed: boolean },
+  cell: {
+    status: QuoteCellStatus; levelledTotal: number | null; levelledRate: number | null; isAssumed: boolean;
+    hasOverride: boolean; autoLevelledTotal: number | null;
+  },
   unit: string | null
 ): PriceCellDisplay {
   if (cell.status === 'priced_as_variant') {
-    return { primary: formatMoney(0), secondary: 'priced under their own wording — see below', tone: 'variant' };
+    return { primary: formatMoney(0), secondary: 'priced under their own wording — see below', strikethrough: null, tone: 'variant' };
   }
   if (cell.levelledTotal == null) {
-    return { primary: '—', secondary: cell.status === 'absent' ? 'no return' : null, tone: 'absent' };
+    return { primary: '—', secondary: cell.status === 'absent' ? 'no return' : null, strikethrough: null, tone: 'absent' };
   }
   const secondary = cell.levelledRate != null ? `${formatMoney(cell.levelledRate)}${unit ? `/${unit}` : ''}` : null;
-  return { primary: formatMoney(cell.levelledTotal), secondary, tone: cell.isAssumed ? 'assumed' : 'priced' };
+  if (cell.hasOverride) {
+    const strikethrough = cell.autoLevelledTotal != null ? formatMoney(cell.autoLevelledTotal) : null;
+    return { primary: formatMoney(cell.levelledTotal), secondary, strikethrough, tone: 'override' };
+  }
+  return { primary: formatMoney(cell.levelledTotal), secondary, strikethrough: null, tone: cell.isAssumed ? 'assumed' : 'priced' };
 }
 
 /** "Open" is derived here too, never stored — no response, and not withdrawn. */

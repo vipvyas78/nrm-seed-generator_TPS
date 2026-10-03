@@ -155,7 +155,10 @@ function PackageComparison({ workflowId, packageName }: { workflowId: string; pa
           </tr>
         </thead>
         <tbody>
-          {rows.map((row) => <ComparisonRow key={row.id} row={row} returns={returns} onNote={(cellId, note) => noteMutation.mutate({ cellId, estimatorNote: note })} />)}
+          {rows.map((row) => <ComparisonRow
+            key={row.id} row={row} returns={returns} workflowId={workflowId} comparisonId={comparison.id}
+            onNote={(cellId, note) => noteMutation.mutate({ cellId, estimatorNote: note })} onAdjusted={invalidateAll}
+          />)}
         </tbody>
         <tfoot>
           <tr>
@@ -260,8 +263,9 @@ function PackageComparison({ workflowId, packageName }: { workflowId: string; pa
   </div>;
 }
 
-function ComparisonRow({ row, returns, onNote }: {
-  row: QuoteComparisonRow; returns: QuoteComparisonReturn[]; onNote: (cellId: string, note: string | null) => void;
+function ComparisonRow({ row, returns, workflowId, comparisonId, onNote, onAdjusted }: {
+  row: QuoteComparisonRow; returns: QuoteComparisonReturn[]; workflowId: string; comparisonId: string;
+  onNote: (cellId: string, note: string | null) => void; onAdjusted: () => void;
 }) {
   const isVariant = row.origin === 'tenderer_variant';
   return <tr>
@@ -274,27 +278,35 @@ function ComparisonRow({ row, returns, onNote }: {
     </td>
     {returns.map((ret) => {
       const cell = row.cells.find((c) => c.returnId === ret.id);
-      return cell ? <ComparisonCell key={ret.id} cell={cell} unit={row.unit} onNote={onNote} /> : <><td /><td /></>;
+      return cell
+        ? <ComparisonCell key={ret.id} cell={cell} unit={row.unit} workflowId={workflowId} comparisonId={comparisonId} onNote={onNote} onAdjusted={onAdjusted} />
+        : <><td /><td /></>;
     })}
     <td>{!isVariant && row.lowest ? `${formatMoney(row.lowest.total)} (${row.lowest.tendererName})` : '—'}</td>
   </tr>;
 }
 
-function ComparisonCell({ cell, unit, onNote }: {
-  cell: QuoteComparisonCell; unit: string | null; onNote: (cellId: string, note: string | null) => void;
+function ComparisonCell({ cell, unit, workflowId, comparisonId, onNote, onAdjusted }: {
+  cell: QuoteComparisonCell; unit: string | null; workflowId: string; comparisonId: string;
+  onNote: (cellId: string, note: string | null) => void; onAdjusted: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(cell.estimatorNote ?? '');
   const display = priceCellDisplay(cell, unit);
-  const toneClass = display.tone === 'variant' ? 'qc-variant' : display.tone === 'assumed' ? 'qc-assumed' : undefined;
+  const toneClass = display.tone === 'variant' ? 'qc-variant' : display.tone === 'override' ? 'qc-override'
+    : display.tone === 'assumed' ? 'qc-assumed' : undefined;
+  const canAdjust = cell.cellId && cell.status !== 'priced_as_variant';
 
   return <>
     <td className={toneClass}>
       {display.primary}
+      {display.strikethrough && <div className="muted" style={{ fontSize: '0.7rem', textDecoration: 'line-through' }}>{display.strikethrough}</div>}
       {display.secondary && <div className="muted" style={{ fontSize: '0.7rem' }}>{display.secondary}</div>}
     </td>
     <td className={toneClass} style={{ minWidth: 180 }}>
       {cell.isAssumed && cell.assumptionBasis && <div className="text-red" style={{ fontSize: '0.72rem', marginBottom: 4 }}>{cell.assumptionBasis}</div>}
+      {cell.hasOverride && cell.adjustmentReason && <div style={{ fontSize: '0.72rem', marginBottom: 4, color: '#7c3aed' }}>Adjusted: {cell.adjustmentReason}</div>}
+      {cell.overrideStale && <div className="text-red" style={{ fontSize: '0.72rem', marginBottom: 4 }}>The quote has changed since this was set — review it.</div>}
       {cell.tendererDescription && <div className="muted" style={{ fontSize: '0.72rem', marginBottom: 4 }}>their wording: “{cell.tendererDescription}”</div>}
       {cell.tendererNote && <div className="muted" style={{ fontSize: '0.72rem', marginBottom: 4 }}>“{cell.tendererNote}”</div>}
       {cell.cellId && (editing
@@ -304,8 +316,81 @@ function ComparisonCell({ cell, unit, onNote }: {
           </div>
         : <button className="secondary small" onClick={() => setEditing(true)}>{cell.estimatorNote ? cell.estimatorNote : '+ Note'}</button>
       )}
+      {canAdjust && <AdjustmentControls
+        cell={cell} workflowId={workflowId} comparisonId={comparisonId} onAdjusted={onAdjusted}
+      />}
     </td>
   </>;
+}
+
+/**
+ * The estimator's own final figure for a cell — "subject to the response from the
+ * subcontractor, he can make the final adjustments" (BuildFlow #100). Sits beside the
+ * note control rather than replacing it: a note is a comment, an adjustment changes what
+ * this comparison actually carries, and the two stay visually and functionally distinct.
+ */
+function AdjustmentControls({ cell, workflowId, comparisonId, onAdjusted }: {
+  cell: QuoteComparisonCell; workflowId: string; comparisonId: string; onAdjusted: () => void;
+}) {
+  const [mode, setMode] = useState<'closed' | 'set' | 'clear' | 'history'>('closed');
+  const [rate, setRate] = useState('');
+  const [total, setTotal] = useState('');
+  const [reason, setReason] = useState('');
+  const history = useQuery({
+    queryKey: ['quote-comparison-adjustments', workflowId, comparisonId, cell.cellId],
+    queryFn: () => api.quoteComparisonAdjustmentHistory(workflowId, comparisonId, cell.cellId!),
+    enabled: mode === 'history'
+  });
+
+  const set = useMutation({
+    mutationFn: () => api.setQuoteComparisonAdjustment(workflowId, comparisonId, cell.cellId!, {
+      rate: rate ? Number(rate) : null, total: total ? Number(total) : null, reason: reason.trim()
+    }),
+    onSuccess: () => { setMode('closed'); setRate(''); setTotal(''); setReason(''); onAdjusted(); }
+  });
+  const clear = useMutation({
+    mutationFn: () => api.clearQuoteComparisonAdjustment(workflowId, comparisonId, cell.cellId!, reason.trim()),
+    onSuccess: () => { setMode('closed'); setReason(''); onAdjusted(); }
+  });
+
+  if (mode === 'closed') {
+    return <div className="button-row" style={{ marginTop: 4 }}>
+      <button className="secondary small" onClick={() => setMode('set')}>{cell.hasOverride ? 'Re-adjust' : 'Adjust'}</button>
+      {cell.hasOverride && <button className="secondary small" onClick={() => setMode('clear')}>Clear adjustment</button>}
+      <button className="secondary small" onClick={() => setMode('history')}>History</button>
+    </div>;
+  }
+
+  if (mode === 'set') {
+    return <div className="inline-form" style={{ marginTop: 4, flexWrap: 'wrap' }}>
+      <input value={rate} onChange={(e) => setRate(e.target.value)} placeholder="Rate" type="number" style={{ width: 90 }} />
+      <input value={total} onChange={(e) => setTotal(e.target.value)} placeholder="Total (optional if rate given)" type="number" style={{ width: 150 }} />
+      <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Reason (required)" style={{ flex: 1, minWidth: 160 }} />
+      <button disabled={(!rate && !total) || !reason.trim() || set.isPending} onClick={() => set.mutate()}>{set.isPending ? 'Saving…' : 'Save'}</button>
+      <button className="secondary small" onClick={() => setMode('closed')}>Cancel</button>
+      <ErrorMessage error={set.error} />
+    </div>;
+  }
+
+  if (mode === 'clear') {
+    return <div className="inline-form" style={{ marginTop: 4 }}>
+      <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Reason for clearing (required)" style={{ flex: 1 }} />
+      <button disabled={!reason.trim() || clear.isPending} onClick={() => clear.mutate()}>{clear.isPending ? 'Clearing…' : 'Clear'}</button>
+      <button className="secondary small" onClick={() => setMode('closed')}>Cancel</button>
+      <ErrorMessage error={clear.error} />
+    </div>;
+  }
+
+  return <div style={{ marginTop: 4 }}>
+    {history.isLoading ? <Busy /> : (history.data?.length ?? 0) === 0
+      ? <p className="muted" style={{ fontSize: '0.72rem' }}>No adjustments have been made to this cell.</p>
+      : <ul style={{ margin: 0, paddingLeft: 16, fontSize: '0.72rem' }}>
+          {history.data!.map((h) => <li key={h.id}>
+            {h.action === 'set' ? `Set to ${formatMoney(h.new_total)}` : 'Cleared'} — {h.reason} ({new Date(h.occurred_at).toLocaleDateString()})
+          </li>)}
+        </ul>}
+    <button className="secondary small" style={{ marginTop: 4 }} onClick={() => setMode('closed')}>Close</button>
+  </div>;
 }
 
 /**

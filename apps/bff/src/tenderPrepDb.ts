@@ -3208,6 +3208,29 @@ export class TenderPrepDatabase {
     return this.quoteDb.deleteEstimatorRow(workflowId, comparisonId, rowId);
   }
 
+  /** The estimator's own final figure for a cell — "subject to the response from the
+   *  subcontractor, he can make the final adjustments" (BuildFlow #100). */
+  async setQuoteComparisonAdjustment(
+    actor: Actor, workflowId: string, comparisonId: string, cellId: string,
+    input: { rate: number | null; total: number | null; reason: string; queryId: string | null }
+  ): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.quoteDb) throw notFound('The quote comparison stage is not configured in this environment.');
+    return this.quoteDb.setAdjustment(workflowId, comparisonId, cellId, input, actor.userId);
+  }
+
+  async clearQuoteComparisonAdjustment(actor: Actor, workflowId: string, comparisonId: string, cellId: string, reason: string): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.quoteDb) throw notFound('The quote comparison stage is not configured in this environment.');
+    return this.quoteDb.clearAdjustment(workflowId, comparisonId, cellId, reason, actor.userId);
+  }
+
+  async quoteComparisonAdjustmentHistory(actor: Actor, workflowId: string, comparisonId: string, cellId: string): Promise<Row[]> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.quoteDb) return [];
+    return this.quoteDb.adjustmentHistory(workflowId, comparisonId, cellId);
+  }
+
   /** A quote that arrived by email rather than through the portal, keyed in against the
    * comparison's own spine — see `QuoteComparisonDatabase.recordManualReturn`. The
    * comparison must already be open, since manual entry is keyed against its spine rows. */

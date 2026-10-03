@@ -134,6 +134,13 @@ export const ROUTE_ACCESS: Record<string, RouteAccess> = {
   'POST /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries/:queryId/response': 'ordinary',
   'POST /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries/send': 'ordinary',
 
+  // Final adjustments (issue #100's own closing step). Setting or clearing one is the
+  // estimator's own working-out, same class as the comparison edits above; the award
+  // itself is where the approval class actually sits.
+  'PUT /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/cells/:cellId/adjustment': 'ordinary',
+  'POST /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/cells/:cellId/adjustment/clear': 'ordinary',
+  'GET /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/cells/:cellId/adjustments': 'read',
+
   // ── comparison and the bid itself (legacy tps.comparative screen, superseded above)
   'GET /api/tender-prep/:workflowId/comparative': 'read',
   'POST /api/tender-prep/:workflowId/comparative': 'ordinary',

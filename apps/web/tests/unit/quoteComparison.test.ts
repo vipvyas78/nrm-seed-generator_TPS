@@ -61,36 +61,56 @@ describe('formatMoney', () => {
   });
 });
 
+function cell(over: Partial<{
+  status: string; levelledTotal: number | null; levelledRate: number | null; isAssumed: boolean;
+  hasOverride: boolean; autoLevelledTotal: number | null;
+}> = {}) {
+  return {
+    status: 'priced', levelledTotal: 0, levelledRate: 0, isAssumed: false,
+    hasOverride: false, autoLevelledTotal: null,
+    ...over
+  } as never;
+}
+
 describe('priceCellDisplay', () => {
   it('shows the rate beside the total for a genuine quote', () => {
-    const display = priceCellDisplay({ status: 'priced', levelledTotal: 6000, levelledRate: 12, isAssumed: false }, 'm2');
+    const display = priceCellDisplay(cell({ status: 'priced', levelledTotal: 6000, levelledRate: 12 }), 'm2');
     expect(display.primary).toBe('£6,000.00');
     expect(display.secondary).toBe('£12.00/m2');
     expect(display.tone).toBe('priced');
   });
 
   it('omits the rate when there is none to show, without hiding the total', () => {
-    const display = priceCellDisplay({ status: 'included', levelledTotal: 0, levelledRate: 0, isAssumed: true }, null);
+    const display = priceCellDisplay(cell({ status: 'included', levelledTotal: 0, levelledRate: 0, isAssumed: true }), null);
     expect(display.primary).toBe('£0.00');
   });
 
   it('marks a substituted figure as assumed', () => {
-    const display = priceCellDisplay({ status: 'excluded', levelledTotal: 500, levelledRate: 10, isAssumed: true }, 'nr');
+    const display = priceCellDisplay(cell({ status: 'excluded', levelledTotal: 500, levelledRate: 10, isAssumed: true }), 'nr');
     expect(display.tone).toBe('assumed');
   });
 
   it('points at the variant row rather than showing a real total for priced_as_variant', () => {
-    const display = priceCellDisplay({ status: 'priced_as_variant', levelledTotal: 0, levelledRate: 0, isAssumed: true }, 'm2');
+    const display = priceCellDisplay(cell({ status: 'priced_as_variant', levelledTotal: 0, levelledRate: 0, isAssumed: true }), 'm2');
     expect(display.primary).toBe('£0.00');
     expect(display.secondary).toContain('own wording');
     expect(display.tone).toBe('variant');
   });
 
   it('shows no return rather than a figure when nobody priced it and there is nothing to substitute', () => {
-    const display = priceCellDisplay({ status: 'absent', levelledTotal: null, levelledRate: null, isAssumed: true }, 'nr');
+    const display = priceCellDisplay(cell({ status: 'absent', levelledTotal: null, levelledRate: null, isAssumed: true }), 'nr');
     expect(display.primary).toBe('—');
     expect(display.secondary).toBe('no return');
     expect(display.tone).toBe('absent');
+  });
+
+  it('shows the override as the headline figure, with the automatic one struck through alongside it', () => {
+    const display = priceCellDisplay(cell({
+      status: 'excluded', levelledTotal: 600, levelledRate: 12, isAssumed: true, hasOverride: true, autoLevelledTotal: 500
+    }), 'm2');
+    expect(display.primary).toBe('£600.00'); // the override
+    expect(display.strikethrough).toBe('£500.00'); // what it would have read without it
+    expect(display.tone).toBe('override');
   });
 });
 

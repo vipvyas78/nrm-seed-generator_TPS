@@ -253,7 +253,9 @@ describe('queries to subcontractors about their quote', () => {
       expect(beforeAward).toBeUndefined(); // the refusal is not a partial approval
 
       const tradeAnalysis = await tpDb.approveQuoteComparison(f.actor, f.workflowId, f.packageName, String(ret!.id), null, true);
-      expect(tradeAnalysis.status).toBe('approved_with_adjustments');
+      // One cleanly-priced line, no override — 'approved', not '_with_adjustments'
+      // (see quoteComparisonDb.ts's approvalStatusFor, added by PR4).
+      expect(tradeAnalysis.status).toBe('approved');
     } finally {
       await cleanup(db, f);
     }

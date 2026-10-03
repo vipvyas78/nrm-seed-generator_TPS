@@ -9,7 +9,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  boqStatusFor, collectScopeNotes, computeReadiness, findLowestQuote, levelCell, moneyGBP, sameItem, sumTotals, QUOTE_QUORUM
+  applyOverride, approvalStatusFor, boqStatusFor, collectScopeNotes, composeAdjustmentNote, computeReadiness,
+  findLowestQuote, levelCell, moneyGBP, sameItem, sumTotals, QUOTE_QUORUM
 } from '../../src/quoteComparisonDb.js';
 
 const LOWEST = { rate: 10, total: 500, tendererName: 'Acme Roofing' };
@@ -229,6 +230,74 @@ describe('collectScopeNotes', () => {
     const rows = [{ seq: 1, description: 'Added by someone else', cells: [{ returnId: 'r2', status: 'priced' as const }] }];
     expect(() => collectScopeNotes(returns, rows)).not.toThrow();
     expect(collectScopeNotes(returns, rows)[0]!.includedItems).toEqual([]);
+  });
+});
+
+describe('applyOverride', () => {
+  const LEVELLED = { status: 'excluded' as const, levelledRate: 10, levelledTotal: 500, isAssumed: true, assumptionBasis: 'Excluded by this tenderer. Levelled at the lowest quoted price (Acme Roofing, £500.00).' };
+
+  it('carries the automatic figure through unchanged with no override on file', () => {
+    const result = applyOverride(LEVELLED, null, 500);
+    expect(result.finalRate).toBe(10);
+    expect(result.finalTotal).toBe(500);
+    expect(result.hasOverride).toBe(false);
+    expect(result.overrideStale).toBe(false);
+    expect(result.autoLevelledTotal).toBe(500); // preserved even though there is no override to contrast it with
+  });
+
+  it('replaces the final figure with the override, keeping the automatic one alongside it', () => {
+    const override = { adjustedRate: 12, adjustedTotal: 600, adjustmentReason: 'Confirmed scaffold is excluded, quoted separately.', adjustedAgainstQuotedTotal: null };
+    const result = applyOverride(LEVELLED, override, null);
+    expect(result.finalRate).toBe(12);
+    expect(result.finalTotal).toBe(600);
+    expect(result.hasOverride).toBe(true);
+    expect(result.adjustmentReason).toContain('scaffold');
+    expect(result.autoLevelledTotal).toBe(500); // what it would have read without the override
+  });
+
+  it('is stale once the tenderer’s own quoted figure has moved since the override was set', () => {
+    const override = { adjustedRate: 12, adjustedTotal: 600, adjustmentReason: 'x', adjustedAgainstQuotedTotal: 400 };
+    expect(applyOverride(LEVELLED, override, 400).overrideStale).toBe(false); // unchanged
+    expect(applyOverride(LEVELLED, override, 450).overrideStale).toBe(true); // a resubmission moved it
+  });
+});
+
+describe('composeAdjustmentNote', () => {
+  it('leads with the override’s own reason when there is one, over the automatic basis', () => {
+    const note = composeAdjustmentNote({
+      hasOverride: true, adjustmentReason: 'Confirmed by phone.', autoAssumptionBasis: 'Levelled at the lowest quoted price.', estimatorNote: null
+    });
+    expect(note).toBe('Adjusted: Confirmed by phone.');
+  });
+
+  it('falls back to the automatic basis with no override', () => {
+    const note = composeAdjustmentNote({ hasOverride: false, adjustmentReason: null, autoAssumptionBasis: 'Not addressed by this tenderer.', estimatorNote: null });
+    expect(note).toBe('Not addressed by this tenderer.');
+  });
+
+  it('appends the estimator’s own cell note either way', () => {
+    const note = composeAdjustmentNote({ hasOverride: false, adjustmentReason: null, autoAssumptionBasis: 'Not addressed.', estimatorNote: 'Confirmed verbally they will match.' });
+    expect(note).toBe('Not addressed. Estimator note: Confirmed verbally they will match.');
+  });
+
+  it('is null when there is nothing to say at all', () => {
+    expect(composeAdjustmentNote({ hasOverride: false, adjustmentReason: null, autoAssumptionBasis: null, estimatorNote: null })).toBeNull();
+  });
+});
+
+describe('approvalStatusFor', () => {
+  it('is approved when automatic levelling alone filled every gap', () => {
+    // The user's own call: a cheapest-price substitution is the comparison working as
+    // designed, not a human adjustment — only an override earns the "_with_adjustments".
+    expect(approvalStatusFor([{ hasOverride: false }, { hasOverride: false }])).toBe('approved');
+  });
+
+  it('is approved_with_adjustments the moment any line carries an estimator override', () => {
+    expect(approvalStatusFor([{ hasOverride: false }, { hasOverride: true }])).toBe('approved_with_adjustments');
+  });
+
+  it('is approved for an award with no lines at all', () => {
+    expect(approvalStatusFor([])).toBe('approved');
   });
 });
 

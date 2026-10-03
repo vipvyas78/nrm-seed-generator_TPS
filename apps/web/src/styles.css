@@ -100,6 +100,9 @@ code { font-family: monospace; font-size: 0.85em; background: #f3f4f6; padding: 
 /* Priced under the tenderer's own wording — the figure lives on the variant row just
    below, so this cell is neither a real quote nor a cheapest-price assumption. */
 .qc-variant { background: #dbeafe; }
+/* A human changed this figure — distinct from an automatic assumption, which the
+   estimator never actually looked at and decided on. */
+.qc-override { background: #ede9fe; }
 .text-green { color: #16a34a; }
 
 /* Step 1 — Tender Launch table: one row per configured package */

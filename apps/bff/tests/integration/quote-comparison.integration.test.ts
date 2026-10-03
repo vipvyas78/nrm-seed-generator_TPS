@@ -329,7 +329,9 @@ describe('the levelled quote comparison', () => {
       // Awarding the CHEAPEST of the three — Firm A at 4000 — writes the draft BoQ, which
       // the trigger above refuses without an approved trade analysis first.
       const tradeAnalysis = await tpDb.approveQuoteComparison(f.actor, f.workflowId, f.packageName, firmA.id, 'Cheapest compliant bid');
-      expect(tradeAnalysis.status).toBe('approved_with_adjustments');
+      // Firm A's own line was priced cleanly — no assumption, and no estimator override
+      // (that is PR4's own addition) — so this reads 'approved', not '_with_adjustments'.
+      expect(tradeAnalysis.status).toBe('approved');
       expect(String(tradeAnalysis.awarded_return_id)).toBe(firmA.id);
 
       const boqLines = await db.query<{ description: string; submitted_rate: string; approved_rate: string; adjusted: boolean }>(
@@ -486,7 +488,10 @@ describe('the levelled quote comparison', () => {
       const firmB = returns.find((r) => r.tenderer_name === 'Firm B')!;
 
       const tradeAnalysis = await tpDb.approveQuoteComparison(f.actor, f.workflowId, f.packageName, firmB.id, null);
-      expect(tradeAnalysis.status).toBe('approved_with_adjustments');
+      // Automatic levelling filled the gap on the Reconcile row — that is the comparison
+      // working as designed, not an estimator override (PR4's own addition), so this
+      // reads 'approved'.
+      expect(tradeAnalysis.status).toBe('approved');
 
       const boqLines = await db.query<{ description: string; status: string; adjusted: boolean }>(
         `SELECT description, status, adjusted FROM tender_boq_lines WHERE workflow_id = $1 AND package_name = $2`,
@@ -535,6 +540,221 @@ describe('the levelled quote comparison', () => {
       const stillRow = (stillThere.rows as Array<{ id: string; cells: Array<{ estimatorNote: string | null }> }>).find((r) => r.id === estimatorRowId)!;
       expect(stillRow).toBeDefined();
       expect(stillRow.cells.every((c) => c.estimatorNote !== 'hijacked note')).toBe(true);
+    } finally {
+      await db.query(`DELETE FROM workflows WHERE id = ANY($1::uuid[])`, [[f1.workflowId, f2.workflowId]]);
+      await db.close();
+    }
+  });
+
+  // ── Final adjustments (BuildFlow #100's own closing step) ────────────────────────────
+
+  it('sets, clears, and keeps a full history of an adjustment', async () => {
+    const { db, portalDb, tpDb } = connect();
+    const f = await fixture(db, tpDb);
+    try {
+      await mkPricedReturn(portalDb, f.entryIds[0]!, f.workflowId, f.packageName, 'Firm B', 'b@example.com', 100);
+      await tpDb.openQuoteComparison(f.actor, f.workflowId, f.packageName);
+      const detail = await tpDb.getQuoteComparison(f.actor, f.workflowId, f.packageName);
+      const comparisonId = String((detail.comparison as Row).id);
+      const cellId = (detail.rows as Array<{ cells: Array<{ cellId: string | null }> }>)[0]!.cells[0]!.cellId!;
+
+      const set = await tpDb.setQuoteComparisonAdjustment(f.actor, f.workflowId, comparisonId, cellId, {
+        rate: 90, total: null, reason: 'Confirmed by phone — firm will match 90/item.', queryId: null
+      });
+      expect(Number(set.adjusted_total)).toBe(90); // derived from rate x the row's own quantity (1)
+      expect(Number(set.adjusted_rate)).toBe(90);
+
+      const afterSet = await tpDb.getQuoteComparison(f.actor, f.workflowId, f.packageName);
+      const cellAfterSet = (afterSet.rows as Array<{ cells: Array<{ levelledTotal: number | null; hasOverride: boolean; autoLevelledTotal: number | null }> }>)[0]!.cells[0]!;
+      expect(cellAfterSet.levelledTotal).toBe(90); // the override, not the quoted 100
+      expect(cellAfterSet.hasOverride).toBe(true);
+      expect(cellAfterSet.autoLevelledTotal).toBe(100); // what it would have read without it
+
+      const cleared = await tpDb.clearQuoteComparisonAdjustment(f.actor, f.workflowId, comparisonId, cellId, 'Reconsidered — their quote stands.');
+      expect(cleared.adjusted_total).toBeNull();
+
+      const history = await tpDb.quoteComparisonAdjustmentHistory(f.actor, f.workflowId, comparisonId, cellId);
+      expect(history).toHaveLength(2);
+      expect(history[0]!.action).toBe('cleared'); // newest first
+      expect(history[1]!.action).toBe('set');
+      expect(Number(history[1]!.new_total)).toBe(90);
+      expect(Number(history[0]!.previous_total)).toBe(90);
+    } finally {
+      await cleanup(db, f);
+    }
+  });
+
+  it('rejects an override with no stated reason, at the database itself', async () => {
+    const { db, portalDb, tpDb } = connect();
+    const f = await fixture(db, tpDb);
+    try {
+      await mkPricedReturn(portalDb, f.entryIds[0]!, f.workflowId, f.packageName, 'Firm B', 'b@example.com', 100);
+      await tpDb.openQuoteComparison(f.actor, f.workflowId, f.packageName);
+      const detail = await tpDb.getQuoteComparison(f.actor, f.workflowId, f.packageName);
+      const cellId = (detail.rows as Array<{ cells: Array<{ cellId: string | null }> }>)[0]!.cells[0]!.cellId!;
+
+      // Bypasses the route's own zod validation deliberately — the guarantee being
+      // tested is the database's, not the application's.
+      await expect(tpDb.setQuoteComparisonAdjustment(f.actor, f.workflowId, String((detail.comparison as Row).id), cellId, {
+        rate: 90, total: null, reason: '', queryId: null
+      })).rejects.toThrow();
+    } finally {
+      await cleanup(db, f);
+    }
+  });
+
+  it('refuses an override on a spine cell priced under the tenderer’s own wording — adjust the variant row instead', async () => {
+    const { db, portalDb, tpDb } = connect();
+    const f = await fixture(db, tpDb);
+    try {
+      const linkB = await portalDb.mintOrRefreshLink({
+        shortlistEntryId: f.entryIds[0]!, workflowId: f.workflowId, packageName: f.packageName,
+        subcontractorId: null, tendererName: 'Firm B', recipientEmail: 'b@example.com', isTest: true, ttlDays: 30
+      });
+      await portalDb.snapshotLines(linkB.id, [
+        { sourceItemId: null, geCode: null, elementCode: null, description: 'Mobilisation', quantity: 1, unit: 'item', isPriceable: true },
+        { sourceItemId: null, geCode: null, elementCode: null, description: 'Supply and fix roof tiles', quantity: 500, unit: 'm2', isPriceable: true }
+      ]);
+      await portalDb.saveDraft(linkB.id, {
+        header: { programmeWeeks: null, qualifications: null, exclusions: null },
+        lines: (await portalDb.getLines(linkB.id)).map((l, i) => ({ id: String(l.id), quantity: Number(l.quantity), rate: [200, 12][i]!, status: 'priced', note: null }))
+      });
+      await portalDb.submit(linkB.id);
+
+      const linkA = await portalDb.mintOrRefreshLink({
+        shortlistEntryId: f.entryIds[1]!, workflowId: f.workflowId, packageName: f.packageName,
+        subcontractorId: null, tendererName: 'Firm A', recipientEmail: 'a@example.com', isTest: true, ttlDays: 30
+      });
+      await portalDb.snapshotLines(linkA.id, [
+        { sourceItemId: null, geCode: null, elementCode: null, description: 'Mobilisation', quantity: 1, unit: 'item', isPriceable: true },
+        { sourceItemId: null, geCode: null, elementCode: null, description: 'Supply and fix roof SLATES', quantity: 500, unit: 'm2', isPriceable: true }
+      ]);
+      await portalDb.saveDraft(linkA.id, {
+        header: { programmeWeeks: null, qualifications: null, exclusions: null },
+        lines: (await portalDb.getLines(linkA.id)).map((l, i) => ({ id: String(l.id), quantity: Number(l.quantity), rate: [200, 10][i]!, status: 'priced', note: null }))
+      });
+      await portalDb.submit(linkA.id);
+
+      await tpDb.openQuoteComparison(f.actor, f.workflowId, f.packageName);
+      const detail = await tpDb.getQuoteComparison(f.actor, f.workflowId, f.packageName);
+      const returns = detail.returns as Array<{ id: string; tenderer_name: string }>;
+      const firmA = returns.find((r) => r.tenderer_name === 'Firm A')!;
+      const spineRow = (detail.rows as Array<{ description: string; cells: Array<{ returnId: string; status: string; cellId: string | null }> }>)
+        .find((r) => r.description === 'Supply and fix roof tiles')!;
+      const spineCell = spineRow.cells.find((c) => c.returnId === firmA.id)!;
+      expect(spineCell.status).toBe('priced_as_variant');
+
+      await expect(tpDb.setQuoteComparisonAdjustment(f.actor, f.workflowId, String((detail.comparison as Row).id), spineCell.cellId!, {
+        rate: null, total: 999, reason: 'x', queryId: null
+      })).rejects.toThrow(/own wording/);
+    } finally {
+      await cleanup(db, f);
+    }
+  });
+
+  it('refuses an award once an override has gone stale, and succeeds again once re-saved against the new quote', async () => {
+    const { db, portalDb, tpDb } = connect();
+    const f = await fixture(db, tpDb);
+    try {
+      await db.query(`INSERT INTO itt_letter_details (workflow_id, tender_return_deadline) VALUES ($1, '2020-01-01')`, [f.workflowId]);
+      const link = await portalDb.mintOrRefreshLink({
+        shortlistEntryId: f.entryIds[0]!, workflowId: f.workflowId, packageName: f.packageName,
+        subcontractorId: null, tendererName: 'Firm B', recipientEmail: 'b@example.com', isTest: true, ttlDays: 30
+      });
+      await portalDb.snapshotLines(link.id, [
+        { sourceItemId: null, geCode: null, elementCode: null, description: 'Mobilisation', quantity: 1, unit: 'item', isPriceable: true }
+      ]);
+      await portalDb.saveDraft(link.id, {
+        header: { programmeWeeks: null, qualifications: null, exclusions: null },
+        lines: [{ id: String((await portalDb.getLines(link.id))[0]!.id), quantity: 1, rate: 100, status: 'priced', note: null }]
+      });
+      await portalDb.submit(link.id);
+
+      await tpDb.openQuoteComparison(f.actor, f.workflowId, f.packageName);
+      const detail = await tpDb.getQuoteComparison(f.actor, f.workflowId, f.packageName);
+      const comparisonId = String((detail.comparison as Row).id);
+      const cellId = (detail.rows as Array<{ cells: Array<{ cellId: string | null }> }>)[0]!.cells[0]!.cellId!;
+      const [ret] = await db.query<{ id: string }>(`SELECT id FROM tender_returns WHERE workflow_id = $1`, [f.workflowId]);
+
+      await tpDb.setQuoteComparisonAdjustment(f.actor, f.workflowId, comparisonId, cellId, {
+        rate: 90, total: null, reason: 'Confirmed by phone.', queryId: null
+      });
+
+      // The subcontractor resubmits at a different rate — refreshCells (run by the next
+      // open()) updates quoted_rate/quoted_total, but never the adjusted_* columns, so
+      // the override now disagrees with the figure it was set against.
+      await db.query(`UPDATE tender_return_lines SET rate = 150, total = 150 WHERE return_id = $1`, [ret!.id]);
+      await tpDb.openQuoteComparison(f.actor, f.workflowId, f.packageName);
+
+      await expect(tpDb.approveQuoteComparison(f.actor, f.workflowId, f.packageName, String(ret!.id), null))
+        .rejects.toThrow(/has since changed/);
+
+      // Re-saving re-snapshots the current quote — that save IS the re-confirmation;
+      // there is no separate "acknowledge" step.
+      await tpDb.setQuoteComparisonAdjustment(f.actor, f.workflowId, comparisonId, cellId, {
+        rate: 95, total: null, reason: 'Re-confirmed after resubmission.', queryId: null
+      });
+
+      const tradeAnalysis = await tpDb.approveQuoteComparison(f.actor, f.workflowId, f.packageName, String(ret!.id), null);
+      expect(tradeAnalysis.status).toBe('approved_with_adjustments'); // the override, not automatic levelling, earns this
+
+      const [boqLine] = await db.query<{ approved_rate: string; adjustment_note: string }>(
+        `SELECT approved_rate, adjustment_note FROM tender_boq_lines WHERE workflow_id = $1 AND package_name = $2`,
+        [f.workflowId, f.packageName]
+      );
+      expect(Number(boqLine!.approved_rate)).toBe(95);
+      expect(boqLine!.adjustment_note).toContain('Adjusted: Re-confirmed after resubmission.');
+    } finally {
+      await cleanup(db, f);
+    }
+  });
+
+  it('refuses to delete an estimator row while it still carries an adjustment', async () => {
+    const { db, portalDb, tpDb } = connect();
+    const f = await fixture(db, tpDb);
+    try {
+      await mkPricedReturn(portalDb, f.entryIds[0]!, f.workflowId, f.packageName, 'Firm B', 'b@example.com', 100);
+      const comparison = await tpDb.openQuoteComparison(f.actor, f.workflowId, f.packageName);
+      const comparisonId = String(comparison.id);
+      const estimatorRow = await tpDb.addQuoteComparisonRow(f.actor, f.workflowId, comparisonId, {
+        description: 'Reconcile item', unit: 'item', quantity: 1
+      });
+      const estimatorRowId = String(estimatorRow.id);
+
+      await tpDb.recordManualQuoteReturn(f.actor, f.workflowId, f.packageName, {
+        tendererName: 'Firm E', subcontractorId: null, receivedAt: null, programmeWeeks: null, qualifications: null, exclusions: null,
+        cells: [{ rowId: estimatorRowId, quantity: 1, rate: 300, status: 'priced', note: null }], extraLines: []
+      });
+      const detail = await tpDb.getQuoteComparison(f.actor, f.workflowId, f.packageName);
+      const row = (detail.rows as Array<{ id: string; cells: Array<{ cellId: string | null }> }>).find((r) => r.id === estimatorRowId)!;
+      const cellId = row.cells.find((c) => c.cellId)!.cellId!;
+
+      await tpDb.setQuoteComparisonAdjustment(f.actor, f.workflowId, comparisonId, cellId, {
+        rate: 280, total: null, reason: 'Negotiated down.', queryId: null
+      });
+
+      await expect(tpDb.deleteQuoteComparisonRow(f.actor, f.workflowId, comparisonId, estimatorRowId)).rejects.toThrow(/adjustment/);
+    } finally {
+      await cleanup(db, f);
+    }
+  });
+
+  it('refuses to set, clear or read adjustment history for a cell from another workflow', async () => {
+    const { db, portalDb, tpDb } = connect();
+    const f1 = await fixture(db, tpDb);
+    const f2 = await fixture(db, tpDb);
+    try {
+      await mkPricedReturn(portalDb, f1.entryIds[0]!, f1.workflowId, f1.packageName, 'Firm B', 'b@example.com', 100);
+      const comparison1 = await tpDb.openQuoteComparison(f1.actor, f1.workflowId, f1.packageName);
+      const detail1 = await tpDb.getQuoteComparison(f1.actor, f1.workflowId, f1.packageName);
+      const cellId1 = (detail1.rows as Array<{ cells: Array<{ cellId: string | null }> }>)[0]!.cells[0]!.cellId!;
+
+      await expect(tpDb.setQuoteComparisonAdjustment(f2.actor, f2.workflowId, String(comparison1.id), cellId1, {
+        rate: 1, total: null, reason: 'x', queryId: null
+      })).rejects.toThrow();
+      await expect(tpDb.clearQuoteComparisonAdjustment(f2.actor, f2.workflowId, String(comparison1.id), cellId1, 'x')).rejects.toThrow();
+      const history = await tpDb.quoteComparisonAdjustmentHistory(f2.actor, f2.workflowId, String(comparison1.id), cellId1);
+      expect(history).toHaveLength(0);
     } finally {
       await db.query(`DELETE FROM workflows WHERE id = ANY($1::uuid[])`, [[f1.workflowId, f2.workflowId]]);
       await db.close();

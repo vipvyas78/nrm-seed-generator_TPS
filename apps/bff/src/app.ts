@@ -1469,6 +1469,31 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
       return tpDb.sendQuoteQueries(requireActor(request), workflowId, comparisonId, input.returnId, input.recipientEmail ?? null);
     });
 
+    // ── Final adjustments (BuildFlow #100): "he can make the final adjustments in the
+    // final comparison of that respective trade" ────────────────────────────────────
+
+    protectedApi.put('/api/tender-prep/:workflowId/quote-comparisons/:comparisonId/cells/:cellId/adjustment', async (request) => {
+      const { workflowId, comparisonId, cellId } = params(request, z.object({ workflowId: uuid, comparisonId: uuid, cellId: uuid }));
+      const input = body(request, z.object({
+        rate: z.number().nullable().optional(), total: z.number().nullable().optional(),
+        reason: z.string().trim().min(1).max(2000), queryId: uuid.nullable().optional()
+      }));
+      return tpDb.setQuoteComparisonAdjustment(requireActor(request), workflowId, comparisonId, cellId, {
+        rate: input.rate ?? null, total: input.total ?? null, reason: input.reason, queryId: input.queryId ?? null
+      });
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/quote-comparisons/:comparisonId/cells/:cellId/adjustment/clear', async (request) => {
+      const { workflowId, comparisonId, cellId } = params(request, z.object({ workflowId: uuid, comparisonId: uuid, cellId: uuid }));
+      const input = body(request, z.object({ reason: z.string().trim().min(1).max(2000) }));
+      return tpDb.clearQuoteComparisonAdjustment(requireActor(request), workflowId, comparisonId, cellId, input.reason);
+    });
+
+    protectedApi.get('/api/tender-prep/:workflowId/quote-comparisons/:comparisonId/cells/:cellId/adjustments', async (request) => {
+      const { workflowId, comparisonId, cellId } = params(request, z.object({ workflowId: uuid, comparisonId: uuid, cellId: uuid }));
+      return tpDb.quoteComparisonAdjustmentHistory(requireActor(request), workflowId, comparisonId, cellId);
+    });
+
     // ── Step 3 (legacy): the four-field comparative screen, superseded above ────
 
     protectedApi.get('/api/tender-prep/:workflowId/comparative', async (request) => {

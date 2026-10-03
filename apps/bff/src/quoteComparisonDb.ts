@@ -229,6 +229,87 @@ export function collectScopeNotes(
   });
 }
 
+// ──────────────────────────────────────────────────────────────── final adjustments
+
+/** An override on file for a cell — `adjusted_total` is the only required field; a rate
+ *  with no total alongside it is not a complete override (see `setAdjustment`, which
+ *  always derives one before this is ever read). */
+export interface CellOverride {
+  adjustedRate: number | null;
+  adjustedTotal: number;
+  adjustmentReason: string;
+  /** The cell's `quoted_total` at the moment the override was set — compared against the
+   *  LIVE figure to decide `overrideStale` below. */
+  adjustedAgainstQuotedTotal: number | null;
+}
+
+export interface OverriddenCell {
+  /** What this comparison actually carries, once an override is applied — equal to the
+   *  automatic figure when there is none. */
+  finalRate: number | null;
+  finalTotal: number | null;
+  hasOverride: boolean;
+  /** The automatic figure is ALSO preserved either way, so a reviewer can see what was
+   *  overridden FROM, not just what it reads now. */
+  autoLevelledRate: number | null;
+  autoLevelledTotal: number | null;
+  adjustmentReason: string | null;
+  /** True once a resubmission has changed the tenderer's own quoted figure out from under
+   *  a standing override — the estimator adjusted against a number that no longer holds.
+   *  Re-saving (or clearing) the override is what re-confirms it; there is no separate
+   *  "acknowledge" step, because setAdjustment itself re-snapshots the current quote. */
+  overrideStale: boolean;
+}
+
+/**
+ * Blends a standing override into what `levelCell` already decided — never in place of
+ * it. "Lowest" (and so every OTHER return's substitution) still comes from the QUOTED
+ * figures alone, never an override, or the cheapest-price rule would start chasing its
+ * own adjustments.
+ */
+export function applyOverride(levelled: LevelledCell, override: CellOverride | null, currentQuotedTotal: number | null): OverriddenCell {
+  if (!override) {
+    return {
+      finalRate: levelled.levelledRate, finalTotal: levelled.levelledTotal, hasOverride: false,
+      autoLevelledRate: levelled.levelledRate, autoLevelledTotal: levelled.levelledTotal,
+      adjustmentReason: null, overrideStale: false
+    };
+  }
+  return {
+    finalRate: override.adjustedRate, finalTotal: override.adjustedTotal, hasOverride: true,
+    autoLevelledRate: levelled.levelledRate, autoLevelledTotal: levelled.levelledTotal,
+    adjustmentReason: override.adjustmentReason,
+    overrideStale: override.adjustedAgainstQuotedTotal !== currentQuotedTotal
+  };
+}
+
+/**
+ * What goes into `tender_boq_lines.adjustment_note` for one line — the override's own
+ * reason takes precedence over the automatic substitution's, since once an estimator has
+ * looked at a line and decided a figure for it, that decision is the one worth recording,
+ * not the guess it replaced. The estimator's own cell note is never lost either way.
+ */
+export function composeAdjustmentNote(input: {
+  hasOverride: boolean; adjustmentReason: string | null; autoAssumptionBasis: string | null; estimatorNote: string | null;
+}): string | null {
+  const parts: string[] = [];
+  if (input.hasOverride && input.adjustmentReason) parts.push(`Adjusted: ${input.adjustmentReason}`);
+  else if (input.autoAssumptionBasis) parts.push(input.autoAssumptionBasis);
+  if (input.estimatorNote) parts.push(`Estimator note: ${input.estimatorNote}`);
+  return parts.length > 0 ? parts.join(' ') : null;
+}
+
+/**
+ * approved_with_adjustments means an ESTIMATOR changed a figure — not that the automatic
+ * cheapest-price rule filled a gap, which is what every comparison with any absent line
+ * does regardless. Levelling a gap is the comparison working as designed; overriding one
+ * is a human decision on top of it, and that is the distinction this status exists to
+ * record for whoever reads trade_analysis later.
+ */
+export function approvalStatusFor(lines: Array<{ hasOverride: boolean }>): 'approved' | 'approved_with_adjustments' {
+  return lines.some((l) => l.hasOverride) ? 'approved_with_adjustments' : 'approved';
+}
+
 // ──────────────────────────────────────────────────────────────────── the database
 
 export interface ManualReturnInput {
@@ -598,6 +679,11 @@ export class QuoteComparisonDatabase {
       isAssumed: boolean; assumptionBasis: string | null; tendererNote: string | null; estimatorNote: string | null;
       cellId: string | null; quotedRate: number | null; quotedTotal: number | null;
       tendererDescription: string | null; pricedAsVariantRowId: string | null;
+      // Final adjustments (BuildFlow #100's own closing step) — levelledRate/levelledTotal
+      // above are already override-aware (see applyOverride); these three carry what the
+      // automatic rule alone would have said, and whether a human has since overridden it.
+      hasOverride: boolean; overrideStale: boolean; adjustmentReason: string | null;
+      autoLevelledRate: number | null; autoLevelledTotal: number | null;
     };
 
     const grid = rows.map((row) => {
@@ -620,20 +706,26 @@ export class QuoteComparisonDatabase {
         // theirs to have priced.
         if ((row.origin === 'tenderer_added' || row.origin === 'tenderer_variant') && String(row.added_by_return_id) !== returnId) {
           const l = levelCell({ lineStatus: null, quotedRate: null, quotedTotal: null, lowest: null });
-          return { returnId, ...l, tendererNote: null, estimatorNote: null, cellId: null, quotedRate: null, quotedTotal: null, tendererDescription: null, pricedAsVariantRowId: null };
+          return {
+            returnId, ...l, tendererNote: null, estimatorNote: null, cellId: null, quotedRate: null, quotedTotal: null,
+            tendererDescription: null, pricedAsVariantRowId: null,
+            hasOverride: false, overrideStale: false, adjustmentReason: null, autoLevelledRate: l.levelledRate, autoLevelledTotal: l.levelledTotal
+          };
         }
         const existing = byReturn.get(returnId);
         if (existing?.status === 'priced_as_variant') {
           // Priced, just under this tenderer's own wording — the variant row alongside
           // this one carries the actual figure, so this cell levels to zero rather than
-          // competing for the same money twice (see `upsertMatchedLine`).
+          // competing for the same money twice (see `upsertMatchedLine`). Not overridable
+          // here — see `setAdjustment`'s own refusal — so there is nothing to blend in.
           return {
             returnId, status: 'priced_as_variant', levelledRate: 0, levelledTotal: 0,
             isAssumed: true, assumptionBasis: (existing.assumption_basis as string | null) ?? null,
             tendererNote: (existing.tenderer_note as string | null) ?? null, estimatorNote: (existing.estimator_note as string | null) ?? null,
             cellId: String(existing.id), quotedRate: null, quotedTotal: null,
             tendererDescription: (existing.tenderer_description as string | null) ?? null,
-            pricedAsVariantRowId: existing.priced_as_variant_row_id ? String(existing.priced_as_variant_row_id) : null
+            pricedAsVariantRowId: existing.priced_as_variant_row_id ? String(existing.priced_as_variant_row_id) : null,
+            hasOverride: false, overrideStale: false, adjustmentReason: null, autoLevelledRate: 0, autoLevelledTotal: 0
           };
         }
         const levelled = levelCell({
@@ -642,14 +734,25 @@ export class QuoteComparisonDatabase {
           quotedTotal: existing?.quoted_total != null ? Number(existing.quoted_total) : null,
           lowest
         });
+        const currentQuotedTotal = existing?.quoted_total != null ? Number(existing.quoted_total) : null;
+        const override: CellOverride | null = existing?.adjusted_total != null ? {
+          adjustedRate: existing.adjusted_rate != null ? Number(existing.adjusted_rate) : null,
+          adjustedTotal: Number(existing.adjusted_total),
+          adjustmentReason: String(existing.adjustment_reason),
+          adjustedAgainstQuotedTotal: existing.adjusted_against_quoted_total != null ? Number(existing.adjusted_against_quoted_total) : null
+        } : null;
+        const overridden = applyOverride(levelled, override, currentQuotedTotal);
         return {
-          returnId, ...levelled,
+          returnId, status: levelled.status, levelledRate: overridden.finalRate, levelledTotal: overridden.finalTotal,
+          isAssumed: levelled.isAssumed, assumptionBasis: levelled.assumptionBasis,
           tendererNote: (existing?.tenderer_note as string | null) ?? null, estimatorNote: (existing?.estimator_note as string | null) ?? null,
           cellId: existing?.id ? String(existing.id) : null,
           quotedRate: existing?.quoted_rate != null ? Number(existing.quoted_rate) : null,
           quotedTotal: existing?.quoted_total != null ? Number(existing.quoted_total) : null,
           tendererDescription: (existing?.tenderer_description as string | null) ?? null,
-          pricedAsVariantRowId: null
+          pricedAsVariantRowId: null,
+          hasOverride: overridden.hasOverride, overrideStale: overridden.overrideStale, adjustmentReason: overridden.adjustmentReason,
+          autoLevelledRate: overridden.autoLevelledRate, autoLevelledTotal: overridden.autoLevelledTotal
         };
       });
       return { ...row, lowest, cells: levelledCells };
@@ -710,6 +813,16 @@ export class QuoteComparisonDatabase {
   }
 
   async deleteEstimatorRow(workflowId: string, comparisonId: string, rowId: string): Promise<void> {
+    const [withOverride] = await this.db.query<{ id: string }>(
+      `SELECT c.id FROM tps.quote_comparison_cells c
+         JOIN tps.quote_comparison_rows r ON r.id = c.row_id
+         JOIN tps.quote_comparisons qc ON qc.id = r.comparison_id
+        WHERE r.id = $3 AND r.comparison_id = $2 AND qc.workflow_id = $1 AND c.adjusted_total IS NOT NULL
+        LIMIT 1`,
+      [workflowId, comparisonId, rowId]
+    );
+    if (withOverride) throw conflict('This row has an adjustment on it — clear the adjustment before deleting the row.');
+
     const deleted = await this.db.query(
       `DELETE FROM tps.quote_comparison_rows r USING tps.quote_comparisons qc
         WHERE r.id = $3 AND r.comparison_id = $2 AND r.origin = 'estimator_added'
@@ -718,6 +831,111 @@ export class QuoteComparisonDatabase {
       [workflowId, comparisonId, rowId]
     );
     if (deleted.length === 0) throw notFound('No estimator-added row to delete with that id.');
+  }
+
+  /**
+   * Sets (or replaces) the estimator's own figure for one cell — "subject to the response
+   * from the subcontractor, he can make the final adjustments" (BuildFlow #100). Refused
+   * on a `priced_as_variant` spine cell: its figure is always zero by construction (see
+   * `computeGrid`), and an override there would be adjusting a number nobody is looking
+   * at — the variant row directly below it is where the real figure lives.
+   *
+   * The total is derived from the rate × the row's own quantity when only a rate is
+   * given; a bare total (no rate) is accepted as-is, for a lump-sum adjustment with no
+   * meaningful per-unit figure.
+   */
+  async setAdjustment(
+    workflowId: string, comparisonId: string, cellId: string,
+    input: { rate: number | null; total: number | null; reason: string; queryId: string | null }, actorId: string
+  ): Promise<Row> {
+    return this.db.transaction(async (client) => {
+      const [cell] = await this.db.query<Row>(
+        `SELECT c.*, r.quantity AS row_quantity, r.seq AS row_seq, r.description AS row_description
+           FROM tps.quote_comparison_cells c
+           JOIN tps.quote_comparison_rows r ON r.id = c.row_id
+           JOIN tps.quote_comparisons qc ON qc.id = r.comparison_id
+          WHERE c.id = $3 AND r.comparison_id = $2 AND qc.workflow_id = $1
+          FOR UPDATE OF c`,
+        [workflowId, comparisonId, cellId], client
+      );
+      if (!cell) throw notFound('Comparison cell not found.');
+      if (cell.status === 'priced_as_variant') {
+        throw conflict('This line is priced under the tenderer’s own wording — adjust the variant row below it instead.');
+      }
+
+      const quantity = cell.row_quantity != null ? Number(cell.row_quantity) : null;
+      const adjustedRate = input.rate ?? null;
+      let adjustedTotal = input.total ?? null;
+      if (adjustedTotal == null && adjustedRate != null && quantity != null) adjustedTotal = adjustedRate * quantity;
+      if (adjustedTotal == null) throw conflict('Give either a total, or a rate together with a known quantity to work it out from.');
+
+      await this.db.query(
+        `UPDATE tps.quote_comparison_cells
+            SET adjusted_rate = $2, adjusted_total = $3, adjustment_reason = $4, adjusted_by = $5, adjusted_at = NOW(),
+                adjustment_query_id = $6, adjusted_against_quoted_total = quoted_total, updated_at = NOW()
+          WHERE id = $1`,
+        [cellId, adjustedRate, adjustedTotal, input.reason, actorId, input.queryId], client
+      );
+      await this.db.query(
+        `INSERT INTO tps.quote_comparison_adjustments
+           (comparison_id, cell_id, return_id, row_seq, row_description, action, previous_rate, previous_total, new_rate, new_total, reason, query_id, actor)
+         VALUES ($1,$2,$3,$4,$5,'set',$6,$7,$8,$9,$10,$11,$12)`,
+        [comparisonId, cellId, cell.return_id, cell.row_seq, cell.row_description,
+         cell.adjusted_rate != null ? Number(cell.adjusted_rate) : null, cell.adjusted_total != null ? Number(cell.adjusted_total) : null,
+         adjustedRate, adjustedTotal, input.reason, input.queryId, actorId],
+        client
+      );
+
+      const [updated] = await this.db.query<Row>(`SELECT * FROM tps.quote_comparison_cells WHERE id = $1`, [cellId], client);
+      return updated!;
+    });
+  }
+
+  async clearAdjustment(workflowId: string, comparisonId: string, cellId: string, reason: string, actorId: string): Promise<Row> {
+    return this.db.transaction(async (client) => {
+      const [cell] = await this.db.query<Row>(
+        `SELECT c.*, r.seq AS row_seq, r.description AS row_description
+           FROM tps.quote_comparison_cells c
+           JOIN tps.quote_comparison_rows r ON r.id = c.row_id
+           JOIN tps.quote_comparisons qc ON qc.id = r.comparison_id
+          WHERE c.id = $3 AND r.comparison_id = $2 AND qc.workflow_id = $1
+          FOR UPDATE OF c`,
+        [workflowId, comparisonId, cellId], client
+      );
+      if (!cell) throw notFound('Comparison cell not found.');
+      if (cell.adjusted_total == null) throw conflict('This cell has no adjustment to clear.');
+
+      await this.db.query(
+        `UPDATE tps.quote_comparison_cells
+            SET adjusted_rate = NULL, adjusted_total = NULL, adjustment_reason = NULL,
+                adjusted_by = NULL, adjusted_at = NULL, adjustment_query_id = NULL, adjusted_against_quoted_total = NULL, updated_at = NOW()
+          WHERE id = $1`,
+        [cellId], client
+      );
+      await this.db.query(
+        `INSERT INTO tps.quote_comparison_adjustments
+           (comparison_id, cell_id, return_id, row_seq, row_description, action, previous_rate, previous_total, new_rate, new_total, reason, actor)
+         VALUES ($1,$2,$3,$4,$5,'cleared',$6,$7,NULL,NULL,$8,$9)`,
+        [comparisonId, cellId, cell.return_id, cell.row_seq, cell.row_description,
+         cell.adjusted_rate != null ? Number(cell.adjusted_rate) : null, Number(cell.adjusted_total), reason, actorId],
+        client
+      );
+
+      const [updated] = await this.db.query<Row>(`SELECT * FROM tps.quote_comparison_cells WHERE id = $1`, [cellId], client);
+      return updated!;
+    });
+  }
+
+  /** The full trail of sets and clears for one cell, newest first — an estimator's own
+   *  record of a figure they changed more than once stays visible, not just the latest. */
+  async adjustmentHistory(workflowId: string, comparisonId: string, cellId: string): Promise<Row[]> {
+    return this.db.query<Row>(
+      `SELECT a.* FROM tps.quote_comparison_adjustments a
+         JOIN tps.quote_comparisons c ON c.id = a.comparison_id
+        WHERE a.cell_id = $3 AND a.comparison_id = $2 AND c.workflow_id = $1
+        ORDER BY a.occurred_at DESC`,
+      [workflowId, comparisonId, cellId]
+    );
   }
 
   /**
@@ -797,12 +1015,18 @@ export class QuoteComparisonDatabase {
   }
 
   /**
-   * Awards the package: upserts `trade_analysis` (approved_with_adjustments, since a
-   * levelled figure is by definition an adjustment the moment any cell is assumed) with
-   * the awarded return, then inserts `tender_boq_lines` from the comparison's LEVELLED
-   * figures. The order is not a style choice — `assert_trade_approved` (008) refuses the
-   * insert unless the trade analysis row already reads approved, so reversing these two
+   * Awards the package: upserts `trade_analysis` with the awarded return, then inserts
+   * `tender_boq_lines` from the comparison's LEVELLED (and, where set, OVERRIDDEN) figures.
+   * The order is not a style choice — `assert_trade_approved` (008) refuses the insert
+   * unless the trade analysis row already reads approved, so reversing these two
    * statements is not an option the database will accept.
+   *
+   * Refuses while any override on the AWARDED return is stale (see `applyOverride`) — a
+   * resubmission changed the quote an estimator's own figure was based on, and awarding
+   * on it regardless would carry a number nobody has actually looked at since. Re-saving
+   * (or clearing) the override via `setAdjustment`/`clearAdjustment` is what clears it;
+   * there is no separate "acknowledge" step, because that save itself re-snapshots the
+   * current quote.
    */
   async approve(workflowId: string, packageName: string, awardedReturnId: string, approvedBy: string, notes: string | null): Promise<Row> {
     return this.db.transaction(async (client) => {
@@ -832,17 +1056,32 @@ export class QuoteComparisonDatabase {
       // `levelled_total` are never persisted (they depend on every OTHER return's cells
       // for the row, not knowable until they are all read together — see computeGrid).
       const detail = await this.computeGrid(workflowId, packageName, client);
-      const rows = detail.rows as Array<Row & { cells: Array<{ returnId: string; status: CellStatus; levelledRate: number | null; levelledTotal: number | null; isAssumed: boolean; assumptionBasis: string | null; quotedRate: number | null }> }>;
+      type ApproveCell = {
+        returnId: string; status: CellStatus; levelledRate: number | null; levelledTotal: number | null;
+        isAssumed: boolean; assumptionBasis: string | null; estimatorNote: string | null; quotedRate: number | null;
+        hasOverride: boolean; overrideStale: boolean; adjustmentReason: string | null;
+      };
+      const rows = detail.rows as Array<Row & { cells: ApproveCell[] }>;
       const cellByRow = new Map(rows.map((row) => [String(row.id), row.cells.find((c) => c.returnId === awardedReturnId)]));
+
+      const stale = [...cellByRow.values()].find((c) => c?.overrideStale);
+      if (stale) {
+        throw conflict(
+          'An adjustment on this comparison was made against a quote that has since changed. '
+          + 'Review it (re-save or clear the adjustment) before awarding.'
+        );
+      }
+
+      const status = approvalStatusFor([...cellByRow.values()].map((c) => ({ hasOverride: c?.hasOverride ?? false })));
 
       await this.db.query(
         `INSERT INTO tps.trade_analysis (workflow_id, package_name, awarded_return_id, status, approved_at, approved_by, approval_notes)
-         VALUES ($1, $2, $3, 'approved_with_adjustments', NOW(), $4, $5)
+         VALUES ($1, $2, $3, $4, NOW(), $5, $6)
          ON CONFLICT (workflow_id, package_name) DO UPDATE
            SET awarded_return_id = EXCLUDED.awarded_return_id, status = EXCLUDED.status,
                approved_at = NOW(), approved_by = EXCLUDED.approved_by, approval_notes = EXCLUDED.approval_notes,
                updated_at = NOW()`,
-        [workflowId, packageName, awardedReturnId, approvedBy, notes], client
+        [workflowId, packageName, awardedReturnId, status, approvedBy, notes], client
       );
 
       await this.db.query(`DELETE FROM tender_boq_lines WHERE workflow_id = $1 AND package_name = $2`, [workflowId, packageName], client);
@@ -861,12 +1100,19 @@ export class QuoteComparisonDatabase {
         })
         .map((row) => {
           const cell = cellByRow.get(String(row.id));
-          const adjusted = cell ? cell.isAssumed : true;
+          const adjusted = cell ? (cell.isAssumed || cell.hasOverride) : true;
           return {
             ge: row.ge_code, el: row.element_code, descr: row.description, qty: row.quantity, unit: row.unit,
             submittedRate: cell?.quotedRate ?? null, approvedRate: cell?.levelledRate ?? null, approvedTotal: cell?.levelledTotal ?? null,
             status: boqStatusFor(cell?.status ?? 'absent'), adjusted,
-            adjustmentNote: adjusted ? (cell?.assumptionBasis ?? 'No return on file for this line; no substitution was available.') : null
+            adjustmentNote: adjusted
+              ? (cell
+                  ? composeAdjustmentNote({
+                      hasOverride: cell.hasOverride, adjustmentReason: cell.adjustmentReason,
+                      autoAssumptionBasis: cell.assumptionBasis, estimatorNote: cell.estimatorNote
+                    })
+                  : 'No return on file for this line; no substitution was available.')
+              : null
           };
         });
 
