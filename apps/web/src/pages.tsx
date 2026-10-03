@@ -1,11 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Fragment, FormEvent, useEffect, useState } from 'react';
 import { Link, Outlet, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, TENDER_RETURN_MAX, type ConfirmIttResult, type IttDispatch, type IttLetterDetailsInput, type IttLineSection, type IttPack, type LaunchTableRow, type PortalResponseSummary, type SendAllIttsResult, type SendIttDraftResult, type TakeoffCompletion, type TenderComparative, type TenderPrepWorkflow, type TenderReturnUnit } from './api';
+import { api, TENDER_RETURN_MAX, type ConfirmIttResult, type IttDispatch, type IttLetterDetailsInput, type IttLineSection, type IttPack, type LaunchTableRow, type PortalResponseSummary, type SendAllIttsResult, type SendIttDraftResult, type TakeoffCompletion, type TenderPrepWorkflow, type TenderReturnUnit } from './api';
 import { oidc, signIn } from './auth';
 import { CommsModal } from './comms';
 import { NotificationBell } from './notifications';
 import { AddendaButton } from './addendum';
+import { QuoteComparisonPanel } from './quoteComparisonPanel';
 
 export function ErrorMessage({ error }: { error: unknown }) {
   return error ? <p className="error">{error instanceof Error ? error.message : 'Something went wrong'}</p> : null;
@@ -228,7 +229,7 @@ export function TenderPrepPage() {
       {currentStep === 1 && takeoff && <TakeoffSummary takeoff={takeoff} packageId={packageId} />}
       {currentStep === 1 && <Step1TenderLaunchPack workflowId={workflowId} />}
       {currentStep === 2 && <Step2IttDispatch workflowId={workflowId} initialThreadId={deepLinkThreadId} openRfi={openRfi} />}
-      {currentStep === 3 && <Step3Comparative workflowId={workflowId} />}
+      {currentStep === 3 && <QuoteComparisonPanel workflowId={workflowId} />}
       {currentStep === 4 && <Step4Submission workflowId={workflowId} />}
     </section>
   </div>;
@@ -1426,56 +1427,6 @@ function PortalResponseDetailView({ workflowId, linkId, onBack, onReopened }: {
   </div>;
 }
 
-
-// ── Step 3: Comparative Analysis ──────────────────────────────────────────
-
-function Step3Comparative({ workflowId }: { workflowId: string }) {
-  const queryClient = useQueryClient();
-  const [name, setName] = useState('');
-  const [tendered, setTendered] = useState('');
-  const [estimate, setEstimate] = useState('');
-  const [recommendation, setRecommendation] = useState('');
-
-  const rows = useQuery({ queryKey: ['comparative', workflowId], queryFn: () => api.listComparative(workflowId) });
-
-  const add = useMutation({
-    mutationFn: () => api.upsertComparative(workflowId, {
-      tenderer_name: name, tendered_sum: tendered ? Number(tendered) : undefined,
-      estimate_sum: estimate ? Number(estimate) : undefined, recommendation: recommendation || undefined
-    }),
-    onSuccess: () => { setName(''); setTendered(''); setEstimate(''); setRecommendation(''); void queryClient.invalidateQueries({ queryKey: ['comparative', workflowId] }); }
-  });
-
-  const fmt = (n?: number) => n !== undefined ? `£${n.toLocaleString()}` : '—';
-  const variance = (t?: number, e?: number) => t && e ? ((t - e) / e * 100).toFixed(1) : null;
-
-  return <div className="panel">
-    <h3>Add Tenderer</h3>
-    <form className="inline-form" onSubmit={(ev) => { ev.preventDefault(); if (name.trim()) add.mutate(); }}>
-      <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Tenderer name" required />
-      <input type="number" value={tendered} onChange={(e) => setTendered(e.target.value)} placeholder="Tendered sum £" />
-      <input type="number" value={estimate} onChange={(e) => setEstimate(e.target.value)} placeholder="Estimate £" />
-      <input value={recommendation} onChange={(e) => setRecommendation(e.target.value)} placeholder="Recommendation" />
-      <button disabled={add.isPending}>Add</button>
-    </form>
-    <ErrorMessage error={add.error} />
-    {rows.isLoading ? <Busy /> : <table className="data-table" style={{ marginTop: 16 }}>
-      <thead><tr><th>Tenderer</th><th>Tendered Sum</th><th>Estimate</th><th>Variance</th><th>Recommendation</th></tr></thead>
-      <tbody>{(rows.data as TenderComparative[])?.map((r) => {
-        const v = variance(r.tendered_sum ?? undefined, r.estimate_sum ?? undefined);
-        return <tr key={r.id}>
-          <td><strong>{r.tenderer_name}</strong></td>
-          <td>{fmt(r.tendered_sum ?? undefined)}</td>
-          <td>{fmt(r.estimate_sum ?? undefined)}</td>
-          <td className={v ? (parseFloat(v) > 5 ? 'text-red' : parseFloat(v) < -5 ? 'text-green' : '') : ''}>{v ? `${v}%` : '—'}</td>
-          <td>{r.recommendation ?? '—'}</td>
-        </tr>;
-      })}
-      {rows.data?.length === 0 && <tr><td colSpan={5} className="muted" style={{ textAlign: 'center', padding: '1.5rem' }}>No comparative data entered.</td></tr>}
-      </tbody>
-    </table>}
-  </div>;
-}
 
 // ── Step 4: Tender Submission ─────────────────────────────────────────────
 

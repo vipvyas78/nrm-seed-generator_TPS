@@ -1,0 +1,1141 @@
+import type { PoolClient } from 'pg';
+import type { Database, Row } from './db.js';
+import { conflict, notFound } from './errors.js';
+import { knownReturnDeadlineSql } from './tenderReturnPeriod.js';
+
+/**
+ * The levelled quote comparison (BuildFlow issue #100) — read side, levelling and
+ * approval for `tps.quote_comparisons` / `_rows` / `_cells` (migration 028).
+ *
+ * Standalone, taking the `Database` explicitly — the same separation `pricingPortalDb.ts`
+ * and `boqReadDb.ts` already keep from `tenderPrepDb.ts`, which is 5,000+ lines. It knows
+ * nothing about actors or workflow authorisation; `tenderPrepDb.ts` wraps every method
+ * here with `assertWorkflowAccess` first, the same convention it already uses for
+ * `PricingPortalDatabase`.
+ *
+ * THE SPINE. A comparison's spine is the bill every tenderer was actually sent, and the
+ * one place that bill already lives, line for line with a stable `seq`, is
+ * `tps.pricing_portal_lines` — every invited firm gets one at MINT time
+ * (`PricingPortalDatabase.snapshotLines`), whether or not they ever open the link. Reading
+ * it here rather than re-deriving the bill from `getPackageItt`/`assemblePackageForEmail`
+ * is deliberate: `tenderPrepDb.ts` already owns that assembly, and a second implementation
+ * of it here would be a second opinion about what a package's bill contains.
+ *
+ * TWO CAVEATS THAT SHAPE `buildSpine`. First, not every firm invited to one package is
+ * necessarily looking at the same snapshot — `mintOrRefreshLink` never touches an
+ * existing link's lines, so a firm invited after a bill change is pricing a different
+ * bill from one invited before it, and `seq` is only a safe cross-tenderer key within ONE
+ * snapshot. Second, a firm's own added lines (`added_by_tenderer`) get a `seq` too — the
+ * next number after their snapshot ends — so two different firms' additions can collide
+ * on the same `seq` while being two unrelated lines. `buildSpine` picks the LARGEST
+ * snapshot (the fullest one — the same "fullest ladder wins" rule this codebase's
+ * take-off pipeline uses for storey height) as the reference, and any OTHER return's line
+ * is matched to it by `seq` only among that return's non-added lines, with description and
+ * unit required to agree — a mismatch is reported on the cell (see `upsertCell`) rather
+ * than silently mis-paired.
+ */
+
+// ─────────────────────────────────────────────────────────────── pure levelling rules
+
+export type ReturnLineStatus = 'priced' | 'included' | 'excluded' | 'not_addressed';
+export type CellStatus = ReturnLineStatus | 'absent' | 'priced_as_variant';
+export type ComparisonReadiness = 'awaiting_returns' | 'quorum_met' | 'deadline_passed';
+
+// Construction shorthand this trade routinely spells three or four different ways for the
+// same unit — a tenderer writing "sq m" against a bill that reads "m2" is not a different
+// item, and must not be read as one.
+const UNIT_SYNONYMS: Record<string, string> = {
+  m2: 'm2', 'm²': 'm2', sqm: 'm2', 'sq.m': 'm2', 'sq m': 'm2', 'sq.m.': 'm2',
+  m3: 'm3', 'm³': 'm3', cum: 'm3', 'cu.m': 'm3', 'cu m': 'm3', 'cu.m.': 'm3',
+  lm: 'lm', 'l.m': 'lm', 'l.m.': 'lm', 'lin m': 'lm', 'linear m': 'lm', 'linear metre': 'lm', 'linear metres': 'lm',
+  nr: 'nr', no: 'nr', 'no.': 'nr', each: 'nr', ea: 'nr', item: 'item', item2: 'item'
+};
+
+function normalizeUnit(unit: string | null): string {
+  if (!unit) return '';
+  const key = unit.trim().toLowerCase().replace(/\s+/g, ' ');
+  return UNIT_SYNONYMS[key] ?? key;
+}
+
+function normalizeDescription(description: string): string {
+  return description.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/**
+ * Whether a tenderer's own line is the SAME item as the reference bill line at that
+ * position, or a genuine discrepancy — the issue's own "slight discrepancy within the
+ * description" is exactly what a strict string comparison would over-report: a trailing
+ * space, a capital letter, or "sq m" against "m2" is not a different item, and treating it
+ * as one would spawn a variant row (and hide the tenderer's own money on it) for nothing.
+ */
+export function sameItem(a: { description: string; unit: string | null }, b: { description: string; unit: string | null }): boolean {
+  return normalizeDescription(a.description) === normalizeDescription(b.description)
+    && normalizeUnit(a.unit) === normalizeUnit(b.unit);
+}
+
+/** The issue's own number: "app should expect at least three quotes." */
+export const QUOTE_QUORUM = 3;
+
+/**
+ * Whether the comparison is ready to approve — never whether it may be VIEWED. An
+ * estimator will open this long before it is ready, and a screen that refuses to render
+ * early is not what was asked for; only the approve action reads this.
+ *
+ * `quorum_met` outranks a passed deadline in the other direction too: three returns in
+ * hand is ready regardless of what the calendar says. Reaching either condition is enough
+ * — the issue's "expect at least three … however, if the time has passed, consider
+ * whatever it has" describes two independent ways to become ready, not a sequence.
+ */
+export function computeReadiness(receivedCount: number, deadline: Date | null, now: Date): ComparisonReadiness {
+  if (receivedCount >= QUOTE_QUORUM) return 'quorum_met';
+  if (deadline && now.getTime() > deadline.getTime()) return 'deadline_passed';
+  return 'awaiting_returns';
+}
+
+export function moneyGBP(amount: number): string {
+  return `£${amount.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/** The cheapest QUOTED figure for one spine row, across every return being compared. Keyed
+ * on TOTAL rather than rate: a tenderer may price their own quantity on a line (the portal
+ * allows it), so two tenderers' rates for the same row are not always for the same
+ * quantity, and total is the number that actually costs money. */
+export interface LowestQuote {
+  rate: number | null;
+  total: number;
+  tendererName: string;
+}
+
+export interface LevelledCell {
+  status: CellStatus;
+  levelledRate: number | null;
+  levelledTotal: number | null;
+  isAssumed: boolean;
+  assumptionBasis: string | null;
+}
+
+/**
+ * One cell of the grid — what a single tenderer's return says (or does not say) about one
+ * spine row, turned into what the comparison carries.
+ *
+ * `lineStatus: null` means this return has no line at all for this row — never submitted
+ * one, or submitted after the row was added to the spine as another tenderer's addition.
+ * That is `absent`, not `not_addressed`: the tenderer never had the chance to address it.
+ */
+export function levelCell(input: {
+  lineStatus: ReturnLineStatus | null;
+  quotedRate: number | null;
+  quotedTotal: number | null;
+  lowest: LowestQuote | null;
+}): LevelledCell {
+  const substitute = (reason: string, status: CellStatus): LevelledCell => {
+    if (!input.lowest) {
+      return { status, levelledRate: null, levelledTotal: null, isAssumed: true, assumptionBasis: `${reason} No tenderer priced this item.` };
+    }
+    return {
+      status, levelledRate: input.lowest.rate, levelledTotal: input.lowest.total, isAssumed: true,
+      assumptionBasis: `${reason} Levelled at the lowest quoted price (${input.lowest.tendererName}, ${moneyGBP(input.lowest.total)}).`
+    };
+  };
+
+  if (input.lineStatus === null) return substitute('Not in this tenderer’s return.', 'absent');
+  if (input.lineStatus === 'included') {
+    return { status: 'included', levelledRate: 0, levelledTotal: 0, isAssumed: true,
+             assumptionBasis: 'Stated included in the price, with no separate rate given.' };
+  }
+  if (input.lineStatus === 'excluded') return substitute('Excluded by this tenderer.', 'excluded');
+  if (input.lineStatus === 'not_addressed') return substitute('Not addressed by this tenderer.', 'not_addressed');
+
+  // 'priced'. A status the tenderer chose but backed with no figure carries no more
+  // evidence than not addressing it — the substitution applies, but `status` still
+  // reports what they actually said, which is why it is not folded into the branch above.
+  if (input.quotedTotal == null) return substitute('Marked priced but no rate was given.', 'priced');
+  return { status: 'priced', levelledRate: input.quotedRate, levelledTotal: input.quotedTotal, isAssumed: false, assumptionBasis: null };
+}
+
+/** The cheapest priced figure for one row, or null where nobody priced it at all. */
+export function findLowestQuote(quotes: Array<{ total: number | null; rate: number | null; tendererName: string }>): LowestQuote | null {
+  let lowest: LowestQuote | null = null;
+  for (const q of quotes) {
+    if (q.total == null) continue;
+    if (!lowest || q.total < lowest.total) lowest = { rate: q.rate, total: q.total, tendererName: q.tendererName };
+  }
+  return lowest;
+}
+
+/**
+ * `tender_boq_lines.status` (008) only ever allowed the four statuses a tenderer can
+ * actually choose — it predates `absent`, which `quote_comparison_cells` added for a row
+ * a tenderer never had the chance to address at all (an estimator's own reconciliation
+ * row, or a short return). Awarding such a row is not a status the CHECK recognises, so
+ * this is the one place `absent` must be translated rather than carried through verbatim
+ * — into `not_addressed`, which is what it is from the awarded firm's own bill's point of
+ * view: a line they did not price, for whatever reason.
+ */
+export function boqStatusFor(status: CellStatus): ReturnLineStatus {
+  if (status === 'absent') return 'not_addressed';
+  // Never actually reaches this far — `approve()` skips a row entirely once its cell is
+  // `priced_as_variant`, since the variant row sitting under it becomes the real BoQ line
+  // (see `approve`'s own filter). Kept total and type-safe regardless.
+  if (status === 'priced_as_variant') return 'excluded';
+  return status;
+}
+
+/** One tenderer's two totals — what they actually quoted, and what the comparison
+ * carries once every gap is levelled. The gap between them IS the point of the stage:
+ * the cheapest substitution flatters whoever omitted the most, so the two must both be
+ * visible rather than blended into one number. */
+export function sumTotals(cells: Array<{ status: CellStatus; quotedTotal: number | null; levelledTotal: number | null }>): {
+  quotedSum: number; levelledSum: number; pricedCount: number; assumedCount: number;
+} {
+  let quotedSum = 0, levelledSum = 0, pricedCount = 0, assumedCount = 0;
+  for (const cell of cells) {
+    if (cell.status === 'priced' && cell.quotedTotal != null) { quotedSum += cell.quotedTotal; pricedCount += 1; }
+    else assumedCount += 1;
+    if (cell.levelledTotal != null) levelledSum += cell.levelledTotal;
+  }
+  return { quotedSum, levelledSum, pricedCount, assumedCount };
+}
+
+export interface ScopeNoteRow { seq: number; description: string; cells: Array<{ returnId: string; status: CellStatus }> }
+export interface ScopeNotes {
+  returnId: string; qualifications: string | null; exclusions: string | null; programmeWeeks: number | null;
+  includedItems: Array<{ seq: number; description: string }>;
+  excludedItems: Array<{ seq: number; description: string }>;
+}
+
+/**
+ * The issue's own closing instruction: "list out all the exclusions and inclusions made
+ * by the subcontractors so that it is a complete comparison for estimators to review" —
+ * not just the free-text header a return carries (`qualifications`/`exclusions`), but
+ * every LINE a tenderer marked included or excluded, by name. Reusing the already-levelled
+ * grid rather than re-reading raw cells means an own-wording variant or an own-added line
+ * a tenderer excluded is picked up exactly the same way a bill line is.
+ */
+export function collectScopeNotes(
+  returns: Array<{ id: string; qualifications: string | null; exclusions: string | null; programmeWeeks: number | null }>,
+  rows: ScopeNoteRow[]
+): ScopeNotes[] {
+  return returns.map((ret) => {
+    const includedItems: Array<{ seq: number; description: string }> = [];
+    const excludedItems: Array<{ seq: number; description: string }> = [];
+    for (const row of rows) {
+      const cell = row.cells.find((c) => c.returnId === ret.id);
+      if (!cell) continue;
+      if (cell.status === 'included') includedItems.push({ seq: row.seq, description: row.description });
+      else if (cell.status === 'excluded') excludedItems.push({ seq: row.seq, description: row.description });
+    }
+    return { returnId: ret.id, qualifications: ret.qualifications, exclusions: ret.exclusions, programmeWeeks: ret.programmeWeeks, includedItems, excludedItems };
+  });
+}
+
+// ──────────────────────────────────────────────────────────────── final adjustments
+
+/** An override on file for a cell — `adjusted_total` is the only required field; a rate
+ *  with no total alongside it is not a complete override (see `setAdjustment`, which
+ *  always derives one before this is ever read). */
+export interface CellOverride {
+  adjustedRate: number | null;
+  adjustedTotal: number;
+  adjustmentReason: string;
+  /** The cell's `quoted_total` at the moment the override was set — compared against the
+   *  LIVE figure to decide `overrideStale` below. */
+  adjustedAgainstQuotedTotal: number | null;
+}
+
+export interface OverriddenCell {
+  /** What this comparison actually carries, once an override is applied — equal to the
+   *  automatic figure when there is none. */
+  finalRate: number | null;
+  finalTotal: number | null;
+  hasOverride: boolean;
+  /** The automatic figure is ALSO preserved either way, so a reviewer can see what was
+   *  overridden FROM, not just what it reads now. */
+  autoLevelledRate: number | null;
+  autoLevelledTotal: number | null;
+  adjustmentReason: string | null;
+  /** True once a resubmission has changed the tenderer's own quoted figure out from under
+   *  a standing override — the estimator adjusted against a number that no longer holds.
+   *  Re-saving (or clearing) the override is what re-confirms it; there is no separate
+   *  "acknowledge" step, because setAdjustment itself re-snapshots the current quote. */
+  overrideStale: boolean;
+}
+
+/**
+ * Blends a standing override into what `levelCell` already decided — never in place of
+ * it. "Lowest" (and so every OTHER return's substitution) still comes from the QUOTED
+ * figures alone, never an override, or the cheapest-price rule would start chasing its
+ * own adjustments.
+ */
+export function applyOverride(levelled: LevelledCell, override: CellOverride | null, currentQuotedTotal: number | null): OverriddenCell {
+  if (!override) {
+    return {
+      finalRate: levelled.levelledRate, finalTotal: levelled.levelledTotal, hasOverride: false,
+      autoLevelledRate: levelled.levelledRate, autoLevelledTotal: levelled.levelledTotal,
+      adjustmentReason: null, overrideStale: false
+    };
+  }
+  return {
+    finalRate: override.adjustedRate, finalTotal: override.adjustedTotal, hasOverride: true,
+    autoLevelledRate: levelled.levelledRate, autoLevelledTotal: levelled.levelledTotal,
+    adjustmentReason: override.adjustmentReason,
+    overrideStale: override.adjustedAgainstQuotedTotal !== currentQuotedTotal
+  };
+}
+
+/**
+ * What goes into `tender_boq_lines.adjustment_note` for one line — the override's own
+ * reason takes precedence over the automatic substitution's, since once an estimator has
+ * looked at a line and decided a figure for it, that decision is the one worth recording,
+ * not the guess it replaced. The estimator's own cell note is never lost either way.
+ */
+export function composeAdjustmentNote(input: {
+  hasOverride: boolean; adjustmentReason: string | null; autoAssumptionBasis: string | null; estimatorNote: string | null;
+}): string | null {
+  const parts: string[] = [];
+  if (input.hasOverride && input.adjustmentReason) parts.push(`Adjusted: ${input.adjustmentReason}`);
+  else if (input.autoAssumptionBasis) parts.push(input.autoAssumptionBasis);
+  if (input.estimatorNote) parts.push(`Estimator note: ${input.estimatorNote}`);
+  return parts.length > 0 ? parts.join(' ') : null;
+}
+
+/**
+ * approved_with_adjustments means an ESTIMATOR changed a figure — not that the automatic
+ * cheapest-price rule filled a gap, which is what every comparison with any absent line
+ * does regardless. Levelling a gap is the comparison working as designed; overriding one
+ * is a human decision on top of it, and that is the distinction this status exists to
+ * record for whoever reads trade_analysis later.
+ */
+export function approvalStatusFor(lines: Array<{ hasOverride: boolean }>): 'approved' | 'approved_with_adjustments' {
+  return lines.some((l) => l.hasOverride) ? 'approved_with_adjustments' : 'approved';
+}
+
+// ──────────────────────────────────────────────────────────────────── the database
+
+export interface ManualReturnInput {
+  tendererName: string;
+  subcontractorId: string | null;
+  receivedAt: string | null;
+  programmeWeeks: number | null;
+  qualifications: string | null;
+  exclusions: string | null;
+  cells: Array<{ rowId: string; quantity: number | null; rate: number | null; status: ReturnLineStatus; note: string | null }>;
+  extraLines: Array<{ description: string; unit: string | null; quantity: number | null; rate: number | null; status: ReturnLineStatus; note: string | null }>;
+}
+
+export class QuoteComparisonDatabase {
+  constructor(private readonly db: Database) {}
+
+  /** Every package this workflow has shortlisted, with live counts and readiness — before
+   * any comparison has been opened, so an estimator can see which packages are worth
+   * opening without pressing into each one first. */
+  async summariesForWorkflow(workflowId: string): Promise<Row[]> {
+    const rows = await this.db.query<Row>(
+      `SELECT sl.package_name,
+              qc.id AS comparison_id, qc.opened_at,
+              (SELECT COUNT(*)::int FROM shortlist_entries se WHERE se.shortlist_id = sl.id AND se.selected) AS expected_count,
+              (SELECT COUNT(*)::int FROM tender_returns tr WHERE tr.workflow_id = sl.workflow_id AND tr.package_name = sl.package_name) AS received_count,
+              ${knownReturnDeadlineSql('sl', 'ld')} AS return_deadline
+         FROM shortlists sl
+         LEFT JOIN itt_letter_details ld ON ld.workflow_id = sl.workflow_id
+         LEFT JOIN tps.quote_comparisons qc ON qc.workflow_id = sl.workflow_id AND qc.package_name = sl.package_name
+        WHERE sl.workflow_id = $1 AND sl.confirmed_at IS NOT NULL
+        ORDER BY sl.package_name`,
+      [workflowId]
+    );
+    const now = new Date();
+    return rows.map((row) => {
+      const deadline = row.return_deadline ? new Date(String(row.return_deadline)) : null;
+      return { ...row, readiness: computeReadiness(Number(row.received_count), deadline, now) };
+    });
+  }
+
+  /**
+   * Opens a package's comparison, or refreshes one already opened.
+   *
+   * The spine is built ONCE, the first time — see `buildSpine`. Every call after that
+   * only adds cells for returns not yet reflected and upserts the rest, so a repeat call
+   * ("Refresh" on the screen, or a re-open days later) never destroys an estimator's own
+   * added rows or their notes. Readiness and the counts on the header row are recomputed
+   * every time, since those are meant to move as returns come in.
+   */
+  async open(workflowId: string, packageName: string, openedBy: string | null): Promise<Row> {
+    return this.db.transaction(async (client) => {
+      const [existing] = await this.db.query<Row>(
+        `SELECT * FROM tps.quote_comparisons WHERE workflow_id = $1 AND package_name = $2 FOR UPDATE`,
+        [workflowId, packageName], client
+      );
+      const returns = await this.db.query<Row>(
+        `SELECT * FROM tender_returns WHERE workflow_id = $1 AND package_name = $2 ORDER BY received_at`,
+        [workflowId, packageName], client
+      );
+      const comparisonId = existing ? String(existing.id) : await this.create(client, workflowId, packageName, openedBy);
+
+      const [{ n: spineCount }] = await this.db.query<{ n: string }>(
+        `SELECT COUNT(*)::text AS n FROM tps.quote_comparison_rows WHERE comparison_id = $1`, [comparisonId], client
+      );
+      if (spineCount === '0') await this.buildSpine(client, comparisonId, workflowId, packageName, returns);
+      await this.refreshCells(client, comparisonId, returns);
+      await this.updateReadiness(client, comparisonId, workflowId, packageName);
+
+      const [row] = await this.db.query<Row>(`SELECT * FROM tps.quote_comparisons WHERE id = $1`, [comparisonId], client);
+      return row!;
+    });
+  }
+
+  private async create(client: PoolClient, workflowId: string, packageName: string, openedBy: string | null): Promise<string> {
+    const [row] = await this.db.query<{ id: string }>(
+      `INSERT INTO tps.quote_comparisons (workflow_id, package_name, opened_by) VALUES ($1, $2, $3) RETURNING id`,
+      [workflowId, packageName, openedBy], client
+    );
+    return row!.id;
+  }
+
+  /**
+   * The spine, built once from the fullest snapshot on file — see this file's header for
+   * why `pricing_portal_lines` is the source and why "fullest" is the tie-break. Falls
+   * back to the fullest MANUAL return's lines when no portal snapshot exists for this
+   * package at all (the portal was never used, or every send was blocked).
+   */
+  private async buildSpine(client: PoolClient, comparisonId: string, workflowId: string, packageName: string, returns: Row[]): Promise<void> {
+    const portalLines = await this.db.query<Row>(
+      `SELECT pl.link_id, pl.seq, pl.ge_code, pl.element_code, pl.description, pl.quantity, pl.unit, pl.is_priceable
+         FROM tps.pricing_portal_lines pl
+         JOIN tps.pricing_portal_links lk ON lk.id = pl.link_id
+        WHERE lk.workflow_id = $1 AND lk.package_name = $2 AND NOT pl.added_by_tenderer
+        ORDER BY pl.link_id, pl.seq`,
+      [workflowId, packageName], client
+    );
+
+    let source: Row[] | null = null;
+    if (portalLines.length > 0) {
+      const byLink = new Map<string, Row[]>();
+      for (const line of portalLines) {
+        const key = String(line.link_id);
+        const list = byLink.get(key) ?? [];
+        list.push(line);
+        byLink.set(key, list);
+      }
+      for (const list of byLink.values()) if (!source || list.length > source.length) source = list;
+    }
+
+    if (!source) {
+      const [fullest] = await this.db.query<{ return_id: string }>(
+        `SELECT return_id FROM tender_return_lines
+          WHERE return_id = ANY($1::uuid[]) AND NOT added_by_tenderer
+          GROUP BY return_id ORDER BY COUNT(*) DESC LIMIT 1`,
+        [returns.map((r) => r.id)], client
+      );
+      if (!fullest) {
+        throw conflict('No returns have been submitted or entered for this package yet — there is nothing to build a comparison from.');
+      }
+      const manualLines = await this.db.query<Row>(
+        `SELECT seq, ge_code, element_code, description, quantity, unit
+           FROM tender_return_lines WHERE return_id = $1 AND NOT added_by_tenderer ORDER BY seq NULLS LAST, created_at`,
+        [fullest.return_id], client
+      );
+      // A manual return's lines may carry no seq at all (the estimator keys them straight
+      // against spine rows once one exists — see recordManualReturn); assign one here so
+      // the spine still has a stable, gapless ordering.
+      source = manualLines.map((row, index) => ({ ...row, seq: row.seq ?? index + 1, is_priceable: true }));
+    }
+
+    if (source.length === 0) throw conflict('The bill on file for this package has no lines to compare.');
+
+    await this.db.query(
+      `INSERT INTO tps.quote_comparison_rows
+         (comparison_id, seq, ge_code, element_code, description, quantity, unit, is_priceable, origin)
+       SELECT $1, s, ge, el, descr, qty, unit, priceable, 'itt_bill'
+         FROM unnest($2::int[], $3::text[], $4::text[], $5::text[], $6::numeric[], $7::text[], $8::boolean[])
+           AS t(s, ge, el, descr, qty, unit, priceable)`,
+      [comparisonId, source.map((l) => l.seq), source.map((l) => l.ge_code), source.map((l) => l.element_code),
+       source.map((l) => l.description), source.map((l) => l.quantity), source.map((l) => l.unit),
+       source.map((l) => l.is_priceable ?? true)],
+      client
+    );
+  }
+
+  /** Adds a spine row for any return's own extra line not already reflected, and
+   * upserts every cell — never touching `estimator_note`, the one field a human owns. */
+  private async refreshCells(client: PoolClient, comparisonId: string, returns: Row[]): Promise<void> {
+    const spineRows = await this.db.query<Row>(
+      `SELECT * FROM tps.quote_comparison_rows WHERE comparison_id = $1 ORDER BY seq`, [comparisonId], client
+    );
+    const byId = new Map(spineRows.map((r) => [String(r.id), r]));
+    // `seq` is only a safe key among the ORIGINAL bill rows (see this file's header) — a
+    // row added after the fact (tenderer- or estimator-added) is assigned the next free
+    // seq once, which a later addition can reuse no differently from any other integer.
+    // A manual return keyed in by hand instead carries `comparison_row_id` (see
+    // `recordManualReturn`), pointing at the exact row the estimator typed the figure
+    // against; `seq` remains the fallback for lines that never went through that path
+    // (a portal submission, or data written before this column existed).
+    const bySeq = new Map(spineRows.filter((r) => r.origin === 'itt_bill').map((r) => [Number(r.seq), r]));
+
+    for (const ret of returns) {
+      const lines = await this.db.query<Row>(
+        `SELECT * FROM tender_return_lines WHERE return_id = $1 ORDER BY seq NULLS LAST, created_at`, [ret.id], client
+      );
+      for (const line of lines) {
+        if (line.added_by_tenderer) {
+          // This tenderer's own extra line. Dedup on content within this return, since a
+          // synthetic identity would need a column this table does not carry (see this
+          // file's header) — a genuine duplicate description just costs one spare row.
+          const [existingRow] = await this.db.query<{ id: string }>(
+            `SELECT id FROM tps.quote_comparison_rows
+              WHERE comparison_id = $1 AND added_by_return_id = $2 AND description = $3 AND COALESCE(unit,'') = COALESCE($4,'')`,
+            [comparisonId, ret.id, line.description, line.unit], client
+          );
+          let rowId = existingRow?.id;
+          if (!rowId) {
+            const [{ n: maxSeq }] = await this.db.query<{ n: string }>(
+              `SELECT COALESCE(MAX(seq), 0)::text AS n FROM tps.quote_comparison_rows WHERE comparison_id = $1`, [comparisonId], client
+            );
+            const [created] = await this.db.query<{ id: string }>(
+              `INSERT INTO tps.quote_comparison_rows
+                 (comparison_id, seq, ge_code, element_code, description, quantity, unit, is_priceable, origin, added_by_return_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, 'tenderer_added', $8) RETURNING id`,
+              [comparisonId, Number(maxSeq) + 1, line.ge_code, line.element_code, line.description, line.quantity, line.unit, ret.id],
+              client
+            );
+            rowId = created!.id;
+          }
+          await this.upsertCell(client, rowId, String(ret.id), line);
+          continue;
+        }
+
+        const row = (line.comparison_row_id ? byId.get(String(line.comparison_row_id)) : undefined)
+          ?? (line.seq != null ? bySeq.get(Number(line.seq)) : undefined);
+        if (!row) continue; // No seq, or beyond the reference bill's own length — nothing to attach to.
+        await this.upsertMatchedLine(client, comparisonId, row, ret, line);
+      }
+      // A return with fewer lines than the spine has rows it never even listed — those
+      // stay `absent` at read time (getComparison) rather than a manufactured row here;
+      // there is nothing to upsert for a line that does not exist.
+    }
+  }
+
+  /**
+   * One tenderer's own line against the spine row it was matched to (by `comparison_row_id`
+   * or `seq` — see `refreshCells`). Not the same item at all is `sameItem`'s job to say —
+   * this decides what to do once it has: a genuine discrepancy with a figure behind it
+   * becomes its OWN row (the issue's own example, "create a separate item describing the
+   * pricing"), never a cell whose money was simply discarded.
+   */
+  private async upsertMatchedLine(client: PoolClient, comparisonId: string, row: Row, ret: Row, line: Row): Promise<void> {
+    const drifted = !sameItem(
+      { description: String(row.description), unit: (row.unit as string | null) ?? null },
+      { description: String(line.description), unit: (line.unit as string | null) ?? null }
+    );
+    const hasFigure = drifted && (line.status === 'priced' || line.status === 'included') && line.total != null;
+
+    // Any variant from a PREVIOUS refresh of this exact (spine row, return) pair is
+    // cleared before deciding what THIS pass needs — a resubmission whose wording now
+    // matches, or one that stopped pricing the item altogether, must not leave a stale
+    // item behind with money nobody stands behind any more. Harmless, and a no-op, on
+    // every line that never had a variant to begin with.
+    await this.db.query(
+      `DELETE FROM tps.quote_comparison_rows WHERE variant_of_row_id = $1 AND added_by_return_id = $2`,
+      [row.id, ret.id], client
+    );
+
+    if (!hasFigure) {
+      // Either the same item, or a drifted wording with no money behind it (excluded, not
+      // addressed, or "priced" with no rate given) — nothing to preserve as its own line.
+      // Level normally; `tenderer_description`, when set, is shown for transparency only.
+      await this.upsertCell(client, String(row.id), String(ret.id), line, { tendererDescription: drifted ? String(line.description) : null });
+      return;
+    }
+
+    const [variantRow] = await this.db.query<{ id: string }>(
+      `INSERT INTO tps.quote_comparison_rows
+         (comparison_id, seq, ge_code, element_code, description, quantity, unit, is_priceable, origin, added_by_return_id, variant_of_row_id)
+       VALUES ($1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM tps.quote_comparison_rows WHERE comparison_id = $1),
+               $2, $3, $4, $5, $6, TRUE, 'tenderer_variant', $7, $8)
+       RETURNING id`,
+      [comparisonId, row.ge_code, row.element_code, line.description, line.quantity, line.unit, ret.id, row.id],
+      client
+    );
+    await this.upsertCell(client, String(variantRow!.id), String(ret.id), line, {});
+
+    // The spine cell records that this tenderer priced it under their own wording rather
+    // than competing for the row's normal substitution — the variant row above carries the
+    // actual figure, so this one levels to zero rather than being counted twice.
+    await this.db.query(
+      `INSERT INTO tps.quote_comparison_cells
+         (row_id, return_id, status, is_assumed, assumption_basis, tenderer_note, priced_as_variant_row_id, tenderer_description)
+       VALUES ($1, $2, 'priced_as_variant', TRUE, $3, $4, $5, $6)
+       ON CONFLICT (row_id, return_id) DO UPDATE SET
+         quoted_rate = NULL, quoted_total = NULL, status = 'priced_as_variant', is_assumed = TRUE,
+         assumption_basis = EXCLUDED.assumption_basis, tenderer_note = EXCLUDED.tenderer_note,
+         priced_as_variant_row_id = EXCLUDED.priced_as_variant_row_id,
+         tenderer_description = EXCLUDED.tenderer_description, updated_at = NOW()`,
+      [row.id, ret.id, `Priced under their own wording — see “${line.description}” below.`, line.note, variantRow!.id, line.description],
+      client
+    );
+  }
+
+  private async upsertCell(
+    client: PoolClient, rowId: string, returnId: string, line: Row,
+    opts: { tendererDescription?: string | null } = {}
+  ): Promise<void> {
+    await this.db.query(
+      `INSERT INTO tps.quote_comparison_cells (row_id, return_id, quoted_rate, quoted_total, status, is_assumed, assumption_basis, tenderer_note, tenderer_description)
+       VALUES ($1, $2, $3, $4, $5, FALSE, NULL, $6, $7)
+       ON CONFLICT (row_id, return_id) DO UPDATE SET
+         quoted_rate = EXCLUDED.quoted_rate, quoted_total = EXCLUDED.quoted_total, status = EXCLUDED.status,
+         is_assumed = FALSE, assumption_basis = NULL, tenderer_note = EXCLUDED.tenderer_note,
+         tenderer_description = EXCLUDED.tenderer_description, updated_at = NOW()`,
+      [rowId, returnId, line.rate, line.total, line.status, line.note, opts.tendererDescription ?? null], client
+    );
+  }
+
+  private async updateReadiness(client: PoolClient, comparisonId: string, workflowId: string, packageName: string): Promise<void> {
+    const [counts] = await this.db.query<Row>(
+      `SELECT (SELECT COUNT(*)::int FROM shortlists sl JOIN shortlist_entries se ON se.shortlist_id = sl.id AND se.selected
+                WHERE sl.workflow_id = $1 AND sl.package_name = $2) AS expected_count,
+              (SELECT COUNT(*)::int FROM tender_returns tr WHERE tr.workflow_id = $1 AND tr.package_name = $2) AS received_count,
+              ${knownReturnDeadlineSql('sl', 'ld')} AS return_deadline
+         FROM shortlists sl LEFT JOIN itt_letter_details ld ON ld.workflow_id = sl.workflow_id
+        WHERE sl.workflow_id = $1 AND sl.package_name = $2`,
+      [workflowId, packageName], client
+    );
+    const deadline = counts?.return_deadline ? new Date(String(counts.return_deadline)) : null;
+    const received = Number(counts?.received_count ?? 0);
+    const readiness = computeReadiness(received, deadline, new Date());
+    await this.db.query(
+      `UPDATE tps.quote_comparisons
+          SET expected_count = $2, received_count = $3, return_deadline = $4, readiness = $5, updated_at = NOW()
+        WHERE id = $1`,
+      [comparisonId, Number(counts?.expected_count ?? 0), received, deadline ? deadline.toISOString().slice(0, 10) : null, readiness],
+      client
+    );
+  }
+
+  /** The full grid: every spine row, every return's cell for it (or `absent`, for none),
+   * the Lowest column, and each tenderer's two totals. */
+  async getComparison(workflowId: string, packageName: string): Promise<Row> {
+    return this.computeGrid(workflowId, packageName);
+  }
+
+  /**
+   * The actual grid-building logic, shared by `getComparison` (reads the live pool) and
+   * `approve` (reads inside its own transaction, so what is approved cannot be a moment
+   * behind what was on screen). `levelled_rate`/`levelled_total` are NEVER persisted on
+   * `quote_comparison_cells` — they depend on the LOWEST quote across every OTHER return
+   * for the same row, which is not known until every return is read together, so this is
+   * the one and only place that computation happens. `approve` reading the raw table
+   * directly, rather than through here, is exactly the bug this shape exists to prevent.
+   */
+  private async computeGrid(workflowId: string, packageName: string, client?: PoolClient): Promise<Row> {
+    const [comparison] = await this.db.query<Row>(
+      `SELECT * FROM tps.quote_comparisons WHERE workflow_id = $1 AND package_name = $2`, [workflowId, packageName], client
+    );
+    if (!comparison) throw notFound('This package’s comparison has not been opened yet.');
+
+    const returns = await this.db.query<Row>(
+      `SELECT * FROM tender_returns WHERE workflow_id = $1 AND package_name = $2 ORDER BY received_at`,
+      [workflowId, packageName], client
+    );
+    // Variant rows sort directly under the spine row they are a variant OF — a self-join
+    // on that (nullable) link, spine rows first within a group, then their variants by
+    // their own seq — rather than at the end of the table wherever `MAX(seq)+1` happened
+    // to land them when they were created.
+    const rows = await this.db.query<Row>(
+      `SELECT r.* FROM tps.quote_comparison_rows r
+         LEFT JOIN tps.quote_comparison_rows parent ON parent.id = r.variant_of_row_id
+        WHERE r.comparison_id = $1
+        ORDER BY COALESCE(parent.seq, r.seq), (r.origin = 'tenderer_variant')::int, r.seq`,
+      [comparison.id], client
+    );
+    const cells = await this.db.query<Row>(
+      `SELECT c.* FROM tps.quote_comparison_cells c
+         JOIN tps.quote_comparison_rows r ON r.id = c.row_id
+        WHERE r.comparison_id = $1`,
+      [comparison.id], client
+    );
+    const cellsByRow = new Map<string, Row[]>();
+    for (const cell of cells) {
+      const list = cellsByRow.get(String(cell.row_id)) ?? [];
+      list.push(cell);
+      cellsByRow.set(String(cell.row_id), list);
+    }
+    // A spine row's own variants, so their quoted figures count toward "the cheapest price
+    // among the different quotations received" too — the issue's own wording — rather than
+    // only the literal item's own cells. A tenderer who never mentioned the literal item at
+    // all should still be substituted against a price another tenderer gave for it, even if
+    // that other tenderer gave it under their own wording.
+    const variantRowsByParent = new Map<string, Row[]>();
+    for (const r of rows) {
+      if (r.origin === 'tenderer_variant' && r.variant_of_row_id != null) {
+        const key = String(r.variant_of_row_id);
+        const list = variantRowsByParent.get(key) ?? [];
+        list.push(r);
+        variantRowsByParent.set(key, list);
+      }
+    }
+
+    type GridCell = {
+      returnId: string; status: CellStatus; levelledRate: number | null; levelledTotal: number | null;
+      isAssumed: boolean; assumptionBasis: string | null; tendererNote: string | null; estimatorNote: string | null;
+      cellId: string | null; quotedRate: number | null; quotedTotal: number | null;
+      tendererDescription: string | null; pricedAsVariantRowId: string | null;
+      // Final adjustments (BuildFlow #100's own closing step) — levelledRate/levelledTotal
+      // above are already override-aware (see applyOverride); these three carry what the
+      // automatic rule alone would have said, and whether a human has since overridden it.
+      hasOverride: boolean; overrideStale: boolean; adjustmentReason: string | null;
+      autoLevelledRate: number | null; autoLevelledTotal: number | null;
+    };
+
+    const grid = rows.map((row) => {
+      const present = cellsByRow.get(String(row.id)) ?? [];
+      const byReturn = new Map(present.map((c) => [String(c.return_id), c]));
+      const variantCandidates = (variantRowsByParent.get(String(row.id)) ?? [])
+        .flatMap((v) => cellsByRow.get(String(v.id)) ?? []);
+      const lowest = findLowestQuote(
+        [...present, ...variantCandidates].filter((c) => c.status === 'priced' && c.quoted_total != null)
+          .map((c) => ({
+            total: Number(c.quoted_total), rate: c.quoted_rate != null ? Number(c.quoted_rate) : null,
+            tendererName: String(returns.find((r) => String(r.id) === String(c.return_id))?.tenderer_name ?? '')
+          }))
+      );
+
+      const levelledCells: GridCell[] = returns.map((ret) => {
+        const returnId = String(ret.id);
+        // A tenderer- or variant-added row is, by construction, absent for every OTHER
+        // tenderer — someone else's own wording or own reconciliation line is simply not
+        // theirs to have priced.
+        if ((row.origin === 'tenderer_added' || row.origin === 'tenderer_variant') && String(row.added_by_return_id) !== returnId) {
+          const l = levelCell({ lineStatus: null, quotedRate: null, quotedTotal: null, lowest: null });
+          return {
+            returnId, ...l, tendererNote: null, estimatorNote: null, cellId: null, quotedRate: null, quotedTotal: null,
+            tendererDescription: null, pricedAsVariantRowId: null,
+            hasOverride: false, overrideStale: false, adjustmentReason: null, autoLevelledRate: l.levelledRate, autoLevelledTotal: l.levelledTotal
+          };
+        }
+        const existing = byReturn.get(returnId);
+        if (existing?.status === 'priced_as_variant') {
+          // Priced, just under this tenderer's own wording — the variant row alongside
+          // this one carries the actual figure, so this cell levels to zero rather than
+          // competing for the same money twice (see `upsertMatchedLine`). Not overridable
+          // here — see `setAdjustment`'s own refusal — so there is nothing to blend in.
+          return {
+            returnId, status: 'priced_as_variant', levelledRate: 0, levelledTotal: 0,
+            isAssumed: true, assumptionBasis: (existing.assumption_basis as string | null) ?? null,
+            tendererNote: (existing.tenderer_note as string | null) ?? null, estimatorNote: (existing.estimator_note as string | null) ?? null,
+            cellId: String(existing.id), quotedRate: null, quotedTotal: null,
+            tendererDescription: (existing.tenderer_description as string | null) ?? null,
+            pricedAsVariantRowId: existing.priced_as_variant_row_id ? String(existing.priced_as_variant_row_id) : null,
+            hasOverride: false, overrideStale: false, adjustmentReason: null, autoLevelledRate: 0, autoLevelledTotal: 0
+          };
+        }
+        const levelled = levelCell({
+          lineStatus: (existing?.status as ReturnLineStatus | undefined) ?? null,
+          quotedRate: existing?.quoted_rate != null ? Number(existing.quoted_rate) : null,
+          quotedTotal: existing?.quoted_total != null ? Number(existing.quoted_total) : null,
+          lowest
+        });
+        const currentQuotedTotal = existing?.quoted_total != null ? Number(existing.quoted_total) : null;
+        const override: CellOverride | null = existing?.adjusted_total != null ? {
+          adjustedRate: existing.adjusted_rate != null ? Number(existing.adjusted_rate) : null,
+          adjustedTotal: Number(existing.adjusted_total),
+          adjustmentReason: String(existing.adjustment_reason),
+          adjustedAgainstQuotedTotal: existing.adjusted_against_quoted_total != null ? Number(existing.adjusted_against_quoted_total) : null
+        } : null;
+        const overridden = applyOverride(levelled, override, currentQuotedTotal);
+        return {
+          returnId, status: levelled.status, levelledRate: overridden.finalRate, levelledTotal: overridden.finalTotal,
+          isAssumed: levelled.isAssumed, assumptionBasis: levelled.assumptionBasis,
+          tendererNote: (existing?.tenderer_note as string | null) ?? null, estimatorNote: (existing?.estimator_note as string | null) ?? null,
+          cellId: existing?.id ? String(existing.id) : null,
+          quotedRate: existing?.quoted_rate != null ? Number(existing.quoted_rate) : null,
+          quotedTotal: existing?.quoted_total != null ? Number(existing.quoted_total) : null,
+          tendererDescription: (existing?.tenderer_description as string | null) ?? null,
+          pricedAsVariantRowId: null,
+          hasOverride: overridden.hasOverride, overrideStale: overridden.overrideStale, adjustmentReason: overridden.adjustmentReason,
+          autoLevelledRate: overridden.autoLevelledRate, autoLevelledTotal: overridden.autoLevelledTotal
+        };
+      });
+      return { ...row, lowest, cells: levelledCells };
+    });
+
+    const totals = returns.map((ret) => {
+      const returnId = String(ret.id);
+      const summed = sumTotals(grid.map((row) => {
+        const cell = row.cells.find((c) => c.returnId === returnId)!;
+        return { status: cell.status, quotedTotal: cell.quotedTotal, levelledTotal: cell.levelledTotal };
+      }));
+      return { returnId, tendererName: ret.tenderer_name, ...summed };
+    });
+
+    const scopeNotes = collectScopeNotes(
+      returns.map((r) => ({
+        id: String(r.id), qualifications: (r.qualifications as string | null) ?? null,
+        exclusions: (r.exclusions as string | null) ?? null, programmeWeeks: r.programme_weeks != null ? Number(r.programme_weeks) : null
+      })),
+      (grid as Array<Row & { cells: GridCell[] }>).map((row) => ({ seq: Number(row.seq), description: String(row.description), cells: row.cells }))
+    );
+
+    return { comparison, returns, rows: grid, totals, scopeNotes };
+  }
+
+  /**
+   * A `comparisonId` arrives from the request body, not derived from `workflowId` the way
+   * `packageName` is on every other route here — so every method taking one must confirm
+   * it actually belongs to that workflow before touching it, or a caller with access to
+   * one tender could reach another's comparison by id alone. Folded into each statement's
+   * own WHERE/EXISTS below rather than a separate round trip.
+   */
+  async updateCellNote(workflowId: string, comparisonId: string, cellId: string, estimatorNote: string | null): Promise<Row> {
+    const [row] = await this.db.query<Row>(
+      `UPDATE tps.quote_comparison_cells c SET estimator_note = $4, updated_at = NOW()
+         FROM tps.quote_comparison_rows r, tps.quote_comparisons qc
+        WHERE c.id = $3 AND c.row_id = r.id AND r.comparison_id = $2 AND qc.id = r.comparison_id AND qc.workflow_id = $1
+        RETURNING c.*`,
+      [workflowId, comparisonId, cellId, estimatorNote]
+    );
+    if (!row) throw notFound('Comparison cell not found');
+    return row;
+  }
+
+  /** An estimator's own line — e.g. to price a discrepancy the issue names directly:
+   * "if there is a slight discrepancy … create a separate item describing the pricing." */
+  async addEstimatorRow(workflowId: string, comparisonId: string, input: { description: string; unit: string | null; quantity: number | null }): Promise<Row> {
+    const [row] = await this.db.query<Row>(
+      `INSERT INTO tps.quote_comparison_rows (comparison_id, seq, description, unit, quantity, is_priceable, origin)
+       SELECT $2, COALESCE((SELECT MAX(seq) FROM tps.quote_comparison_rows WHERE comparison_id = $2), 0) + 1,
+              $3, $4, $5, TRUE, 'estimator_added'
+        WHERE EXISTS (SELECT 1 FROM tps.quote_comparisons WHERE id = $2 AND workflow_id = $1)
+       RETURNING *`,
+      [workflowId, comparisonId, input.description, input.unit, input.quantity]
+    );
+    if (!row) throw notFound('This comparison does not belong to that tender.');
+    return row;
+  }
+
+  async deleteEstimatorRow(workflowId: string, comparisonId: string, rowId: string): Promise<void> {
+    const [withOverride] = await this.db.query<{ id: string }>(
+      `SELECT c.id FROM tps.quote_comparison_cells c
+         JOIN tps.quote_comparison_rows r ON r.id = c.row_id
+         JOIN tps.quote_comparisons qc ON qc.id = r.comparison_id
+        WHERE r.id = $3 AND r.comparison_id = $2 AND qc.workflow_id = $1 AND c.adjusted_total IS NOT NULL
+        LIMIT 1`,
+      [workflowId, comparisonId, rowId]
+    );
+    if (withOverride) throw conflict('This row has an adjustment on it — clear the adjustment before deleting the row.');
+
+    const deleted = await this.db.query(
+      `DELETE FROM tps.quote_comparison_rows r USING tps.quote_comparisons qc
+        WHERE r.id = $3 AND r.comparison_id = $2 AND r.origin = 'estimator_added'
+          AND qc.id = r.comparison_id AND qc.workflow_id = $1
+        RETURNING r.id`,
+      [workflowId, comparisonId, rowId]
+    );
+    if (deleted.length === 0) throw notFound('No estimator-added row to delete with that id.');
+  }
+
+  /**
+   * Sets (or replaces) the estimator's own figure for one cell — "subject to the response
+   * from the subcontractor, he can make the final adjustments" (BuildFlow #100). Refused
+   * on a `priced_as_variant` spine cell: its figure is always zero by construction (see
+   * `computeGrid`), and an override there would be adjusting a number nobody is looking
+   * at — the variant row directly below it is where the real figure lives.
+   *
+   * The total is derived from the rate × the row's own quantity when only a rate is
+   * given; a bare total (no rate) is accepted as-is, for a lump-sum adjustment with no
+   * meaningful per-unit figure.
+   */
+  async setAdjustment(
+    workflowId: string, comparisonId: string, cellId: string,
+    input: { rate: number | null; total: number | null; reason: string; queryId: string | null }, actorId: string
+  ): Promise<Row> {
+    return this.db.transaction(async (client) => {
+      const [cell] = await this.db.query<Row>(
+        `SELECT c.*, r.quantity AS row_quantity, r.seq AS row_seq, r.description AS row_description
+           FROM tps.quote_comparison_cells c
+           JOIN tps.quote_comparison_rows r ON r.id = c.row_id
+           JOIN tps.quote_comparisons qc ON qc.id = r.comparison_id
+          WHERE c.id = $3 AND r.comparison_id = $2 AND qc.workflow_id = $1
+          FOR UPDATE OF c`,
+        [workflowId, comparisonId, cellId], client
+      );
+      if (!cell) throw notFound('Comparison cell not found.');
+      if (cell.status === 'priced_as_variant') {
+        throw conflict('This line is priced under the tenderer’s own wording — adjust the variant row below it instead.');
+      }
+
+      const quantity = cell.row_quantity != null ? Number(cell.row_quantity) : null;
+      const adjustedRate = input.rate ?? null;
+      let adjustedTotal = input.total ?? null;
+      if (adjustedTotal == null && adjustedRate != null && quantity != null) adjustedTotal = adjustedRate * quantity;
+      if (adjustedTotal == null) throw conflict('Give either a total, or a rate together with a known quantity to work it out from.');
+
+      await this.db.query(
+        `UPDATE tps.quote_comparison_cells
+            SET adjusted_rate = $2, adjusted_total = $3, adjustment_reason = $4, adjusted_by = $5, adjusted_at = NOW(),
+                adjustment_query_id = $6, adjusted_against_quoted_total = quoted_total, updated_at = NOW()
+          WHERE id = $1`,
+        [cellId, adjustedRate, adjustedTotal, input.reason, actorId, input.queryId], client
+      );
+      await this.db.query(
+        `INSERT INTO tps.quote_comparison_adjustments
+           (comparison_id, cell_id, return_id, row_seq, row_description, action, previous_rate, previous_total, new_rate, new_total, reason, query_id, actor)
+         VALUES ($1,$2,$3,$4,$5,'set',$6,$7,$8,$9,$10,$11,$12)`,
+        [comparisonId, cellId, cell.return_id, cell.row_seq, cell.row_description,
+         cell.adjusted_rate != null ? Number(cell.adjusted_rate) : null, cell.adjusted_total != null ? Number(cell.adjusted_total) : null,
+         adjustedRate, adjustedTotal, input.reason, input.queryId, actorId],
+        client
+      );
+
+      const [updated] = await this.db.query<Row>(`SELECT * FROM tps.quote_comparison_cells WHERE id = $1`, [cellId], client);
+      return updated!;
+    });
+  }
+
+  async clearAdjustment(workflowId: string, comparisonId: string, cellId: string, reason: string, actorId: string): Promise<Row> {
+    return this.db.transaction(async (client) => {
+      const [cell] = await this.db.query<Row>(
+        `SELECT c.*, r.seq AS row_seq, r.description AS row_description
+           FROM tps.quote_comparison_cells c
+           JOIN tps.quote_comparison_rows r ON r.id = c.row_id
+           JOIN tps.quote_comparisons qc ON qc.id = r.comparison_id
+          WHERE c.id = $3 AND r.comparison_id = $2 AND qc.workflow_id = $1
+          FOR UPDATE OF c`,
+        [workflowId, comparisonId, cellId], client
+      );
+      if (!cell) throw notFound('Comparison cell not found.');
+      if (cell.adjusted_total == null) throw conflict('This cell has no adjustment to clear.');
+
+      await this.db.query(
+        `UPDATE tps.quote_comparison_cells
+            SET adjusted_rate = NULL, adjusted_total = NULL, adjustment_reason = NULL,
+                adjusted_by = NULL, adjusted_at = NULL, adjustment_query_id = NULL, adjusted_against_quoted_total = NULL, updated_at = NOW()
+          WHERE id = $1`,
+        [cellId], client
+      );
+      await this.db.query(
+        `INSERT INTO tps.quote_comparison_adjustments
+           (comparison_id, cell_id, return_id, row_seq, row_description, action, previous_rate, previous_total, new_rate, new_total, reason, actor)
+         VALUES ($1,$2,$3,$4,$5,'cleared',$6,$7,NULL,NULL,$8,$9)`,
+        [comparisonId, cellId, cell.return_id, cell.row_seq, cell.row_description,
+         cell.adjusted_rate != null ? Number(cell.adjusted_rate) : null, Number(cell.adjusted_total), reason, actorId],
+        client
+      );
+
+      const [updated] = await this.db.query<Row>(`SELECT * FROM tps.quote_comparison_cells WHERE id = $1`, [cellId], client);
+      return updated!;
+    });
+  }
+
+  /** The full trail of sets and clears for one cell, newest first — an estimator's own
+   *  record of a figure they changed more than once stays visible, not just the latest. */
+  async adjustmentHistory(workflowId: string, comparisonId: string, cellId: string): Promise<Row[]> {
+    return this.db.query<Row>(
+      `SELECT a.* FROM tps.quote_comparison_adjustments a
+         JOIN tps.quote_comparisons c ON c.id = a.comparison_id
+        WHERE a.cell_id = $3 AND a.comparison_id = $2 AND c.workflow_id = $1
+        ORDER BY a.occurred_at DESC`,
+      [workflowId, comparisonId, cellId]
+    );
+  }
+
+  /**
+   * A return keyed in by hand — a quote that arrived as an emailed spreadsheet rather
+   * than through the portal. Written against the SPINE directly (`cells[].rowId`), which
+   * is what makes this safe with no fuzzy matching: the estimator is looking at the grid
+   * and typing figures against rows they can already see, not asking the app to guess
+   * which bill line a typed description means.
+   *
+   * Promotes into `tender_returns`/`tender_return_lines` too, so this return is
+   * indistinguishable from a portal one to every downstream reader — the draft BoQ
+   * trigger, the launch table, a future re-open of this same comparison.
+   */
+  async recordManualReturn(workflowId: string, packageName: string, comparisonId: string, input: ManualReturnInput): Promise<Row> {
+    return this.db.transaction(async (client) => {
+      const [ret] = await this.db.query<{ id: string }>(
+        `INSERT INTO tender_returns
+           (workflow_id, package_name, subcontractor_id, tenderer_name, received_at,
+            programme_weeks, qualifications, exclusions, is_fabricated)
+         VALUES ($1,$2,$3,$4, COALESCE($5::timestamptz, NOW()), $6,$7,$8, FALSE)
+         ON CONFLICT (workflow_id, package_name, tenderer_name) DO UPDATE
+           SET received_at = EXCLUDED.received_at, programme_weeks = EXCLUDED.programme_weeks,
+               qualifications = EXCLUDED.qualifications, exclusions = EXCLUDED.exclusions, is_fabricated = FALSE
+         RETURNING id`,
+        [workflowId, packageName, input.subcontractorId, input.tendererName, input.receivedAt,
+         input.programmeWeeks, input.qualifications, input.exclusions],
+        client
+      );
+
+      await this.db.query(`DELETE FROM tender_return_lines WHERE return_id = $1`, [ret!.id], client);
+
+      const spineRows = await this.db.query<Row>(`SELECT * FROM tps.quote_comparison_rows WHERE comparison_id = $1`, [comparisonId], client);
+      const bySpineId = new Map(spineRows.map((r) => [String(r.id), r]));
+
+      const lineValues: { seq: number; ge: string | null; el: string | null; descr: string; qty: number | null;
+        unit: string | null; rate: number | null; total: number | null; status: string; note: string | null;
+        added: boolean; rowId: string | null }[] = [];
+
+      for (const cell of input.cells) {
+        const spine = bySpineId.get(cell.rowId);
+        if (!spine) throw notFound(`No comparison row with id ${cell.rowId}`);
+        const total = cell.rate != null && cell.quantity != null ? cell.rate * cell.quantity : null;
+        lineValues.push({
+          seq: Number(spine.seq), ge: spine.ge_code as string | null, el: spine.element_code as string | null,
+          descr: String(spine.description), qty: cell.quantity, unit: spine.unit as string | null,
+          rate: cell.rate, total, status: cell.status, note: cell.note, added: false, rowId: String(spine.id)
+        });
+      }
+      let nextSeq = Math.max(0, ...spineRows.map((r) => Number(r.seq))) + 1;
+      for (const extra of input.extraLines) {
+        const total = extra.rate != null && extra.quantity != null ? extra.rate * extra.quantity : null;
+        lineValues.push({
+          seq: nextSeq++, ge: null, el: null, descr: extra.description, qty: extra.quantity, unit: extra.unit,
+          rate: extra.rate, total, status: extra.status, note: extra.note, added: true, rowId: null
+        });
+      }
+
+      if (lineValues.length > 0) {
+        await this.db.query(
+          `INSERT INTO tender_return_lines (return_id, seq, ge_code, element_code, description, quantity, unit, rate, total, status, note, added_by_tenderer, comparison_row_id)
+           SELECT $1, s, ge, el, descr, qty, unit, rate, total, status, note, added, row_id
+             FROM unnest($2::int[], $3::text[], $4::text[], $5::text[], $6::numeric[], $7::text[], $8::numeric[], $9::numeric[], $10::text[], $11::text[], $12::boolean[], $13::uuid[])
+               AS t(s, ge, el, descr, qty, unit, rate, total, status, note, added, row_id)`,
+          [ret!.id, lineValues.map((l) => l.seq), lineValues.map((l) => l.ge), lineValues.map((l) => l.el),
+           lineValues.map((l) => l.descr), lineValues.map((l) => l.qty), lineValues.map((l) => l.unit),
+           lineValues.map((l) => l.rate), lineValues.map((l) => l.total), lineValues.map((l) => l.status),
+           lineValues.map((l) => l.note), lineValues.map((l) => l.added), lineValues.map((l) => l.rowId)],
+          client
+        );
+        const tenderedSum = lineValues.filter((l) => l.status === 'priced' && l.total != null)
+          .reduce((sum, l) => sum + Number(l.total), 0);
+        await this.db.query(`UPDATE tender_returns SET tendered_sum = $2 WHERE id = $1`, [ret!.id, tenderedSum], client);
+      }
+
+      return { id: ret!.id };
+    });
+  }
+
+  /**
+   * Awards the package: upserts `trade_analysis` with the awarded return, then inserts
+   * `tender_boq_lines` from the comparison's LEVELLED (and, where set, OVERRIDDEN) figures.
+   * The order is not a style choice — `assert_trade_approved` (008) refuses the insert
+   * unless the trade analysis row already reads approved, so reversing these two
+   * statements is not an option the database will accept.
+   *
+   * Refuses while any override on the AWARDED return is stale (see `applyOverride`) — a
+   * resubmission changed the quote an estimator's own figure was based on, and awarding
+   * on it regardless would carry a number nobody has actually looked at since. Re-saving
+   * (or clearing) the override via `setAdjustment`/`clearAdjustment` is what clears it;
+   * there is no separate "acknowledge" step, because that save itself re-snapshots the
+   * current quote.
+   */
+  async approve(workflowId: string, packageName: string, awardedReturnId: string, approvedBy: string, notes: string | null): Promise<Row> {
+    return this.db.transaction(async (client) => {
+      const [comparison] = await this.db.query<Row>(
+        `SELECT * FROM tps.quote_comparisons WHERE workflow_id = $1 AND package_name = $2 FOR UPDATE`,
+        [workflowId, packageName], client
+      );
+      if (!comparison) throw notFound('This package’s comparison has not been opened yet.');
+      // Readiness gates approval, never viewing (see computeReadiness's own doc comment).
+      // The screen's disabled button is a courtesy; this is the actual guard, and it is
+      // recomputed here rather than trusted from whenever the comparison was last opened
+      // — a return that arrived since must count, the same reason the release gate in
+      // BuildFlow re-counts inside its own transaction rather than trusting a stale page.
+      await this.updateReadiness(client, String(comparison.id), workflowId, packageName);
+      const [refreshed] = await this.db.query<Row>(`SELECT readiness, expected_count, received_count FROM tps.quote_comparisons WHERE id = $1`, [comparison.id], client);
+      if (refreshed!.readiness === 'awaiting_returns') {
+        throw conflict(`Only ${refreshed!.received_count} of the expected ${refreshed!.expected_count} returns are in, and the return date has not passed. Wait for at least ${QUOTE_QUORUM}, or for the deadline.`);
+      }
+      const [awarded] = await this.db.query<Row>(
+        `SELECT * FROM tender_returns WHERE id = $1 AND workflow_id = $2 AND package_name = $3`,
+        [awardedReturnId, workflowId, packageName], client
+      );
+      if (!awarded) throw notFound('That return does not belong to this package.');
+
+      // The SAME levelling `getComparison` shows on screen, computed inside this
+      // transaction — never the raw `quote_comparison_cells` row, whose `levelled_rate`/
+      // `levelled_total` are never persisted (they depend on every OTHER return's cells
+      // for the row, not knowable until they are all read together — see computeGrid).
+      const detail = await this.computeGrid(workflowId, packageName, client);
+      type ApproveCell = {
+        returnId: string; status: CellStatus; levelledRate: number | null; levelledTotal: number | null;
+        isAssumed: boolean; assumptionBasis: string | null; estimatorNote: string | null; quotedRate: number | null;
+        hasOverride: boolean; overrideStale: boolean; adjustmentReason: string | null;
+      };
+      const rows = detail.rows as Array<Row & { cells: ApproveCell[] }>;
+      const cellByRow = new Map(rows.map((row) => [String(row.id), row.cells.find((c) => c.returnId === awardedReturnId)]));
+
+      const stale = [...cellByRow.values()].find((c) => c?.overrideStale);
+      if (stale) {
+        throw conflict(
+          'An adjustment on this comparison was made against a quote that has since changed. '
+          + 'Review it (re-save or clear the adjustment) before awarding.'
+        );
+      }
+
+      const status = approvalStatusFor([...cellByRow.values()].map((c) => ({ hasOverride: c?.hasOverride ?? false })));
+
+      await this.db.query(
+        `INSERT INTO tps.trade_analysis (workflow_id, package_name, awarded_return_id, status, approved_at, approved_by, approval_notes)
+         VALUES ($1, $2, $3, $4, NOW(), $5, $6)
+         ON CONFLICT (workflow_id, package_name) DO UPDATE
+           SET awarded_return_id = EXCLUDED.awarded_return_id, status = EXCLUDED.status,
+               approved_at = NOW(), approved_by = EXCLUDED.approved_by, approval_notes = EXCLUDED.approval_notes,
+               updated_at = NOW()`,
+        [workflowId, packageName, awardedReturnId, status, approvedBy, notes], client
+      );
+
+      await this.db.query(`DELETE FROM tender_boq_lines WHERE workflow_id = $1 AND package_name = $2`, [workflowId, packageName], client);
+
+      const values = rows
+        .filter((r) => {
+          // Someone else's own wording or own reconciliation line is never this award's to
+          // carry — only the winner's own.
+          const isAddedRowType = r.origin === 'tenderer_added' || r.origin === 'tenderer_variant';
+          if (isAddedRowType && String(r.added_by_return_id) !== awardedReturnId) return false;
+          // The winner priced THIS spine line under their own wording — the variant row
+          // just below it (origin 'tenderer_variant', caught by the branch above) becomes
+          // its own BoQ line instead, so the spine line itself is not also emitted at zero.
+          if (cellByRow.get(String(r.id))?.status === 'priced_as_variant') return false;
+          return true;
+        })
+        .map((row) => {
+          const cell = cellByRow.get(String(row.id));
+          const adjusted = cell ? (cell.isAssumed || cell.hasOverride) : true;
+          return {
+            ge: row.ge_code, el: row.element_code, descr: row.description, qty: row.quantity, unit: row.unit,
+            submittedRate: cell?.quotedRate ?? null, approvedRate: cell?.levelledRate ?? null, approvedTotal: cell?.levelledTotal ?? null,
+            status: boqStatusFor(cell?.status ?? 'absent'), adjusted,
+            adjustmentNote: adjusted
+              ? (cell
+                  ? composeAdjustmentNote({
+                      hasOverride: cell.hasOverride, adjustmentReason: cell.adjustmentReason,
+                      autoAssumptionBasis: cell.assumptionBasis, estimatorNote: cell.estimatorNote
+                    })
+                  : 'No return on file for this line; no substitution was available.')
+              : null
+          };
+        });
+
+      if (values.length > 0) {
+        await this.db.query(
+          `INSERT INTO tender_boq_lines
+             (workflow_id, package_name, ge_code, element_code, description, quantity, unit,
+              submitted_rate, approved_rate, approved_total, status, source_return_id, adjusted, adjustment_note)
+           SELECT $1, $2, ge, el, descr, qty, unit, srate, arate, atotal, st, $3, adj, note
+             FROM unnest($4::text[], $5::text[], $6::text[], $7::numeric[], $8::text[], $9::numeric[], $10::numeric[],
+                         $11::numeric[], $12::text[], $13::boolean[], $14::text[])
+               AS t(ge, el, descr, qty, unit, srate, arate, atotal, st, adj, note)`,
+          [workflowId, packageName, awardedReturnId,
+           values.map((v) => v.ge), values.map((v) => v.el), values.map((v) => v.descr), values.map((v) => v.qty),
+           values.map((v) => v.unit), values.map((v) => v.submittedRate), values.map((v) => v.approvedRate),
+           values.map((v) => v.approvedTotal), values.map((v) => v.status), values.map((v) => v.adjusted),
+           values.map((v) => v.adjustmentNote)],
+          client
+        );
+      }
+
+      const [tradeAnalysis] = await this.db.query<Row>(`SELECT * FROM tps.trade_analysis WHERE workflow_id = $1 AND package_name = $2`, [workflowId, packageName], client);
+      return tradeAnalysis!;
+    });
+  }
+}

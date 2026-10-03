@@ -718,15 +718,168 @@ export type PortalRfiInput = {
   attachments: Array<{ filename: string; contentBase64: string }>;
 };
 
-export type TenderComparative = {
+// tps.comparative's own type/routes (the four-field screen the levelled comparison below
+// replaced) are left unregistered here — see quoteComparisonDb.ts's header. The BFF routes
+// still exist, unreachable from this app; nothing here calls /comparative any more.
+
+// ── The levelled quote comparison (BuildFlow issue #100) ────────────────────
+// Mirrors apps/bff/src/quoteComparisonDb.ts — see that file's own header for why the
+// spine comes from the pricing portal and why levelledRate/levelledTotal are computed,
+// never stored.
+
+export type QuoteComparisonReadiness = 'awaiting_returns' | 'quorum_met' | 'deadline_passed';
+export type QuoteLineStatus = 'priced' | 'included' | 'excluded' | 'not_addressed';
+export type QuoteCellStatus = QuoteLineStatus | 'absent' | 'priced_as_variant';
+
+export type QuoteComparisonSummary = {
+  package_name: string;
+  comparison_id: string | null;
+  opened_at: string | null;
+  expected_count: number;
+  received_count: number;
+  return_deadline: string | null;
+  readiness: QuoteComparisonReadiness;
+};
+
+export type QuoteComparisonReturn = {
   id: string;
-  workflow_id: string;
   tenderer_name: string;
-  tendered_sum?: number;
-  estimate_sum?: number;
-  scope_compliance?: Record<string, unknown>;
-  qualifications?: string;
-  recommendation?: string;
+  subcontractor_id: string | null;
+  tendered_sum: number | null;
+  programme_weeks: number | null;
+  qualifications: string | null;
+  exclusions: string | null;
+  is_fabricated: boolean;
+};
+
+/** One tenderer's answer for one row — the cheapest price wherever they left a gap, and
+ *  always saying so where it does. */
+export type QuoteComparisonCell = {
+  returnId: string;
+  status: QuoteCellStatus;
+  levelledRate: number | null;
+  levelledTotal: number | null;
+  isAssumed: boolean;
+  assumptionBasis: string | null;
+  tendererNote: string | null;
+  estimatorNote: string | null;
+  cellId: string | null;
+  quotedRate: number | null;
+  quotedTotal: number | null;
+  /** The tenderer's own wording for this line, kept for display even when it drifted with
+   *  no figure behind it (excluded/not addressed under a different description). */
+  tendererDescription: string | null;
+  /** Set only when `status` is 'priced_as_variant' — the row carrying this tenderer's own
+   *  figure for the item, directly below this one in `rows`. */
+  pricedAsVariantRowId: string | null;
+  /** Final adjustments (BuildFlow issue #100's own closing step). `levelledRate`/
+   *  `levelledTotal` above are already override-aware; these carry what the automatic
+   *  rule alone would have said, and whether a human has since overridden it. */
+  hasOverride: boolean;
+  overrideStale: boolean;
+  adjustmentReason: string | null;
+  autoLevelledRate: number | null;
+  autoLevelledTotal: number | null;
+};
+
+/** One entry in a cell's adjustment history — set, then cleared, then set again
+ *  differently — kept so a figure changed more than once stays visible, not just the
+ *  latest. */
+export type QuoteComparisonAdjustment = {
+  id: number;
+  action: 'set' | 'cleared';
+  previous_rate: number | null;
+  previous_total: number | null;
+  new_rate: number | null;
+  new_total: number | null;
+  reason: string;
+  occurred_at: string;
+};
+
+export type QuoteComparisonLowest = { rate: number | null; total: number; tendererName: string } | null;
+
+export type QuoteComparisonRow = {
+  id: string;
+  seq: number;
+  ge_code: string | null;
+  element_code: string | null;
+  description: string;
+  quantity: number | null;
+  unit: string | null;
+  is_priceable: boolean;
+  origin: 'itt_bill' | 'tenderer_added' | 'tenderer_variant' | 'estimator_added';
+  added_by_return_id: string | null;
+  /** Set only for origin 'tenderer_variant' — the spine row this is a variant OF. */
+  variant_of_row_id: string | null;
+  lowest: QuoteComparisonLowest;
+  cells: QuoteComparisonCell[];
+};
+
+export type QuoteComparisonTotal = {
+  returnId: string;
+  tendererName: string;
+  quotedSum: number;
+  levelledSum: number;
+  pricedCount: number;
+  assumedCount: number;
+};
+
+/** One tenderer's inclusions and exclusions, gathered from both their header text and
+ *  every line they actually marked included/excluded — the issue's own closing
+ *  instruction: "list out all the exclusions and inclusions ... for a complete
+ *  comparison." */
+export type QuoteComparisonScopeNotes = {
+  returnId: string;
+  qualifications: string | null;
+  exclusions: string | null;
+  programmeWeeks: number | null;
+  includedItems: Array<{ seq: number; description: string }>;
+  excludedItems: Array<{ seq: number; description: string }>;
+};
+
+export type QuoteComparisonDetail = {
+  comparison: {
+    id: string; readiness: QuoteComparisonReadiness; expected_count: number;
+    received_count: number; return_deadline: string | null;
+  };
+  returns: QuoteComparisonReturn[];
+  rows: QuoteComparisonRow[];
+  totals: QuoteComparisonTotal[];
+  scopeNotes: QuoteComparisonScopeNotes[];
+};
+
+export type QuoteQueryEmailStatus = 'draft' | 'pending' | 'sent' | 'failed' | 'skipped_no_email';
+export type QuoteQueryResponseSource = 'email' | 'phone' | 'meeting' | 'other';
+
+/** One question raised against a subcontractor's return (BuildFlow issue #100's own
+ *  closing step) — "open" is derived on this side too: no response and not withdrawn. */
+export type QuoteQuery = {
+  id: string;
+  comparison_id: string;
+  return_id: string;
+  row_id: string | null;
+  cell_id: string | null;
+  question: string;
+  raised_at: string;
+  email_status: QuoteQueryEmailStatus;
+  email_error: string | null;
+  recipient_email: string | null;
+  sent_at: string | null;
+  response: string | null;
+  response_source: QuoteQueryResponseSource | null;
+  responded_at: string | null;
+  withdrawn_at: string | null;
+};
+
+export type ManualQuoteReturnInput = {
+  tendererName: string;
+  subcontractorId?: string | null;
+  receivedAt?: string | null;
+  programmeWeeks?: number | null;
+  qualifications?: string | null;
+  exclusions?: string | null;
+  cells: Array<{ rowId: string; quantity?: number | null; rate?: number | null; status: QuoteLineStatus; note?: string | null }>;
+  extraLines?: Array<{ description: string; unit?: string | null; quantity?: number | null; rate?: number | null; status: QuoteLineStatus; note?: string | null }>;
 };
 
 export type TenderSubmission = {
@@ -1049,10 +1202,57 @@ export const api = {
   issueAddendum: (addendumId: string) =>
     request<IssueAddendumResult>(`/api/tender-prep/addenda/${addendumId}/issue`, { method: 'POST' }),
 
-  // Step 3: Comparative
-  listComparative: (workflowId: string) => request<TenderComparative[]>(`/api/tender-prep/${workflowId}/comparative`),
-  upsertComparative: (workflowId: string, input: Omit<TenderComparative, 'id' | 'workflow_id'>) =>
-    request<TenderComparative>(`/api/tender-prep/${workflowId}/comparative`, { method: 'POST', body: JSON.stringify(input) }),
+  // Step 3: the levelled quote comparison (BuildFlow issue #100)
+  listQuoteComparisons: (workflowId: string) => request<QuoteComparisonSummary[]>(`/api/tender-prep/${workflowId}/quote-comparisons`),
+  openQuoteComparison: (workflowId: string, packageName: string) =>
+    request<QuoteComparisonDetail['comparison']>(`/api/tender-prep/${workflowId}/quote-comparisons/${encodeURIComponent(packageName)}/open`, { method: 'POST' }),
+  getQuoteComparison: (workflowId: string, packageName: string) =>
+    request<QuoteComparisonDetail>(`/api/tender-prep/${workflowId}/quote-comparisons/${encodeURIComponent(packageName)}`),
+  updateQuoteComparisonCellNote: (workflowId: string, comparisonId: string, cellId: string, estimatorNote: string | null) =>
+    request(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/cells/${cellId}`, { method: 'PATCH', body: JSON.stringify({ estimatorNote }) }),
+  addQuoteComparisonRow: (workflowId: string, comparisonId: string, input: { description: string; unit?: string | null; quantity?: number | null }) =>
+    request<QuoteComparisonRow>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/rows`, { method: 'POST', body: JSON.stringify(input) }),
+  deleteQuoteComparisonRow: (workflowId: string, comparisonId: string, rowId: string) =>
+    request(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/rows/${rowId}`, { method: 'DELETE' }),
+  recordManualQuoteReturn: (workflowId: string, packageName: string, input: ManualQuoteReturnInput) =>
+    request(`/api/tender-prep/${workflowId}/quote-comparisons/${encodeURIComponent(packageName)}/returns`, { method: 'POST', body: JSON.stringify(input) }),
+  approveQuoteComparison: (
+    workflowId: string, packageName: string,
+    input: { awardedReturnId: string; notes?: string | null; acknowledgeOpenQueries?: boolean }
+  ) =>
+    request(`/api/tender-prep/${workflowId}/quote-comparisons/${encodeURIComponent(packageName)}/approve`, { method: 'POST', body: JSON.stringify(input) }),
+
+  // Queries to subcontractors about their quote (BuildFlow issue #100)
+  listQuoteQueries: (workflowId: string, comparisonId: string) =>
+    request<QuoteQuery[]>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/queries`),
+  createQuoteQuery: (workflowId: string, comparisonId: string, input: { returnId: string; rowId?: string | null; cellId?: string | null; question: string }) =>
+    request<QuoteQuery>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/queries`, { method: 'POST', body: JSON.stringify(input) }),
+  updateQuoteQuery: (workflowId: string, comparisonId: string, queryId: string, question: string) =>
+    request<QuoteQuery>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/queries/${queryId}`, { method: 'PATCH', body: JSON.stringify({ question }) }),
+  withdrawQuoteQuery: (workflowId: string, comparisonId: string, queryId: string) =>
+    request<QuoteQuery>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/queries/${queryId}/withdraw`, { method: 'POST' }),
+  logQuoteQueryResponse: (workflowId: string, comparisonId: string, queryId: string, input: { response: string; responseSource: 'email' | 'phone' | 'meeting' | 'other'; respondedAt?: string | null }) =>
+    request<QuoteQuery>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/queries/${queryId}/response`, { method: 'POST', body: JSON.stringify(input) }),
+  sendQuoteQueries: (workflowId: string, comparisonId: string, returnId: string, recipientEmail?: string | null) =>
+    request<{ sent: number; skippedNoEmail: boolean; error?: string }>(
+      `/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/queries/send`,
+      { method: 'POST', body: JSON.stringify({ returnId, recipientEmail }) }
+    ),
+
+  // Final adjustments (BuildFlow issue #100)
+  setQuoteComparisonAdjustment: (
+    workflowId: string, comparisonId: string, cellId: string,
+    input: { rate?: number | null; total?: number | null; reason: string; queryId?: string | null }
+  ) =>
+    request<QuoteComparisonCell>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/cells/${cellId}/adjustment`, {
+      method: 'PUT', body: JSON.stringify(input)
+    }),
+  clearQuoteComparisonAdjustment: (workflowId: string, comparisonId: string, cellId: string, reason: string) =>
+    request<QuoteComparisonCell>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/cells/${cellId}/adjustment/clear`, {
+      method: 'POST', body: JSON.stringify({ reason })
+    }),
+  quoteComparisonAdjustmentHistory: (workflowId: string, comparisonId: string, cellId: string) =>
+    request<QuoteComparisonAdjustment[]>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/cells/${cellId}/adjustments`),
 
   // Step 4: Submission
   getSubmission: (workflowId: string) => request<TenderSubmission | null>(`/api/tender-prep/${workflowId}/submission`),
