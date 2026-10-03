@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import type { QuoteComparisonSummary } from '../../src/api';
+import type { QuoteComparisonSummary, QuoteQuery } from '../../src/api';
 import {
-  formatMoney, isReadyToApprove, priceCellDisplay, readinessBadgeClass, readinessLabel, sortComparisonSummaries
+  formatMoney, isOpenQueriesRefusal, isQueryOpen, isReadyToApprove, openQueryCountByReturn,
+  priceCellDisplay, readinessBadgeClass, readinessLabel, sortComparisonSummaries
 } from '../../src/quoteComparison';
 
 function summary(over: Partial<QuoteComparisonSummary> = {}): QuoteComparisonSummary {
@@ -90,6 +91,59 @@ describe('priceCellDisplay', () => {
     expect(display.primary).toBe('—');
     expect(display.secondary).toBe('no return');
     expect(display.tone).toBe('absent');
+  });
+});
+
+function query(over: Partial<QuoteQuery> = {}): QuoteQuery {
+  return {
+    id: 'q1', comparison_id: 'c1', return_id: 'r1', row_id: null, cell_id: null,
+    question: 'A question', raised_at: '2026-10-01T00:00:00Z', email_status: 'draft',
+    email_error: null, recipient_email: null, sent_at: null,
+    response: null, response_source: null, responded_at: null, withdrawn_at: null,
+    ...over
+  };
+}
+
+describe('isQueryOpen', () => {
+  it('is open with no response and not withdrawn', () => {
+    expect(isQueryOpen(query())).toBe(true);
+  });
+
+  it('is closed once answered', () => {
+    expect(isQueryOpen(query({ response: 'Yes', responded_at: '2026-10-02T00:00:00Z' }))).toBe(false);
+  });
+
+  it('is closed once withdrawn', () => {
+    expect(isQueryOpen(query({ withdrawn_at: '2026-10-02T00:00:00Z' }))).toBe(false);
+  });
+});
+
+describe('openQueryCountByReturn', () => {
+  it('counts only open queries, grouped by return', () => {
+    const counts = openQueryCountByReturn([
+      query({ id: 'q1', return_id: 'r1' }),
+      query({ id: 'q2', return_id: 'r1' }),
+      query({ id: 'q3', return_id: 'r2', response: 'Answered' }),
+      query({ id: 'q4', return_id: 'r3', withdrawn_at: '2026-10-02T00:00:00Z' })
+    ]);
+    expect(counts).toEqual({ r1: 2 });
+  });
+
+  it('is empty for no queries at all', () => {
+    expect(openQueryCountByReturn([])).toEqual({});
+  });
+});
+
+describe('isOpenQueriesRefusal', () => {
+  it('recognises the server’s own wording', () => {
+    expect(isOpenQueriesRefusal('There is 1 open query to this tenderer that have not been answered yet.')).toBe(true);
+    expect(isOpenQueriesRefusal('There are 3 open queries to this tenderer that have not been answered yet.')).toBe(true);
+  });
+
+  it('is false for any other refusal, or none at all', () => {
+    expect(isOpenQueriesRefusal('Only 1 of the expected 3 returns are in.')).toBe(false);
+    expect(isOpenQueriesRefusal(null)).toBe(false);
+    expect(isOpenQueriesRefusal(undefined)).toBe(false);
   });
 });
 

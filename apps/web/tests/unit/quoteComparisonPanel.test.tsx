@@ -97,7 +97,7 @@ describe('QuoteComparisonPanel', () => {
     await userEvent.selectOptions(select, 'r1');
     await userEvent.click(screen.getByRole('button', { name: 'Award package' }));
 
-    await waitFor(() => expect(approveSpy).toHaveBeenCalledWith('w1', 'Roofing', { awardedReturnId: 'r1', notes: null }));
+    await waitFor(() => expect(approveSpy).toHaveBeenCalledWith('w1', 'Roofing', { awardedReturnId: 'r1', notes: null, acknowledgeOpenQueries: false }));
   });
 
   it('sends an extra line typed into the manual-return form — not silently dropped', async () => {
@@ -163,6 +163,55 @@ describe('QuoteComparisonPanel', () => {
     expect(screen.getByText(/their wording: “Supply and fix roof SLATES”/)).toBeInTheDocument();
     // The footer lists the line by name, not just the header text.
     expect(screen.getByText('Scaffold')).toBeInTheDocument();
+  });
+
+  it('shows an open query and bundles its send into one click', async () => {
+    vi.spyOn(api, 'listQuoteComparisons').mockResolvedValue([
+      { package_name: 'Roofing', comparison_id: 'c1', opened_at: null, expected_count: 3, received_count: 1, return_deadline: null, readiness: 'awaiting_returns' }
+    ]);
+    vi.spyOn(api, 'getQuoteComparison').mockResolvedValue(detail());
+    vi.spyOn(api, 'listQuoteQueries').mockResolvedValue([{
+      id: 'q1', comparison_id: 'c1', return_id: 'r1', row_id: null, cell_id: null,
+      question: 'Does your rate include scaffold access?', raised_at: '2026-10-01T00:00:00Z',
+      email_status: 'draft', email_error: null, recipient_email: null, sent_at: null,
+      response: null, response_source: null, responded_at: null, withdrawn_at: null
+    }]);
+    const sendSpy = vi.spyOn(api, 'sendQuoteQueries').mockResolvedValue({ sent: 1, skippedNoEmail: false });
+
+    renderWithClient(<QuoteComparisonPanel workflowId="w1" />);
+    await screen.findByText('Roofing');
+
+    expect(await screen.findByText('Does your rate include scaffold access?')).toBeInTheDocument();
+    expect(screen.getByText('1 query')).toBeInTheDocument(); // the column-header badge
+    await userEvent.click(screen.getByRole('button', { name: 'Send 1 draft query' }));
+    await waitFor(() => expect(sendSpy).toHaveBeenCalledWith('w1', 'c1', 'r1'));
+  });
+
+  it('warns rather than blocks an award with an open query, and offers to award anyway', async () => {
+    vi.spyOn(api, 'listQuoteComparisons').mockResolvedValue([
+      { package_name: 'Roofing', comparison_id: 'c1', opened_at: null, expected_count: 3, received_count: 3, return_deadline: null, readiness: 'quorum_met' }
+    ]);
+    vi.spyOn(api, 'getQuoteComparison').mockResolvedValue(detail({
+      comparison: { id: 'c1', readiness: 'quorum_met', expected_count: 3, received_count: 3, return_deadline: null }
+    }));
+    vi.spyOn(api, 'listQuoteQueries').mockResolvedValue([]);
+    const approveSpy = vi.spyOn(api, 'approveQuoteComparison').mockImplementation(async (_w, _p, input) => {
+      if (!input.acknowledgeOpenQueries) throw new Error('There is 1 open query to this tenderer that have not been answered yet.');
+      return { status: 'approved_with_adjustments' } as never;
+    });
+
+    renderWithClient(<QuoteComparisonPanel workflowId="w1" />);
+    await screen.findByText('Roofing');
+
+    const select = await screen.findByDisplayValue('Select the awarded tenderer…');
+    await userEvent.selectOptions(select, 'r1');
+    await userEvent.click(screen.getByRole('button', { name: 'Award package' }));
+
+    const awardAnyway = await screen.findByRole('button', { name: 'Award anyway' });
+    expect(screen.getByText(/1 open query/)).toBeInTheDocument();
+    await userEvent.click(awardAnyway);
+
+    await waitFor(() => expect(approveSpy).toHaveBeenCalledWith('w1', 'Roofing', { awardedReturnId: 'r1', notes: null, acknowledgeOpenQueries: true }));
   });
 
   it('shows the exclusions and qualifications a tenderer stated, verbatim', async () => {

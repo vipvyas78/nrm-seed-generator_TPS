@@ -1,4 +1,4 @@
-import type { QuoteCellStatus, QuoteComparisonReadiness, QuoteComparisonSummary } from './api';
+import type { QuoteCellStatus, QuoteComparisonReadiness, QuoteComparisonSummary, QuoteQuery } from './api';
 
 /**
  * Pure presentation helpers for the levelled quote comparison (BuildFlow issue #100).
@@ -64,6 +64,31 @@ export function priceCellDisplay(
   }
   const secondary = cell.levelledRate != null ? `${formatMoney(cell.levelledRate)}${unit ? `/${unit}` : ''}` : null;
   return { primary: formatMoney(cell.levelledTotal), secondary, tone: cell.isAssumed ? 'assumed' : 'priced' };
+}
+
+/** "Open" is derived here too, never stored — no response, and not withdrawn. */
+export function isQueryOpen(query: Pick<QuoteQuery, 'response' | 'withdrawn_at'>): boolean {
+  return query.response == null && query.withdrawn_at == null;
+}
+
+/** How many open queries sit against each return — the badge every column header and the
+ *  award confirmation both read from. */
+export function openQueryCountByReturn(queries: QuoteQuery[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const q of queries) {
+    if (!isQueryOpen(q)) continue;
+    counts[q.return_id] = (counts[q.return_id] ?? 0) + 1;
+  }
+  return counts;
+}
+
+/** Whether an approve() refusal is the open-queries warning specifically, so the screen
+ *  can offer "award anyway" rather than just showing the error. Matches the wording
+ *  `tenderPrepDb.ts`'s `approveQuoteComparison` actually throws — a plain substring check
+ *  rather than a structured error code, the same trade-off the rest of this screen makes
+ *  for every other server-side refusal. */
+export function isOpenQueriesRefusal(message: string | null | undefined): boolean {
+  return Boolean(message?.includes('open quer'));
 }
 
 /** Packages worth the estimator's attention first: not yet opened, or open and ready. A

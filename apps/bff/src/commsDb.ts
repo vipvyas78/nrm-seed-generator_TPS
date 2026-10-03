@@ -84,7 +84,17 @@ export interface NotificationInput {
 
 export type MessageKind =
   | 'subcontractor_rfi' | 'client_forward' | 'client_reply' | 'relay_to_subcontractor' | 'note'
-  | 'itt_reminder' | 'rfi_response';
+  | 'itt_reminder' | 'rfi_response'
+  // BuildFlow issue #100: an estimator's own query to a subcontractor about their quote,
+  // raised after the comparison — not 'relay_to_subcontractor' (listClientAnswersForWorkflow
+  // reads that kind specifically; reusing it here would misclassify these messages).
+  // Recorded here ahead of the schema change it depends on: `comms.messages`' own kind
+  // CHECK lives in novamerx-comms-worker (see REQUIRED_COMMS_MIGRATION's own doc comment),
+  // and does not yet allow this value. recordMessage() with this kind fails that CHECK — a
+  // clean, local failure of the one feature that uses it — until that sister migration
+  // lands; nothing else here depends on it, so REQUIRED_COMMS_MIGRATION is deliberately
+  // left unbumped rather than guessed at a filename this repository does not control.
+  | 'quote_query';
 
 export interface RecordMessageInput {
   threadId: string;

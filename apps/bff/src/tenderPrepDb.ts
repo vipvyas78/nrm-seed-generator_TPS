@@ -28,6 +28,7 @@ import { renderIttEmail, requiredReturnsList, sectionIndex, type IttEmailLetterC
 import type { Block, RenderContext } from './blockPdfRenderer.js';
 import type { PortalLineDraftInput, PortalLineInput, PricingPortalDatabase } from './pricingPortalDb.js';
 import type { ManualReturnInput, QuoteComparisonDatabase } from './quoteComparisonDb.js';
+import type { QuoteQueryDraftInput, QuoteQueriesDatabase } from './quoteQueriesDb.js';
 import type { ScmsReadDatabase } from './scmsReadDb.js';
 import type { TakeoffCompletion, TakeoffTendered } from './takeoffCompletion.js';
 import { deriveReturnDate, isTenderReturnUnit } from './tenderReturnPeriod.js';
@@ -295,7 +296,10 @@ export class TenderPrepDatabase {
     // Optional: without one configured, the quote comparison stage (BuildFlow #100) is
     // unavailable and the workflow's step 3 stays the four-field tps.comparative screen
     // it always was — see quoteComparisonDb.ts's own header for why it needs only db.
-    private readonly quoteDb?: QuoteComparisonDatabase
+    private readonly quoteDb?: QuoteComparisonDatabase,
+    // Optional: without one configured, an estimator can still raise and log queries by
+    // hand but none can be emailed — see quoteQueriesDb.ts's own header.
+    private readonly quoteQueriesDb?: QuoteQueriesDatabase
   ) {}
 
   /**
@@ -3217,13 +3221,84 @@ export class TenderPrepDatabase {
     return this.quoteDb.recordManualReturn(workflowId, packageName, String(comparison.id), input);
   }
 
-  /** Awards the package — writes `trade_analysis` and the draft `tender_boq_lines` from
+  /**
+   * Awards the package — writes `trade_analysis` and the draft `tender_boq_lines` from
    * the comparison's levelled figures. The one act in this whole stage that leaves a mark
-   * on the firm's own bill, hence `approval` in routeAccess.ts. */
-  async approveQuoteComparison(actor: Actor, workflowId: string, packageName: string, awardedReturnId: string, notes: string | null): Promise<Row> {
+   * on the firm's own bill, hence `approval` in routeAccess.ts.
+   *
+   * A query still open against the AWARDED tenderer WARNS rather than blocks — the issue
+   * puts querying before the final adjustment, not before the award itself, and a question
+   * still outstanding after the estimator has made their adjustments is a judgement call
+   * for them, not a hard gate. `acknowledgeOpenQueries` is the estimator making that call;
+   * without it, the refusal names how many are open so the screen can ask first.
+   */
+  async approveQuoteComparison(
+    actor: Actor, workflowId: string, packageName: string, awardedReturnId: string, notes: string | null,
+    acknowledgeOpenQueries = false
+  ): Promise<Row> {
     await this.assertWorkflowAccess(actor, workflowId);
     if (!this.quoteDb) throw notFound('The quote comparison stage is not configured in this environment.');
+    if (this.quoteQueriesDb && !acknowledgeOpenQueries) {
+      const openCount = await this.quoteQueriesDb.openCountForReturn(workflowId, awardedReturnId);
+      if (openCount > 0) {
+        throw conflict(
+          `There ${openCount === 1 ? 'is' : 'are'} ${openCount} open quer${openCount === 1 ? 'y' : 'ies'} to this tenderer `
+          + `that have not been answered yet. Award anyway only once you are satisfied they will not change the figures.`
+        );
+      }
+    }
     return this.quoteDb.approve(workflowId, packageName, awardedReturnId, actor.userId, notes);
+  }
+
+  // ── Queries to subcontractors about their quote (BuildFlow #100) ───────────────────
+  //
+  // Every method here is `assertWorkflowAccess` first, delegating to `QuoteQueriesDatabase`
+  // — the same wrapping convention the quote comparison methods above already keep.
+
+  async listQuoteQueries(actor: Actor, workflowId: string, comparisonId: string): Promise<Row[]> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.quoteQueriesDb) return [];
+    return this.quoteQueriesDb.list(workflowId, comparisonId);
+  }
+
+  async createQuoteQuery(actor: Actor, workflowId: string, comparisonId: string, input: QuoteQueryDraftInput): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.quoteQueriesDb) throw notFound('Subcontractor queries are not configured in this environment.');
+    return this.quoteQueriesDb.createDraft(workflowId, comparisonId, input, actor.userId);
+  }
+
+  async updateQuoteQuery(actor: Actor, workflowId: string, comparisonId: string, queryId: string, question: string): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.quoteQueriesDb) throw notFound('Subcontractor queries are not configured in this environment.');
+    return this.quoteQueriesDb.updateDraft(workflowId, comparisonId, queryId, question);
+  }
+
+  async withdrawQuoteQuery(actor: Actor, workflowId: string, comparisonId: string, queryId: string): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.quoteQueriesDb) throw notFound('Subcontractor queries are not configured in this environment.');
+    return this.quoteQueriesDb.withdraw(workflowId, comparisonId, queryId, actor.userId);
+  }
+
+  async logQuoteQueryResponse(
+    actor: Actor, workflowId: string, comparisonId: string, queryId: string,
+    input: { response: string; responseSource: 'email' | 'phone' | 'meeting' | 'other'; respondedAt: string | null }
+  ): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.quoteQueriesDb) throw notFound('Subcontractor queries are not configured in this environment.');
+    return this.quoteQueriesDb.logResponse(workflowId, comparisonId, queryId, input, actor.userId);
+  }
+
+  /** Bundles every draft query against one return into a single email — "raise any
+   *  queries he may have on the quotes" (BuildFlow #100). Sending a query is estimator
+   *  work, not an act on the firm's own bill, hence `ordinary` in routeAccess.ts. */
+  async sendQuoteQueries(
+    actor: Actor, workflowId: string, comparisonId: string, returnId: string, recipientEmail: string | null
+  ): Promise<{ sent: number; skippedNoEmail: boolean; error?: string }> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    if (!this.quoteQueriesDb) throw notFound('Subcontractor queries are not configured in this environment.');
+    return this.quoteQueriesDb.sendDrafts(
+      workflowId, comparisonId, returnId, { userId: actor.userId, displayName: actor.displayName ?? null }, recipientEmail
+    );
   }
 
   // ── Subcontractor pricing portal — the public-facing side (a token, no Actor) ───────

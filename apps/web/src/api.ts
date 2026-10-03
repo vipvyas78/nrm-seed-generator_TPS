@@ -826,6 +826,29 @@ export type QuoteComparisonDetail = {
   scopeNotes: QuoteComparisonScopeNotes[];
 };
 
+export type QuoteQueryEmailStatus = 'draft' | 'pending' | 'sent' | 'failed' | 'skipped_no_email';
+export type QuoteQueryResponseSource = 'email' | 'phone' | 'meeting' | 'other';
+
+/** One question raised against a subcontractor's return (BuildFlow issue #100's own
+ *  closing step) — "open" is derived on this side too: no response and not withdrawn. */
+export type QuoteQuery = {
+  id: string;
+  comparison_id: string;
+  return_id: string;
+  row_id: string | null;
+  cell_id: string | null;
+  question: string;
+  raised_at: string;
+  email_status: QuoteQueryEmailStatus;
+  email_error: string | null;
+  recipient_email: string | null;
+  sent_at: string | null;
+  response: string | null;
+  response_source: QuoteQueryResponseSource | null;
+  responded_at: string | null;
+  withdrawn_at: string | null;
+};
+
 export type ManualQuoteReturnInput = {
   tendererName: string;
   subcontractorId?: string | null;
@@ -1171,8 +1194,28 @@ export const api = {
     request(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/rows/${rowId}`, { method: 'DELETE' }),
   recordManualQuoteReturn: (workflowId: string, packageName: string, input: ManualQuoteReturnInput) =>
     request(`/api/tender-prep/${workflowId}/quote-comparisons/${encodeURIComponent(packageName)}/returns`, { method: 'POST', body: JSON.stringify(input) }),
-  approveQuoteComparison: (workflowId: string, packageName: string, input: { awardedReturnId: string; notes?: string | null }) =>
+  approveQuoteComparison: (
+    workflowId: string, packageName: string,
+    input: { awardedReturnId: string; notes?: string | null; acknowledgeOpenQueries?: boolean }
+  ) =>
     request(`/api/tender-prep/${workflowId}/quote-comparisons/${encodeURIComponent(packageName)}/approve`, { method: 'POST', body: JSON.stringify(input) }),
+
+  // Queries to subcontractors about their quote (BuildFlow issue #100)
+  listQuoteQueries: (workflowId: string, comparisonId: string) =>
+    request<QuoteQuery[]>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/queries`),
+  createQuoteQuery: (workflowId: string, comparisonId: string, input: { returnId: string; rowId?: string | null; cellId?: string | null; question: string }) =>
+    request<QuoteQuery>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/queries`, { method: 'POST', body: JSON.stringify(input) }),
+  updateQuoteQuery: (workflowId: string, comparisonId: string, queryId: string, question: string) =>
+    request<QuoteQuery>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/queries/${queryId}`, { method: 'PATCH', body: JSON.stringify({ question }) }),
+  withdrawQuoteQuery: (workflowId: string, comparisonId: string, queryId: string) =>
+    request<QuoteQuery>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/queries/${queryId}/withdraw`, { method: 'POST' }),
+  logQuoteQueryResponse: (workflowId: string, comparisonId: string, queryId: string, input: { response: string; responseSource: 'email' | 'phone' | 'meeting' | 'other'; respondedAt?: string | null }) =>
+    request<QuoteQuery>(`/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/queries/${queryId}/response`, { method: 'POST', body: JSON.stringify(input) }),
+  sendQuoteQueries: (workflowId: string, comparisonId: string, returnId: string, recipientEmail?: string | null) =>
+    request<{ sent: number; skippedNoEmail: boolean; error?: string }>(
+      `/api/tender-prep/${workflowId}/quote-comparisons/${comparisonId}/queries/send`,
+      { method: 'POST', body: JSON.stringify({ returnId, recipientEmail }) }
+    ),
 
   // Step 4: Submission
   getSubmission: (workflowId: string) => request<TenderSubmission | null>(`/api/tender-prep/${workflowId}/submission`),

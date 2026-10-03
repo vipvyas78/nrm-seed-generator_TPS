@@ -27,6 +27,7 @@ import { DropboxDocumentLinkProvider } from './documentLinkProvider.js';
 import { EmailService } from './emailService.js';
 import { PricingPortalDatabase } from './pricingPortalDb.js';
 import { QuoteComparisonDatabase } from './quoteComparisonDb.js';
+import { QuoteQueriesDatabase } from './quoteQueriesDb.js';
 import { RfiDatabase } from './rfiDb.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
 import { ITT_FROM_ADDRESS, TenderPrepDatabase } from './tenderPrepDb.js';
@@ -175,10 +176,17 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   // gated on the BuildFlow pair directly, not on this being defined, since it always is.
   const rfiDb = new RfiDatabase(db, commsDb, attachmentTextClient, tenderPassagesClient);
 
+  // Queries to subcontractors about their quote (BuildFlow #100's own closing step).
+  // Needs the same pair quoteDb and portalDb already have, plus scmsDb for the fallback
+  // recipient when a return never went through the portal — see quoteQueriesDb.ts's own
+  // header for why sending a query is CLAIM/RECORD/SEND/SETTLE, the same shape as
+  // IttRemindersDatabase below.
+  const quoteQueriesDb = new QuoteQueriesDatabase(db, commsDb, scmsDb, emailService, testEmailOverride, ITT_FROM_ADDRESS);
+
   const tpDb = new TenderPrepDatabase(
     db, scmsDb, boqDb, documentLinks, buildflowLinks, specClauses, documentBundles,
     emailService, testEmailOverride, portalDb, accessAdmin, portalBaseUrl, config.PORTAL_LINK_TTL_DAYS,
-    mepBoq, commsDb, commsAttachments, config.CLIENT_LINK_TTL_DAYS, rfiDb, addendumDelta, quoteDb
+    mepBoq, commsDb, commsAttachments, config.CLIENT_LINK_TTL_DAYS, rfiDb, addendumDelta, quoteDb, quoteQueriesDb
   );
 
   // ITT reminders and the reading of a firm's emailed reply. Its own module rather than more
@@ -1397,8 +1405,68 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     // Awards the package — the act that leaves a mark on the firm's own bill.
     protectedApi.post('/api/tender-prep/:workflowId/quote-comparisons/:packageName/approve', async (request) => {
       const { workflowId, packageName } = params(request, z.object({ workflowId: uuid, packageName: z.string().trim().min(1).max(200) }));
-      const input = body(request, z.object({ awardedReturnId: uuid, notes: z.string().trim().max(2000).nullable().optional() }));
-      return tpDb.approveQuoteComparison(requireActor(request), workflowId, packageName, input.awardedReturnId, input.notes ?? null);
+      const input = body(request, z.object({
+        awardedReturnId: uuid, notes: z.string().trim().max(2000).nullable().optional(),
+        acknowledgeOpenQueries: z.boolean().optional()
+      }));
+      return tpDb.approveQuoteComparison(
+        requireActor(request), workflowId, packageName, input.awardedReturnId, input.notes ?? null,
+        input.acknowledgeOpenQueries ?? false
+      );
+    });
+
+    // ── Queries to subcontractors about their quote (BuildFlow #100) ───────────
+    //
+    // "Once this comparison is done, then the estimator should ... get in touch with the
+    // respective subcontractors to raise any queries he may have on the quotes or on the
+    // pricing." Nested under the comparison, not the package, for the same reason the
+    // cells routes above are: a query is always about one return's figures.
+
+    protectedApi.get('/api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries', async (request) => {
+      const { workflowId, comparisonId } = params(request, z.object({ workflowId: uuid, comparisonId: uuid }));
+      return tpDb.listQuoteQueries(requireActor(request), workflowId, comparisonId);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries', async (request, reply) => {
+      const { workflowId, comparisonId } = params(request, z.object({ workflowId: uuid, comparisonId: uuid }));
+      const input = body(request, z.object({
+        returnId: uuid, rowId: uuid.nullable().optional(), cellId: uuid.nullable().optional(),
+        question: z.string().trim().min(1).max(2000)
+      }));
+      return reply.status(201).send(await tpDb.createQuoteQuery(requireActor(request), workflowId, comparisonId, {
+        returnId: input.returnId, rowId: input.rowId ?? null, cellId: input.cellId ?? null, question: input.question
+      }));
+    });
+
+    protectedApi.patch('/api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries/:queryId', async (request) => {
+      const { workflowId, comparisonId, queryId } = params(request, z.object({ workflowId: uuid, comparisonId: uuid, queryId: uuid }));
+      const input = body(request, z.object({ question: z.string().trim().min(1).max(2000) }));
+      return tpDb.updateQuoteQuery(requireActor(request), workflowId, comparisonId, queryId, input.question);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries/:queryId/withdraw', async (request) => {
+      const { workflowId, comparisonId, queryId } = params(request, z.object({ workflowId: uuid, comparisonId: uuid, queryId: uuid }));
+      return tpDb.withdrawQuoteQuery(requireActor(request), workflowId, comparisonId, queryId);
+    });
+
+    protectedApi.post('/api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries/:queryId/response', async (request) => {
+      const { workflowId, comparisonId, queryId } = params(request, z.object({ workflowId: uuid, comparisonId: uuid, queryId: uuid }));
+      const input = body(request, z.object({
+        response: z.string().trim().min(1).max(4000),
+        responseSource: z.enum(['email', 'phone', 'meeting', 'other']),
+        respondedAt: z.string().nullable().optional()
+      }));
+      return tpDb.logQuoteQueryResponse(requireActor(request), workflowId, comparisonId, queryId, {
+        response: input.response, responseSource: input.responseSource, respondedAt: input.respondedAt ?? null
+      });
+    });
+
+    // Bundles every draft query against ONE return into a single email — sending is
+    // estimator work on their own query, never an act on the firm's bill, hence `ordinary`.
+    protectedApi.post('/api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries/send', async (request) => {
+      const { workflowId, comparisonId } = params(request, z.object({ workflowId: uuid, comparisonId: uuid }));
+      const input = body(request, z.object({ returnId: uuid, recipientEmail: z.string().email().nullable().optional() }));
+      return tpDb.sendQuoteQueries(requireActor(request), workflowId, comparisonId, input.returnId, input.recipientEmail ?? null);
     });
 
     // ── Step 3 (legacy): the four-field comparative screen, superseded above ────

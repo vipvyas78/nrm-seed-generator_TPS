@@ -1,10 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import {
-  api, type QuoteComparisonCell, type QuoteComparisonReturn, type QuoteComparisonRow, type QuoteLineStatus
+  api, type QuoteComparisonCell, type QuoteComparisonReturn, type QuoteComparisonRow, type QuoteLineStatus, type QuoteQuery,
+  type QuoteQueryResponseSource
 } from './api';
 import { Busy, ErrorMessage } from './pages';
-import { formatMoney, isReadyToApprove, priceCellDisplay, readinessBadgeClass, readinessLabel, sortComparisonSummaries } from './quoteComparison';
+import {
+  formatMoney, isOpenQueriesRefusal, isQueryOpen, isReadyToApprove, openQueryCountByReturn, priceCellDisplay,
+  readinessBadgeClass, readinessLabel, sortComparisonSummaries
+} from './quoteComparison';
 
 /**
  * Step 3: the levelled quote comparison (BuildFlow issue #100).
@@ -74,16 +78,30 @@ function PackageComparison({ workflowId, packageName }: { workflowId: string; pa
     queryFn: () => api.getQuoteComparison(workflowId, packageName),
     retry: false
   });
+  const comparisonId = detail.data?.comparison.id ?? null;
+  const queriesKey = ['quote-queries', workflowId, comparisonId];
+  const queries = useQuery({
+    queryKey: queriesKey,
+    queryFn: () => api.listQuoteQueries(workflowId, comparisonId!),
+    enabled: Boolean(comparisonId)
+  });
   const invalidateAll = () => {
     void queryClient.invalidateQueries({ queryKey: detailKey });
     void queryClient.invalidateQueries({ queryKey: ['quote-comparisons', workflowId] });
+    void queryClient.invalidateQueries({ queryKey: queriesKey });
   };
 
   const open = useMutation({ mutationFn: () => api.openQuoteComparison(workflowId, packageName), onSuccess: invalidateAll });
   const approve = useMutation({
-    mutationFn: () => api.approveQuoteComparison(workflowId, packageName, { awardedReturnId: awardReturnId, notes: approvalNotes || null }),
+    mutationFn: (acknowledgeOpenQueries: boolean) => api.approveQuoteComparison(workflowId, packageName, {
+      awardedReturnId: awardReturnId, notes: approvalNotes || null, acknowledgeOpenQueries
+    }),
     onSuccess: invalidateAll
   });
+  // A query still open against the AWARDED tenderer only warns (see
+  // tenderPrepDb.ts's own approveQuoteComparison) — the second click sends the SAME
+  // award again, this time saying the estimator has seen and accepted that.
+  const openQueriesWarning = isOpenQueriesRefusal(approve.error?.message);
   const noteMutation = useMutation({
     mutationFn: (input: { cellId: string; estimatorNote: string | null }) =>
       api.updateQuoteComparisonCellNote(workflowId, String(detail.data?.comparison.id), input.cellId, input.estimatorNote),
@@ -126,7 +144,13 @@ function PackageComparison({ workflowId, packageName }: { workflowId: string; pa
         <thead>
           <tr>
             <th>Item</th>
-            {returns.map((ret) => <th key={ret.id} colSpan={2}>{ret.tenderer_name}{ret.is_fabricated ? ' (test)' : ''}</th>)}
+            {returns.map((ret) => {
+              const openCount = openQueryCountByReturn(queries.data ?? [])[ret.id] ?? 0;
+              return <th key={ret.id} colSpan={2}>
+                {ret.tenderer_name}{ret.is_fabricated ? ' (test)' : ''}
+                {openCount > 0 && <span className="badge badge-amber" style={{ marginLeft: 6 }} title="Open queries">{openCount} quer{openCount === 1 ? 'y' : 'ies'}</span>}
+              </th>;
+            })}
             <th>Lowest</th>
           </tr>
         </thead>
@@ -184,6 +208,12 @@ function PackageComparison({ workflowId, packageName }: { workflowId: string; pa
       </table>
     </>}
 
+    {returns.length > 0 && comparisonId && <QueriesSection
+      workflowId={workflowId} comparisonId={comparisonId} returns={returns}
+      queries={queries.data ?? []} queriesLoading={queries.isLoading}
+      onChanged={() => void queryClient.invalidateQueries({ queryKey: queriesKey })}
+    />}
+
     <div className="button-row" style={{ marginTop: 16, justifyContent: 'flex-start' }}>
       <button className="secondary small" onClick={() => setShowManualForm((v) => !v)}>
         {showManualForm ? 'Cancel' : '+ Enter a return by hand'}
@@ -215,11 +245,17 @@ function PackageComparison({ workflowId, packageName }: { workflowId: string; pa
           {returns.map((ret) => <option key={ret.id} value={ret.id}>{ret.tenderer_name}</option>)}
         </select>
         <input value={approvalNotes} onChange={(e) => setApprovalNotes(e.target.value)} placeholder="Notes (optional)" style={{ minWidth: 220 }} />
-        <button disabled={!awardReturnId || !readyToApprove || approve.isPending} onClick={() => approve.mutate()}>
+        <button disabled={!awardReturnId || !readyToApprove || approve.isPending} onClick={() => approve.mutate(false)}>
           {approve.isPending ? 'Awarding…' : 'Award package'}
         </button>
       </div>
-      <ErrorMessage error={approve.error} />
+      <ErrorMessage error={openQueriesWarning ? undefined : approve.error} />
+      {openQueriesWarning && <div className="panel" style={{ marginTop: 8, background: '#fef3c7' }}>
+        <p>{approve.error?.message}</p>
+        <button className="secondary small" onClick={() => approve.mutate(true)} disabled={approve.isPending}>
+          {approve.isPending ? 'Awarding…' : 'Award anyway'}
+        </button>
+      </div>}
     </div>}
   </div>;
 }
@@ -270,6 +306,118 @@ function ComparisonCell({ cell, unit, onNote }: {
       )}
     </td>
   </>;
+}
+
+/**
+ * Queries to subcontractors about their quote — the issue's own closing step: "the
+ * estimator should ... get in touch with the respective subcontractors to raise any
+ * queries he may have on the quotes or on the pricing." One group per return, each with
+ * its own drafts, a bundled send, and the estimator's own record of what came back.
+ */
+function QueriesSection({ workflowId, comparisonId, returns, queries, queriesLoading, onChanged }: {
+  workflowId: string; comparisonId: string; returns: QuoteComparisonReturn[]; queries: QuoteQuery[]; queriesLoading: boolean;
+  onChanged: () => void;
+}) {
+  const [askingFor, setAskingFor] = useState<string | null>(null);
+  const [questionDraft, setQuestionDraft] = useState('');
+
+  const create = useMutation({
+    mutationFn: (returnId: string) => api.createQuoteQuery(workflowId, comparisonId, { returnId, question: questionDraft.trim() }),
+    onSuccess: () => { setQuestionDraft(''); setAskingFor(null); onChanged(); }
+  });
+  const send = useMutation({
+    mutationFn: (returnId: string) => api.sendQuoteQueries(workflowId, comparisonId, returnId),
+    onSuccess: onChanged
+  });
+  const withdraw = useMutation({
+    mutationFn: (queryId: string) => api.withdrawQuoteQuery(workflowId, comparisonId, queryId),
+    onSuccess: onChanged
+  });
+
+  return <>
+    <h4 style={{ marginTop: 16 }}>Queries to subcontractors</h4>
+    <p className="muted" style={{ fontSize: '0.8rem' }}>
+      Once the comparison is done, get in touch with a subcontractor about anything in their
+      quote before making the final adjustments.
+    </p>
+    {queriesLoading ? <Busy /> : returns.map((ret) => {
+      const mine = queries.filter((q) => q.return_id === ret.id);
+      const drafts = mine.filter((q) => q.email_status === 'draft');
+      return <div key={ret.id} className="panel" style={{ marginTop: 8, background: '#f9fafb' }}>
+        <div className="button-row" style={{ justifyContent: 'space-between' }}>
+          <strong>{ret.tenderer_name}</strong>
+          <div className="button-row">
+            {drafts.length > 0 && <button className="secondary small" disabled={send.isPending} onClick={() => send.mutate(ret.id)}>
+              {send.isPending ? 'Sending…' : `Send ${drafts.length} draft quer${drafts.length === 1 ? 'y' : 'ies'}`}
+            </button>}
+            <button className="secondary small" onClick={() => setAskingFor(askingFor === ret.id ? null : ret.id)}>
+              {askingFor === ret.id ? 'Cancel' : '+ Ask a question'}
+            </button>
+          </div>
+        </div>
+        {askingFor === ret.id && <div className="inline-form" style={{ marginTop: 8 }}>
+          <input value={questionDraft} onChange={(e) => setQuestionDraft(e.target.value)} placeholder="Your question" style={{ flex: 1 }} />
+          <button disabled={!questionDraft.trim() || create.isPending} onClick={() => create.mutate(ret.id)}>
+            {create.isPending ? 'Adding…' : 'Add'}
+          </button>
+        </div>}
+        <ErrorMessage error={create.error ?? send.error} />
+        {mine.length === 0
+          ? <p className="muted" style={{ fontSize: '0.8rem', marginTop: 8 }}>No queries raised yet.</p>
+          : <ul style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+              {mine.map((q) => <QueryItem
+                key={q.id} query={q} workflowId={workflowId} comparisonId={comparisonId}
+                onChanged={onChanged} onWithdraw={() => withdraw.mutate(q.id)}
+              />)}
+            </ul>}
+      </div>;
+    })}
+  </>;
+}
+
+function QueryItem({ query, workflowId, comparisonId, onChanged, onWithdraw }: {
+  query: QuoteQuery; workflowId: string; comparisonId: string; onChanged: () => void; onWithdraw: () => void;
+}) {
+  const [logging, setLogging] = useState(false);
+  const [response, setResponse] = useState('');
+  const [source, setSource] = useState<QuoteQueryResponseSource>('phone');
+
+  const logResponse = useMutation({
+    mutationFn: () => api.logQuoteQueryResponse(workflowId, comparisonId, query.id, { response: response.trim(), responseSource: source }),
+    onSuccess: () => { setLogging(false); setResponse(''); onChanged(); }
+  });
+
+  const open = isQueryOpen(query);
+  return <li style={{ marginBottom: 8 }}>
+    <div>{query.question}</div>
+    <div className="muted" style={{ fontSize: '0.72rem' }}>
+      {query.withdrawn_at
+        ? 'Withdrawn'
+        : query.email_status === 'draft' ? 'Not yet sent'
+        : query.email_status === 'sent' ? 'Sent'
+        : query.email_status === 'failed' ? `Send failed${query.email_error ? `: ${query.email_error}` : ''}`
+        : query.email_status === 'skipped_no_email' ? 'No email on file for this firm'
+        : query.email_status}
+    </div>
+    {query.response && <div className="text-green" style={{ fontSize: '0.78rem', marginTop: 2 }}>“{query.response}” ({query.response_source})</div>}
+    {open && <div className="button-row" style={{ marginTop: 4 }}>
+      <button className="secondary small" onClick={() => setLogging((v) => !v)}>{logging ? 'Cancel' : 'Log response'}</button>
+      <button className="secondary small" onClick={onWithdraw}>Withdraw</button>
+    </div>}
+    {logging && <div className="inline-form" style={{ marginTop: 4 }}>
+      <input value={response} onChange={(e) => setResponse(e.target.value)} placeholder="What did they say?" style={{ flex: 1 }} />
+      <select value={source} onChange={(e) => setSource(e.target.value as QuoteQueryResponseSource)}>
+        <option value="phone">Phone</option>
+        <option value="email">Email</option>
+        <option value="meeting">Meeting</option>
+        <option value="other">Other</option>
+      </select>
+      <button disabled={!response.trim() || logResponse.isPending} onClick={() => logResponse.mutate()}>
+        {logResponse.isPending ? 'Saving…' : 'Save'}
+      </button>
+    </div>}
+    <ErrorMessage error={logResponse.error} />
+  </li>;
 }
 
 const STATUS_OPTIONS: QuoteLineStatus[] = ['priced', 'included', 'excluded', 'not_addressed'];

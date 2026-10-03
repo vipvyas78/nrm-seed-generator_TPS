@@ -122,6 +122,18 @@ export const ROUTE_ACCESS: Record<string, RouteAccess> = {
   'POST /api/tender-prep/:workflowId/quote-comparisons/:packageName/returns': 'ordinary',
   'POST /api/tender-prep/:workflowId/quote-comparisons/:packageName/approve': 'approval',
 
+  // Queries to subcontractors about their quote (issue #100's own closing step).
+  // Raising, editing, withdrawing and SENDING a query are all estimator work on their own
+  // question — never an act on the firm's bill — so all but the read stay `ordinary`,
+  // the same class the comparison's own cell/row edits above already carry. Logging a
+  // response is the estimator recording what they were told, not a decision either.
+  'GET /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries': 'read',
+  'POST /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries': 'ordinary',
+  'PATCH /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries/:queryId': 'ordinary',
+  'POST /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries/:queryId/withdraw': 'ordinary',
+  'POST /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries/:queryId/response': 'ordinary',
+  'POST /api/tender-prep/:workflowId/quote-comparisons/:comparisonId/queries/send': 'ordinary',
+
   // ── comparison and the bid itself (legacy tps.comparative screen, superseded above)
   'GET /api/tender-prep/:workflowId/comparative': 'read',
   'POST /api/tender-prep/:workflowId/comparative': 'ordinary',
