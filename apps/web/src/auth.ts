@@ -52,3 +52,11 @@ export async function signIn(): Promise<void> {
   if (!oidc) throw new Error('OIDC is not configured');
   await oidc.signinRedirect({ extraQueryParams: import.meta.env.VITE_OIDC_AUDIENCE ? { audience: import.meta.env.VITE_OIDC_AUDIENCE } : undefined });
 }
+
+/**
+ * True where TPS is mounted under /tps on BuildFlow's own origin, so BuildFlow's /login is
+ * reachable and its session would be visible here. On localhost (separate ports) it is not.
+ */
+export function sharesOriginWithBuildflow(): boolean {
+  return basePath === '/tps' && !(import.meta.env.VITE_DEV_SUBJECT && import.meta.env.VITE_DEV_ORGANIZATION);
+}
