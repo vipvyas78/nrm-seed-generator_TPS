@@ -59,7 +59,7 @@ describe('self-priced packages', () => {
       await tpDb.savePackageSelection(actor, workflow.id, { packageName: other, routeOfProcurement: 'Supply and install', entries: [] });
       await expect(tpDb.getSelfPricing(actor, workflow.id, other)).rejects.toThrow(/not self priced/i);
 
-      // Promote a hand-built draft into a return.
+      // Open the BoQ from a hand-built draft (the ITT assembly needs a take-off).
       await db.query(
         `INSERT INTO self_pricing_drafts (workflow_id, package_name, lines)
          VALUES ($1, $2, $3::jsonb)`,
@@ -68,21 +68,65 @@ describe('self-priced packages', () => {
             isPriceable: true, rate: null, status: 'priced', note: null, added: false }
         ])]
       );
-      // An unpriced priceable line blocks submission.
-      await expect(tpDb.submitSelfPricing(actor, workflow.id, name)).rejects.toThrow(/no rate/i);
-      await tpDb.saveSelfPricing(actor, workflow.id, name, {
-        programmeWeeks: 4, qualifications: null, exclusions: null,
-        lines: [{ seq: 1, quantity: 10, rate: 25, status: 'priced', note: null }]
+      const opened = await tpDb.getSelfPricing(actor, workflow.id, name);
+      expect((opened.lines as Array<Record<string, any>>)[0].measuredQuantity).toBe(10); // back-filled from the snapshot
+      expect(opened.addressed_count).toBe(0);
+
+      // Completing with an unpriced line is refused.
+      await expect(tpDb.completeSelfPricing(actor, workflow.id, name)).rejects.toThrow(/no rate/i);
+
+      // Autosave: change the quantity, add an own item.
+      const saved = await tpDb.saveSelfPricing(actor, workflow.id, name, {
+        version: Number(opened.version), programmeWeeks: 4, qualifications: null, exclusions: null,
+        lines: [
+          { seq: 1, quantity: 12, unit: 'x', description: 'ignored', rate: 25, status: 'priced', note: null, remarks: null },
+          { seq: null, description: 'Extra scaffold', quantity: 1, unit: 'item', rate: 100, status: 'priced', note: null }
+        ]
       });
-      const done = await tpDb.submitSelfPricing(actor, workflow.id, name);
-      expect(Number(done.tendered_sum)).toBe(250);
+      const savedLines = saved.lines as Array<Record<string, any>>;
+      expect(savedLines).toHaveLength(2);
+      expect(savedLines[0].description).toBe('Frame');   // a bill line's wording is fixed
+      expect(savedLines[0].unit).toBe('m2');
+      expect(savedLines[1].added).toBe(true);
+
+      // A second tab holding the old version is refused.
+      await expect(tpDb.saveSelfPricing(actor, workflow.id, name, {
+        version: Number(opened.version), programmeWeeks: null, qualifications: null, exclusions: null, lines: []
+      })).rejects.toThrow(/changed elsewhere/i);
+
+      // Changed quantity needs a remark.
+      await expect(tpDb.completeSelfPricing(actor, workflow.id, name)).rejects.toThrow(/remark/i);
+      const remarked = await tpDb.saveSelfPricing(actor, workflow.id, name, {
+        version: Number(saved.version), programmeWeeks: 4, qualifications: null, exclusions: null,
+        lines: [
+          { seq: 1, quantity: 12, rate: 25, status: 'priced', note: null, remarks: 'Drawing shows 12 m2' },
+          { seq: 2, quantity: 1, rate: 100, status: 'priced', note: null }
+        ]
+      });
+
+      const done = await tpDb.completeSelfPricing(actor, workflow.id, name);
+      expect(Number(done.tendered_sum)).toBe(400);
+      expect(done.status).toBe('complete');
+      expect(done.changed_since_transfer).toBe(false);
       const [ret] = await db.query<{ source: string; subcontractor_id: string | null; tendered_sum: string }>(
         `SELECT source, subcontractor_id, tendered_sum FROM tender_returns WHERE workflow_id = $1 AND package_name = $2`,
         [workflow.id, name]
       );
       expect(ret.source).toBe('self_priced');
       expect(ret.subcontractor_id).toBeNull();
-      expect(Number(ret.tendered_sum)).toBe(250);
+
+      // Still editable after "save as draft"; the edit shows as changed since transfer.
+      const edited = await tpDb.saveSelfPricing(actor, workflow.id, name, {
+        version: Number(done.version), programmeWeeks: 4, qualifications: null, exclusions: null,
+        lines: [
+          { seq: 1, quantity: 12, rate: 30, status: 'priced', note: null, remarks: 'Drawing shows 12 m2' },
+          { seq: 2, quantity: 1, rate: 100, status: 'priced', note: null }
+        ]
+      });
+      expect(edited.changed_since_transfer).toBe(true);
+      const index = await tpDb.listSelfPricing(actor, workflow.id);
+      expect(index.find((p) => p.package_name === name)!.state).toBe('changed_since_transfer');
+      void remarked;
     } finally {
       await db.query(`DELETE FROM route_options WHERE organization_id = $1`, [organizationId]);
       await db.query(`DELETE FROM workflows WHERE organization_id = $1`, [organizationId]);

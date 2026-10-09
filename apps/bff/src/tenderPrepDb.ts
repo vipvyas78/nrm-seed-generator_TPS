@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { renderAddendumEmail, summariseChanges, type AddendumEmailContext } from './addendumEmail.js';
 import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
 import type { BuildflowCommsAttachmentsClient } from './buildflowCommsAttachmentsClient.js';
@@ -182,6 +182,29 @@ function attributionFor(pkg: Row): Attribution {
     // its attribution has not been set. That is the honest answer, and a QS can see it.
     trade_terms: []
   };
+}
+
+/** The wizard's last step. Self Pricing is step 4, Tender Submission step 5 (migration 034). */
+export const FINAL_STEP = 5;
+
+/** One row of a self-priced package's BoQ — see normaliseSelfPricingLines. */
+export interface SelfPricingLine {
+  seq: number;
+  geCode: string | null;
+  elementCode: string | null;
+  description: string;
+  quantity: number | null;
+  /** What the app measured. Null on a line the QS added. Never edited. */
+  measuredQuantity: number | null;
+  unit: string | null;
+  isPriceable: boolean;
+  rate: number | null;
+  status: 'priced' | 'included' | 'excluded' | 'not_addressed';
+  note: string | null;
+  remarks: string | null;
+  subcontractorRef: string | null;
+  projectRef: string | null;
+  added: boolean;
 }
 
 /**
@@ -1397,7 +1420,7 @@ export class TenderPrepDatabase {
       [workflowId, actor.organizationId]
     );
     if (wf.locked_at) throw conflict('Workflow is locked');
-    if (Number(wf.current_step) >= 4) throw conflict('Already at final step');
+    if (Number(wf.current_step) >= FINAL_STEP) throw conflict('Already at final step');
     return this.db.one(
       `UPDATE workflows SET current_step = current_step + 1, updated_at = NOW() WHERE id = $1 RETURNING *`,
       [workflowId]
@@ -2227,7 +2250,7 @@ export class TenderPrepDatabase {
    * The placeholder firm is excluded from `candidates` for exactly that reason: it is an
    * affordance saying "nobody here", not a firm somebody declined to pick.
    */
-  // ── Self-priced packages: the main contractor's own pricing form ─────────────────────
+  // ── Self-priced packages: the main contractor's own BoQ (issues #143, #144) ──────────
 
   private async assertSelfPriced(workflowId: string, packageName: string): Promise<void> {
     const [row] = await this.db.query<{ is_self_priced: boolean }>(
@@ -2240,8 +2263,62 @@ export class TenderPrepDatabase {
   }
 
   /**
+   * One line per package row. `measuredQuantity` is what the app measured and never changes;
+   * `quantity` is what the QS prices against, so a disagreement with the measurement is on the
+   * record rather than silently overwritten. Drafts written before #144 carry no
+   * `measuredQuantity`, so it is filled from the quantity they were snapshotted with.
+   */
+  private normaliseSelfPricingLines(raw: unknown): SelfPricingLine[] {
+    return (Array.isArray(raw) ? raw : []).map((l: Record<string, any>) => ({
+      seq: Number(l.seq),
+      geCode: l.geCode ?? null,
+      elementCode: l.elementCode ?? null,
+      description: String(l.description ?? ''),
+      quantity: l.quantity ?? null,
+      measuredQuantity: l.added === true ? null : (l.measuredQuantity ?? l.quantity ?? null),
+      unit: l.unit ?? null,
+      isPriceable: l.isPriceable !== false,
+      rate: l.rate ?? null,
+      status: l.status ?? 'priced',
+      note: l.note ?? null,
+      remarks: l.remarks ?? null,
+      subcontractorRef: l.subcontractorRef ?? null,
+      projectRef: l.projectRef ?? null,
+      added: l.added === true
+    }));
+  }
+
+  private selfPricingProgress(lines: SelfPricingLine[]): { priceable: number; addressed: number } {
+    const priceable = lines.filter((l) => l.isPriceable || l.added);
+    return {
+      priceable: priceable.length,
+      // Addressed = priced with a rate, or given an explicit status (included, excluded, ...).
+      addressed: priceable.filter((l) => l.status !== 'priced' || l.rate != null).length
+    };
+  }
+
+  private selfPricingHash(lines: SelfPricingLine[]): string {
+    const figures = lines.map((l) => [l.seq, l.description, l.quantity, l.unit, l.rate, l.status, l.note]);
+    return createHash('sha256').update(JSON.stringify(figures)).digest('hex');
+  }
+
+  private shapeSelfPricing(draft: Row, tendererName?: string): Row {
+    const lines = this.normaliseSelfPricingLines(draft.lines);
+    const progress = this.selfPricingProgress(lines);
+    const changed = draft.transferred_hash != null && draft.transferred_hash !== this.selfPricingHash(lines);
+    return {
+      ...draft,
+      lines,
+      ...(tendererName ? { tenderer_name: tendererName } : {}),
+      priceable_count: progress.priceable,
+      addressed_count: progress.addressed,
+      changed_since_transfer: changed
+    };
+  }
+
+  /**
    * The bill to price, plus whatever has been saved so far. The lines are snapshotted from the
-   * ITT assembly the first time the form opens, so a take-off re-run cannot change the bill
+   * ITT assembly the first time the BoQ opens, so a take-off re-run cannot change the bill
    * under the estimator who is part-way through pricing it.
    */
   async getSelfPricing(actor: Actor, workflowId: string, packageName: string): Promise<Row> {
@@ -2254,7 +2331,9 @@ export class TenderPrepDatabase {
     if (!draft) {
       const { emailPack } = await this.assemblePackageForEmail(actor, workflowId, packageName, [], null);
       const lines = linesFromEmailPack(emailPack).map((l, i) => ({
-        seq: i + 1, ...l, rate: null as number | null, status: 'priced', note: null as string | null, added: false
+        seq: i + 1, ...l, measuredQuantity: l.quantity, rate: null as number | null,
+        status: 'priced', note: null as string | null, remarks: null, subcontractorRef: null,
+        projectRef: null, added: false
       }));
       [draft] = await this.db.query<Row>(
         `INSERT INTO self_pricing_drafts (workflow_id, package_name, lines, updated_by)
@@ -2264,59 +2343,125 @@ export class TenderPrepDatabase {
         [workflowId, packageName, JSON.stringify(lines), actor.userId]
       );
     }
-    return { ...draft, tenderer_name: await this.organizationName(actor) };
+    return this.shapeSelfPricing(draft, await this.organizationName(actor));
   }
 
+  /** Step 4's index: every self-priced package, how far through it the QS is. */
+  async listSelfPricing(actor: Actor, workflowId: string): Promise<Row[]> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    const packages = await this.db.query<Row>(
+      `SELECT sl.package_name, sl.package_seq, d.lines, d.status, d.updated_at, d.completed_at, d.transferred_hash
+         FROM shortlists sl
+         LEFT JOIN self_pricing_drafts d ON d.workflow_id = sl.workflow_id AND d.package_name = sl.package_name
+        WHERE sl.workflow_id = $1 AND sl.is_self_priced
+        ORDER BY sl.package_seq NULLS LAST, sl.package_name`,
+      [workflowId]
+    );
+    return packages.map((p) => {
+      if (!p.lines) {
+        return { package_name: p.package_name, package_seq: p.package_seq, state: 'not_started',
+                 priceable_count: 0, addressed_count: 0, updated_at: null, completed_at: null };
+      }
+      const shaped = this.shapeSelfPricing(p);
+      const state = p.status === 'complete'
+        ? (shaped.changed_since_transfer ? 'changed_since_transfer' : 'complete')
+        : 'in_progress';
+      return { package_name: p.package_name, package_seq: p.package_seq, state,
+               priceable_count: shaped.priceable_count, addressed_count: shaped.addressed_count,
+               updated_at: p.updated_at, completed_at: p.completed_at };
+    });
+  }
+
+  /**
+   * Autosave. Takes the whole editable state and replaces it, guarded by `version` so a second
+   * tab (or a retry that overtook its predecessor) cannot silently overwrite newer work.
+   *
+   * What may change: a rate, status, note and remarks on any line; a quantity on any line (the
+   * measurement stays beside it); everything on a line the QS added. A bill line's description
+   * and unit are evidence of what was asked and are fixed. A line the QS added and then dropped
+   * from the payload is deleted; a bill line absent from the payload is kept.
+   */
   async saveSelfPricing(actor: Actor, workflowId: string, packageName: string, input: {
+    version: number;
     programmeWeeks: number | null; qualifications: string | null; exclusions: string | null;
     lines: Array<{
-      seq: number; description?: string; quantity: number | null; unit?: string | null;
-      rate: number | null; status: 'priced' | 'included' | 'excluded' | 'not_addressed';
-      note: string | null;
+      seq: number | null; description?: string; quantity: number | null; unit?: string | null;
+      rate: number | null; status: SelfPricingLine['status'];
+      note: string | null; remarks?: string | null;
+      subcontractorRef?: string | null; projectRef?: string | null;
     }>;
   }): Promise<Row> {
     const current = await this.getSelfPricing(actor, workflowId, packageName);
-    if (current.submitted_at) throw conflict('This pricing has already been submitted.');
-    for (const l of input.lines) {
-      if (l.status === 'excluded' && !l.note?.trim()) {
-        throw conflict(`Line ${l.seq} is excluded and needs a note saying why.`);
-      }
+    if (Number(current.version) !== input.version) {
+      throw conflict('This BoQ was changed elsewhere since you opened it. Reload to see the latest before editing.');
     }
-    const bySeq = new Map(input.lines.map((l) => [l.seq, l]));
-    const stored = current.lines as Array<Record<string, unknown>>;
-    const merged = stored.map((l) => {
-      const edit = bySeq.get(Number(l.seq));
-      if (!edit) return l;
-      // Only a line the estimator added may be reworded or re-quantified; a snapshotted bill
-      // line is evidence of what was asked and keeps its description, unit and quantity.
-      const own = l.added === true;
-      return {
-        ...l, rate: edit.rate, status: edit.status, note: edit.note,
-        ...(own ? { description: edit.description ?? l.description, quantity: edit.quantity, unit: edit.unit ?? l.unit } : {})
-      };
-    });
+    const stored = current.lines as SelfPricingLine[];
+    const bySeq = new Map(input.lines.filter((l) => l.seq != null).map((l) => [l.seq as number, l]));
+    let nextSeq = stored.reduce((m, l) => Math.max(m, l.seq), 0) + 1;
+
+    const merged: SelfPricingLine[] = [];
+    for (const l of stored) {
+      const edit = bySeq.get(l.seq);
+      if (!edit) {
+        if (!l.added) merged.push(l); // a bill line cannot be dropped, only an added one
+        continue;
+      }
+      merged.push({
+        ...l,
+        quantity: edit.quantity,
+        rate: edit.rate, status: edit.status, note: edit.note,
+        remarks: edit.remarks ?? null,
+        subcontractorRef: edit.subcontractorRef ?? l.subcontractorRef,
+        projectRef: edit.projectRef ?? l.projectRef,
+        ...(l.added
+          ? { description: edit.description?.trim() || l.description, unit: edit.unit ?? l.unit }
+          : {})
+      });
+    }
+    for (const l of input.lines.filter((x) => x.seq == null)) {
+      merged.push({
+        seq: nextSeq++, geCode: null, elementCode: null,
+        description: l.description?.trim() || 'New item', quantity: l.quantity,
+        measuredQuantity: null, unit: l.unit ?? null, isPriceable: true,
+        rate: l.rate, status: l.status, note: l.note, remarks: l.remarks ?? null,
+        subcontractorRef: l.subcontractorRef ?? null, projectRef: l.projectRef ?? null, added: true
+      });
+    }
+    merged.sort((a, b) => a.seq - b.seq);
+
     const [row] = await this.db.query<Row>(
       `UPDATE self_pricing_drafts
           SET programme_weeks = $3, qualifications = $4, exclusions = $5, lines = $6::jsonb,
-              updated_by = $7, updated_at = NOW()
-        WHERE workflow_id = $1 AND package_name = $2 RETURNING *`,
+              updated_by = $7, updated_at = NOW(), version = version + 1
+        WHERE workflow_id = $1 AND package_name = $2 AND version = $8 RETURNING *`,
       [workflowId, packageName, input.programmeWeeks, input.qualifications, input.exclusions,
-       JSON.stringify(merged), actor.userId]
+       JSON.stringify(merged), actor.userId, input.version]
     );
-    return row;
+    if (!row) throw conflict('This BoQ was changed elsewhere since you opened it. Reload to see the latest before editing.');
+    return this.shapeSelfPricing(row, current.tenderer_name as string);
   }
 
-  /** Promotes the draft into a tender return, which the quote comparison then reads like any other. */
-  async submitSelfPricing(actor: Actor, workflowId: string, packageName: string): Promise<Row> {
+  /**
+   * "Save as draft": the QS says this package is priced. Validates, records it as a tender
+   * return so the comparison and history see it, and stamps the hash that later edits are
+   * measured against. The BoQ stays editable; editing after this shows "changed since
+   * transfer", and calling this again re-transfers.
+   */
+  async completeSelfPricing(actor: Actor, workflowId: string, packageName: string): Promise<Row> {
     const draft = await this.getSelfPricing(actor, workflowId, packageName);
-    if (draft.submitted_at) throw conflict('This pricing has already been submitted.');
-    const lines = (draft.lines as Array<Record<string, any>>).map((l): Record<string, any> => ({
+    const lines = (draft.lines as SelfPricingLine[]).map((l) => ({
       ...l,
       total: l.rate != null && l.quantity != null ? Number(l.quantity) * Number(l.rate) : null
     }));
-    const unaddressed = lines.filter((l) => l.isPriceable && l.status === 'priced' && l.rate == null);
+    const unaddressed = lines.filter((l) => (l.isPriceable || l.added) && l.status === 'priced' && l.rate == null);
     if (unaddressed.length > 0) {
       throw conflict(`${unaddressed.length} priceable line(s) have no rate. Price them, or mark them included, excluded or not addressed.`);
+    }
+    const missingNote = lines.filter((l) =>
+      (l.status === 'excluded' && !l.note?.trim()) ||
+      (!l.added && l.quantity !== l.measuredQuantity && !l.remarks?.trim()));
+    if (missingNote.length > 0) {
+      throw conflict(`${missingNote.length} line(s) are excluded or have a changed quantity and need a note or remark saying why (first: line ${missingNote[0].seq}).`);
     }
     const tendererName = String(draft.tenderer_name);
     const tenderedSum = lines.filter((l) => l.status === 'priced' && l.total != null)
@@ -2345,20 +2490,22 @@ export class TenderPrepDatabase {
              FROM unnest($2::int[], $3::text[], $4::text[], $5::text[], $6::numeric[], $7::text[],
                          $8::numeric[], $9::numeric[], $10::text[], $11::text[], $12::boolean[])
                AS t(seq, ge, el, descr, qty, unit, rate, total, status, note, added)`,
-          [ret.id, lines.map((l) => l.seq), lines.map((l) => l.geCode ?? null),
-           lines.map((l) => l.elementCode ?? null), lines.map((l) => l.description),
-           lines.map((l) => l.quantity ?? null), lines.map((l) => l.unit ?? null),
-           lines.map((l) => l.rate ?? null), lines.map((l) => l.total),
-           lines.map((l) => l.status), lines.map((l) => l.note ?? null),
-           lines.map((l) => l.added === true)], client
+          [ret.id, lines.map((l) => l.seq), lines.map((l) => l.geCode),
+           lines.map((l) => l.elementCode), lines.map((l) => l.description),
+           lines.map((l) => l.quantity), lines.map((l) => l.unit),
+           lines.map((l) => l.rate), lines.map((l) => l.total),
+           lines.map((l) => l.status), lines.map((l) => l.note),
+           lines.map((l) => l.added)], client
         );
       }
       const [done] = await this.db.query<Row>(
-        `UPDATE self_pricing_drafts SET submitted_at = NOW(), tender_return_id = $3
+        `UPDATE self_pricing_drafts
+            SET status = 'complete', completed_at = NOW(), tender_return_id = $3,
+                transferred_at = NOW(), transferred_hash = $4, version = version + 1
           WHERE workflow_id = $1 AND package_name = $2 RETURNING *`,
-        [workflowId, packageName, ret.id], client
+        [workflowId, packageName, ret.id, this.selfPricingHash(draft.lines as SelfPricingLine[])], client
       );
-      return { ...done, tendered_sum: tenderedSum };
+      return { ...this.shapeSelfPricing(done, tendererName), tendered_sum: tenderedSum };
     });
   }
 

@@ -50,31 +50,58 @@ export interface SelfPricingLine {
   geCode: string | null;
   elementCode: string | null;
   description: string;
+  /** What the QS prices against. May differ from `measuredQuantity`, with a remark saying why. */
   quantity: number | null;
+  /** What the app measured. Null on a line the QS added. */
+  measuredQuantity: number | null;
   unit: string | null;
   isPriceable: boolean;
   rate: number | null;
   status: SelfPricingStatus;
   note: string | null;
+  remarks: string | null;
+  subcontractorRef: string | null;
+  projectRef: string | null;
   added: boolean;
 }
-/** The main contractor's own pricing of a self-priced package (BuildFlow issue #143). */
+/** The main contractor's own BoQ for a self-priced package (BuildFlow issues #143, #144). */
 export interface SelfPricing {
   workflow_id: string;
   package_name: string;
   tenderer_name: string;
+  /** Sent back with every save; a mismatch means another tab saved first. */
+  version: number;
+  status: 'in_progress' | 'complete';
   programme_weeks: number | null;
   qualifications: string | null;
   exclusions: string | null;
   lines: SelfPricingLine[];
-  submitted_at: string | null;
+  priceable_count: number;
+  addressed_count: number;
+  changed_since_transfer: boolean;
+  updated_at: string;
+  completed_at: string | null;
+}
+export type SelfPricingState = 'not_started' | 'in_progress' | 'complete' | 'changed_since_transfer';
+export interface SelfPricingIndexRow {
+  package_name: string;
+  package_seq: number | null;
+  state: SelfPricingState;
+  priceable_count: number;
+  addressed_count: number;
+  updated_at: string | null;
+  completed_at: string | null;
 }
 export interface SelfPricingSaveInput {
+  version: number;
   programmeWeeks: number | null;
   qualifications: string | null;
   exclusions: string | null;
   lines: Array<{
-    seq: number; quantity: number | null; rate: number | null; status: SelfPricingStatus; note: string | null;
+    /** Null for a line the QS has just added. */
+    seq: number | null; description?: string; unit?: string | null;
+    quantity: number | null; rate: number | null; status: SelfPricingStatus;
+    note: string | null; remarks: string | null;
   }>;
 }
 
@@ -1090,14 +1117,16 @@ export const api = {
   // The tender dashboard: the launch table plus what came back from each firm.
   getDashboard: (workflowId: string) =>
     request<DashboardRow[]>(`/api/tender-prep/${workflowId}/dashboard`),
+  listSelfPricing: (workflowId: string) =>
+    request<SelfPricingIndexRow[]>(`/api/tender-prep/${workflowId}/self-pricing`),
   getSelfPricing: (workflowId: string, packageName: string) =>
     request<SelfPricing>(`/api/tender-prep/${workflowId}/packages/${encodeURIComponent(packageName)}/self-pricing`),
-  saveSelfPricing: (workflowId: string, packageName: string, input: SelfPricingSaveInput) =>
+  saveSelfPricing: (workflowId: string, packageName: string, input: SelfPricingSaveInput, keepalive = false) =>
     request<SelfPricing>(`/api/tender-prep/${workflowId}/packages/${encodeURIComponent(packageName)}/self-pricing`,
-      { method: 'PUT', body: JSON.stringify(input) }),
-  submitSelfPricing: (workflowId: string, packageName: string) =>
+      { method: 'PUT', body: JSON.stringify(input), keepalive }),
+  completeSelfPricing: (workflowId: string, packageName: string) =>
     request<SelfPricing & { tendered_sum: number }>(
-      `/api/tender-prep/${workflowId}/packages/${encodeURIComponent(packageName)}/self-pricing/submit`, { method: 'POST' }),
+      `/api/tender-prep/${workflowId}/packages/${encodeURIComponent(packageName)}/self-pricing/complete`, { method: 'POST' }),
   savePackageSelection: (workflowId: string, input: {
     packageName: string;
     packageSeq?: number;
