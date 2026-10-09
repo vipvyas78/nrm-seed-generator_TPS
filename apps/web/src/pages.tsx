@@ -7,6 +7,7 @@ import { CommsModal } from './comms';
 import { NotificationBell } from './notifications';
 import { AddendaButton } from './addendum';
 import { QuoteComparisonPanel } from './quoteComparisonPanel';
+import { Step4SelfPricing } from './selfPricing';
 
 export function ErrorMessage({ error }: { error: unknown }) {
   return error ? <p className="error">{error instanceof Error ? error.message : 'Something went wrong'}</p> : null;
@@ -15,7 +16,7 @@ export function Busy({ children = 'Loading…' }: { children?: string }) { retur
 
 // Parsed Outputs, Employer RFIs and SoA RAG live in the take-off module, not here. A
 // completed take-off launches a workflow straight onto Tender Launch Pack.
-const STEP_TITLES = ['Tender Launch Pack', 'ITT Dispatch', 'Comparative Analysis', 'Tender Submission'];
+const STEP_TITLES = ['Tender Launch Pack', 'ITT Dispatch', 'Comparative Analysis', 'Self Pricing', 'Tender Submission'];
 const FINAL_STEP = STEP_TITLES.length;
 
 // ── AppShell ───────────────────────────────────────────────────────────────
@@ -230,7 +231,8 @@ export function TenderPrepPage() {
       {currentStep === 1 && <Step1TenderLaunchPack workflowId={workflowId} />}
       {currentStep === 2 && <Step2IttDispatch workflowId={workflowId} initialThreadId={deepLinkThreadId} openRfi={openRfi} />}
       {currentStep === 3 && <QuoteComparisonPanel workflowId={workflowId} />}
-      {currentStep === 4 && <Step4Submission workflowId={workflowId} />}
+      {currentStep === 4 && <Step4SelfPricing workflowId={workflowId} />}
+      {currentStep === 5 && <Step4Submission workflowId={workflowId} />}
     </section>
   </div>;
 }

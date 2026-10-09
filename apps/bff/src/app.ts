@@ -30,7 +30,7 @@ import { QuoteComparisonDatabase } from './quoteComparisonDb.js';
 import { QuoteQueriesDatabase } from './quoteQueriesDb.js';
 import { RfiDatabase } from './rfiDb.js';
 import { ScmsReadDatabase } from './scmsReadDb.js';
-import { ITT_FROM_ADDRESS, TenderPrepDatabase } from './tenderPrepDb.js';
+import { FINAL_STEP, ITT_FROM_ADDRESS, TenderPrepDatabase } from './tenderPrepDb.js';
 import { IttRemindersDatabase } from './ittRemindersDb.js';
 import { TENDER_RETURN_MAX, TENDER_RETURN_UNITS } from './tenderReturnPeriod.js';
 import type { Actor } from './types.js';
@@ -736,7 +736,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     // back to the Tender Launch Pack to revise a shortlist.
     protectedApi.post('/api/tender-prep/:workflowId/step', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));
-      const { step } = body(request, z.object({ step: z.number().int().min(1).max(4) }));
+      const { step } = body(request, z.object({ step: z.number().int().min(1).max(FINAL_STEP) }));
       return tpDb.setStep(requireActor(request), workflowId, step);
     });
 
@@ -998,31 +998,40 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
     // The packages that have an ITT, and the ITT itself. Assembly is server-side so the
     // screen, an export and a future email all render the same pack.
     const selfPricingParams = z.object({ workflowId: uuid, packageName: z.string().trim().min(1).max(200) });
+    protectedApi.get('/api/tender-prep/:workflowId/self-pricing', async (request) => {
+      const { workflowId } = params(request, z.object({ workflowId: uuid }));
+      return tpDb.listSelfPricing(requireActor(request), workflowId);
+    });
     protectedApi.get('/api/tender-prep/:workflowId/packages/:packageName/self-pricing', async (request) => {
       const { workflowId, packageName } = params(request, selfPricingParams);
       return tpDb.getSelfPricing(requireActor(request), workflowId, packageName);
     });
     protectedApi.put('/api/tender-prep/:workflowId/packages/:packageName/self-pricing', async (request) => {
       const { workflowId, packageName } = params(request, selfPricingParams);
+      const text = (max: number) => z.string().trim().max(max).nullable().optional().transform((v) => v ?? null);
       const input = body(request, z.object({
+        version: z.number().int().min(1),
         programmeWeeks: z.number().int().min(0).nullable().optional().transform((v) => v ?? null),
-        qualifications: z.string().trim().max(4000).nullable().optional().transform((v) => v ?? null),
-        exclusions: z.string().trim().max(4000).nullable().optional().transform((v) => v ?? null),
+        qualifications: text(4000),
+        exclusions: text(4000),
         lines: z.array(z.object({
-          seq: z.number().int().min(1),
-          description: z.string().trim().min(1).max(500).optional(),
-          quantity: z.number().nullable(),
+          seq: z.number().int().min(1).nullable(),
+          description: z.string().trim().max(500).optional(),
+          quantity: z.number().min(0).nullable(),
           unit: z.string().trim().max(50).nullable().optional(),
           rate: z.number().min(0).nullable(),
           status: z.enum(['priced', 'included', 'excluded', 'not_addressed']),
-          note: z.string().trim().max(2000).nullable()
+          note: text(2000),
+          remarks: text(2000),
+          subcontractorRef: text(200),
+          projectRef: text(200)
         })).max(5000)
       }));
       return tpDb.saveSelfPricing(requireActor(request), workflowId, packageName, input);
     });
-    protectedApi.post('/api/tender-prep/:workflowId/packages/:packageName/self-pricing/submit', async (request) => {
+    protectedApi.post('/api/tender-prep/:workflowId/packages/:packageName/self-pricing/complete', async (request) => {
       const { workflowId, packageName } = params(request, selfPricingParams);
-      return tpDb.submitSelfPricing(requireActor(request), workflowId, packageName);
+      return tpDb.completeSelfPricing(requireActor(request), workflowId, packageName);
     });
 
     protectedApi.get('/api/tender-prep/:workflowId/itts', async (request) => {
