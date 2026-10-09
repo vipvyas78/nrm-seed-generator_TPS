@@ -69,7 +69,7 @@ describe('self-priced packages', () => {
         ])]
       );
       const opened = await tpDb.getSelfPricing(actor, workflow.id, name);
-      expect(opened.lines[0].measuredQuantity).toBe(10); // back-filled from the snapshot
+      expect((opened.lines as Array<Record<string, any>>)[0].measuredQuantity).toBe(10); // back-filled from the snapshot
       expect(opened.addressed_count).toBe(0);
 
       // Completing with an unpriced line is refused.
@@ -83,10 +83,11 @@ describe('self-priced packages', () => {
           { seq: null, description: 'Extra scaffold', quantity: 1, unit: 'item', rate: 100, status: 'priced', note: null }
         ]
       });
-      expect(saved.lines).toHaveLength(2);
-      expect(saved.lines[0].description).toBe('Frame');   // a bill line's wording is fixed
-      expect(saved.lines[0].unit).toBe('m2');
-      expect(saved.lines[1].added).toBe(true);
+      const savedLines = saved.lines as Array<Record<string, any>>;
+      expect(savedLines).toHaveLength(2);
+      expect(savedLines[0].description).toBe('Frame');   // a bill line's wording is fixed
+      expect(savedLines[0].unit).toBe('m2');
+      expect(savedLines[1].added).toBe(true);
 
       // A second tab holding the old version is refused.
       await expect(tpDb.saveSelfPricing(actor, workflow.id, name, {
