@@ -113,6 +113,11 @@ export const ROUTE_ACCESS: Record<string, RouteAccess> = {
   // estimator row and keying in a manually-received return are all work; awarding the
   // package writes trade_analysis and the draft tender_boq_lines, which is the act that
   // leaves a mark on the firm's own bill — the same line the addenda/RFI approvals draw.
+  // Self-priced packages: the main contractor's own pricing form (issue #143). Saving is the
+  // estimator's daily work; submitting puts a bid into the comparison, so it is a sign-off.
+  'GET /api/tender-prep/:workflowId/packages/:packageName/self-pricing': 'read',
+  'PUT /api/tender-prep/:workflowId/packages/:packageName/self-pricing': 'ordinary',
+  'POST /api/tender-prep/:workflowId/packages/:packageName/self-pricing/submit': 'approval',
   'GET /api/tender-prep/:workflowId/quote-comparisons': 'read',
   'POST /api/tender-prep/:workflowId/quote-comparisons/:packageName/open': 'ordinary',
   'GET /api/tender-prep/:workflowId/quote-comparisons/:packageName': 'read',
