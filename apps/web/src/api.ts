@@ -44,6 +44,40 @@ export type TenderPrepWorkflow = {
  */
 export type RouteOfProcurement = string;
 
+export type SelfPricingStatus = 'priced' | 'included' | 'excluded' | 'not_addressed';
+export interface SelfPricingLine {
+  seq: number;
+  geCode: string | null;
+  elementCode: string | null;
+  description: string;
+  quantity: number | null;
+  unit: string | null;
+  isPriceable: boolean;
+  rate: number | null;
+  status: SelfPricingStatus;
+  note: string | null;
+  added: boolean;
+}
+/** The main contractor's own pricing of a self-priced package (BuildFlow issue #143). */
+export interface SelfPricing {
+  workflow_id: string;
+  package_name: string;
+  tenderer_name: string;
+  programme_weeks: number | null;
+  qualifications: string | null;
+  exclusions: string | null;
+  lines: SelfPricingLine[];
+  submitted_at: string | null;
+}
+export interface SelfPricingSaveInput {
+  programmeWeeks: number | null;
+  qualifications: string | null;
+  exclusions: string | null;
+  lines: Array<{
+    seq: number; quantity: number | null; rate: number | null; status: SelfPricingStatus; note: string | null;
+  }>;
+}
+
 /** One line of the client's agreed package breakdown, fixed at project configuration. */
 export type PackageConfig = {
   id: string;
@@ -70,6 +104,9 @@ export type LaunchTableRow = {
   /** The route in force — the launch choice where one was made, else the configured one. */
   route_of_procurement: RouteOfProcurement;
   route_options: string[];
+  /** Which of `route_options` mean the main contractor prices the package itself. */
+  self_priced_routes?: string[];
+  is_self_priced?: boolean;
   trade_terms: string[];
   /** Authored bill lines stranded on a heading — nobody has been asked to price them. */
   stranded_bill_lines: number;
@@ -175,6 +212,7 @@ export type IttSummary = {
   package_name: string;
   package_seq: number | null;
   route_of_procurement: string;
+  is_self_priced?: boolean;
   confirmed_at: string | null;
   recipients: number;
   /** Firms actually offered for this package, excluding the "nobody here" placeholder. With
@@ -1052,6 +1090,14 @@ export const api = {
   // The tender dashboard: the launch table plus what came back from each firm.
   getDashboard: (workflowId: string) =>
     request<DashboardRow[]>(`/api/tender-prep/${workflowId}/dashboard`),
+  getSelfPricing: (workflowId: string, packageName: string) =>
+    request<SelfPricing>(`/api/tender-prep/${workflowId}/packages/${encodeURIComponent(packageName)}/self-pricing`),
+  saveSelfPricing: (workflowId: string, packageName: string, input: SelfPricingSaveInput) =>
+    request<SelfPricing>(`/api/tender-prep/${workflowId}/packages/${encodeURIComponent(packageName)}/self-pricing`,
+      { method: 'PUT', body: JSON.stringify(input) }),
+  submitSelfPricing: (workflowId: string, packageName: string) =>
+    request<SelfPricing & { tendered_sum: number }>(
+      `/api/tender-prep/${workflowId}/packages/${encodeURIComponent(packageName)}/self-pricing/submit`, { method: 'POST' }),
   savePackageSelection: (workflowId: string, input: {
     packageName: string;
     packageSeq?: number;

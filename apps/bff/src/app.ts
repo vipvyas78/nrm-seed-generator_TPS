@@ -997,6 +997,34 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
 
     // The packages that have an ITT, and the ITT itself. Assembly is server-side so the
     // screen, an export and a future email all render the same pack.
+    const selfPricingParams = z.object({ workflowId: uuid, packageName: z.string().trim().min(1).max(200) });
+    protectedApi.get('/api/tender-prep/:workflowId/packages/:packageName/self-pricing', async (request) => {
+      const { workflowId, packageName } = params(request, selfPricingParams);
+      return tpDb.getSelfPricing(requireActor(request), workflowId, packageName);
+    });
+    protectedApi.put('/api/tender-prep/:workflowId/packages/:packageName/self-pricing', async (request) => {
+      const { workflowId, packageName } = params(request, selfPricingParams);
+      const input = body(request, z.object({
+        programmeWeeks: z.number().int().min(0).nullable().optional().transform((v) => v ?? null),
+        qualifications: z.string().trim().max(4000).nullable().optional().transform((v) => v ?? null),
+        exclusions: z.string().trim().max(4000).nullable().optional().transform((v) => v ?? null),
+        lines: z.array(z.object({
+          seq: z.number().int().min(1),
+          description: z.string().trim().min(1).max(500).optional(),
+          quantity: z.number().nullable(),
+          unit: z.string().trim().max(50).nullable().optional(),
+          rate: z.number().min(0).nullable(),
+          status: z.enum(['priced', 'included', 'excluded', 'not_addressed']),
+          note: z.string().trim().max(2000).nullable()
+        })).max(5000)
+      }));
+      return tpDb.saveSelfPricing(requireActor(request), workflowId, packageName, input);
+    });
+    protectedApi.post('/api/tender-prep/:workflowId/packages/:packageName/self-pricing/submit', async (request) => {
+      const { workflowId, packageName } = params(request, selfPricingParams);
+      return tpDb.submitSelfPricing(requireActor(request), workflowId, packageName);
+    });
+
     protectedApi.get('/api/tender-prep/:workflowId/itts', async (request) => {
       const { workflowId } = params(request, z.object({ workflowId: uuid }));
       return tpDb.listItts(requireActor(request), workflowId);
