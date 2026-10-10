@@ -59,11 +59,21 @@ export function clearStoredSessionToken(): void {
  * kept in THIS tab's sessionStorage, so it ends with the tab like the original does.
  */
 let pendingHandoff: Promise<string | undefined> | undefined;
+// Asked once per page load. With no BuildFlow tab to answer, every request would otherwise
+// wait out the timeout first; a tab that truly has no session ends at the 401 → /login
+// redirect in api.ts anyway, which is where signing in happens.
+let noBuildflowTabAnswered = false;
 function sessionFromBuildflow(): Promise<string | undefined> {
-  if (typeof BroadcastChannel === 'undefined' || !sharesOriginWithBuildflow()) return Promise.resolve(undefined);
+  if (noBuildflowTabAnswered || typeof BroadcastChannel === 'undefined' || !sharesOriginWithBuildflow()) {
+    return Promise.resolve(undefined);
+  }
   pendingHandoff ??= new Promise<string | undefined>((resolve) => {
     const channel = new BroadcastChannel('buildflow-session');
-    const done = (token?: string) => { clearTimeout(timer); channel.close(); pendingHandoff = undefined; resolve(token); };
+    const done = (token?: string) => {
+      clearTimeout(timer); channel.close(); pendingHandoff = undefined;
+      if (!token) noBuildflowTabAnswered = true;
+      resolve(token);
+    };
     const timer = setTimeout(() => done(undefined), 600);
     channel.onmessage = (event: MessageEvent) => {
       if (event.data?.type !== 'session' || typeof event.data.token !== 'string') return;
