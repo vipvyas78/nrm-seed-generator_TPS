@@ -34,10 +34,17 @@ services:
     # Picks up CLOUDFLARE_*/BUILDFLOW_*/DROPBOX_*/TEST_* optional integration vars from the
     # repo-root .env. `environment:` below still wins on any key collision, so the
     # container-network overrides (DATABASE_URL, etc.) are unaffected.
+    # Optional (issue #145): the local stack starts with no .env at all.
     env_file:
-      - ../../.env
+      - path: ../../.env
+        required: false
     environment:
       NODE_ENV: ${NODE_ENV:-development}
+      # Local mail goes to the parent stack's Mailpit (http://localhost:8025), so nothing
+      # reaches a real inbox and no Cloudflare token is needed. Export
+      # EMAIL_TRANSPORT=cloudflare (with the Cloudflare email keys in .env) to send for real.
+      EMAIL_TRANSPORT: ${EMAIL_TRANSPORT:-mailpit}
+      MAILPIT_URL: http://mailpit:8025
       PORT: "3200"
       DATABASE_URL: postgresql://buildflow:buildflow@postgres:5432/buildflow
       DATABASE_SCHEMA: ${DATABASE_SCHEMA:-tps}

@@ -1,0 +1,22 @@
+{
+  "name": "@tps/edge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TPS on Cloudflare: the Worker behind BuildFlow's /tps paths (static SPA + API routing) and the bff-tps and worker-tps containers. Outside the pnpm workspace (install with --ignore-workspace).",
+  "packageManager": "pnpm@10.18.0",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/render.test.mjs",
+    "render": "node render.mjs",
+    "deploy:dry": "node -e \"require('fs').mkdirSync('../../apps/web/dist',{recursive:true})\" && node render.mjs --env dev --account-id 00000000000000000000000000000000 --tag dry-run --out wrangler.dry.json && wrangler deploy --dry-run -c wrangler.dry.json --outdir dist"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261010.1",
+    "typescript": "^5.7.2",
+    "wrangler": "^4.149.0"
+  }
+}

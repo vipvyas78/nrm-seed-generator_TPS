@@ -24,7 +24,7 @@ import { BuildflowMepBoqClient } from './buildflowMepBoqClient.js';
 import { BuildflowSpecClauseClient } from './buildflowSpecClauseClient.js';
 import { BuildflowTenderPassagesClient } from './buildflowTenderPassagesClient.js';
 import { DropboxDocumentLinkProvider } from './documentLinkProvider.js';
-import { EmailService } from './emailService.js';
+import { createEmailService } from './emailService.js';
 import { PricingPortalDatabase } from './pricingPortalDb.js';
 import { QuoteComparisonDatabase } from './quoteComparisonDb.js';
 import { QuoteQueriesDatabase } from './quoteQueriesDb.js';
@@ -121,9 +121,7 @@ export async function createApp(config: Config): Promise<FastifyInstance> {
   const addendumDelta = config.BUILDFLOW_BASE_URL && config.BUILDFLOW_DOCUMENT_LINKS_TOKEN
     ? new BuildflowAddendumDeltaClient(config.BUILDFLOW_BASE_URL, config.BUILDFLOW_DOCUMENT_LINKS_TOKEN)
     : undefined;
-  const emailService = config.CLOUDFLARE_ACCOUNT_ID && config.CLOUDFLARE_EMAIL_TOKEN
-    ? new EmailService({ cloudflareAccountId: config.CLOUDFLARE_ACCOUNT_ID, cloudflareApiToken: config.CLOUDFLARE_EMAIL_TOKEN })
-    : undefined;
+  const emailService = createEmailService(config);
   const testEmailOverride = config.TEST_EMAIL_FLAG
     ? { from: config.TEST_FROM_EMAIL_ACCOUNT!, to: config.TEST_TO_EMAIL_ACCOUNT! }
     : null;

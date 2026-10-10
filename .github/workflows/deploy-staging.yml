@@ -1,0 +1,30 @@
+# An approved merge to main deploys TPS to staging (nrm-seed-generator#145).
+#
+# SWITCHED OFF until staging is provisioned: set the repository variable
+# STAGING_ENABLED=true to turn it on. Until then each merge records a skip notice.
+name: Deploy to staging
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  disabled:
+    if: ${{ vars.STAGING_ENABLED != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "::notice::Staging deploys are off (repository variable STAGING_ENABLED is not 'true'). ${{ github.sha }} was not deployed."
+
+  deploy:
+    if: ${{ vars.STAGING_ENABLED == 'true' }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: staging
+      ref: ${{ github.sha }}
+    secrets: inherit

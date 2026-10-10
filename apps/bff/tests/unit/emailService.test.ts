@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { EmailService } from '../../src/emailService.js';
+import { EmailService, createEmailService } from '../../src/emailService.js';
 
 vi.mock('cloudflare', () => ({
   default: vi.fn().mockImplementation(() => ({
@@ -91,5 +91,54 @@ describe('EmailService', () => {
     });
 
     expect(client.emailSending.send.mock.calls[0][0]).not.toHaveProperty('attachments');
+  });
+});
+
+describe('EmailService — Mailpit transport (issue #145, local stack)', () => {
+  it('posts the message to Mailpit and returns its id as message_id, as callers expect', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ID: 'mp-1' }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const service = new EmailService({ transport: 'mailpit', mailpitUrl: 'http://mailpit:8025/' });
+      const result = await service.send({
+        from: 'Tenders <tenders@novamerx.ai>', to: ['a@example.com'], cc: ['qs@novamerx.ai'], replyTo: 'jo@novamerx.ai',
+        subject: 'ITT', html: '<p>ITT</p>', text: 'ITT',
+        attachments: [{ content: 'YmFzZTY0', filename: 'boq.xlsx', type: 'application/octet-stream', disposition: 'attachment' }]
+      });
+      expect(result).toEqual({ message_id: 'mp-1' });
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe('http://mailpit:8025/api/v1/send');
+      expect(JSON.parse(init.body)).toEqual({
+        From: { Email: 'tenders@novamerx.ai', Name: 'Tenders' },
+        To: [{ Email: 'a@example.com' }],
+        Cc: [{ Email: 'qs@novamerx.ai' }],
+        ReplyTo: [{ Email: 'jo@novamerx.ai' }],
+        Subject: 'ITT', HTML: '<p>ITT</p>', Text: 'ITT',
+        Attachments: [{ Content: 'YmFzZTY0', Filename: 'boq.xlsx', ContentType: 'application/octet-stream' }]
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('fails the send when Mailpit refuses it, so the dispatch row records a failure', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('no', { status: 500 })));
+    try {
+      const service = new EmailService({ transport: 'mailpit', mailpitUrl: 'http://mailpit:8025' });
+      await expect(service.send({ from: 'a@b.c', to: 'd@e.f', subject: 's', html: 'h', text: 't' }))
+        .rejects.toThrow('Mailpit refused the message: HTTP 500');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('createEmailService', () => {
+  it('builds no sender without Cloudflare credentials, as before', () => {
+    expect(createEmailService({ EMAIL_TRANSPORT: 'cloudflare', MAILPIT_URL: 'http://mailpit:8025' })).toBeUndefined();
+  });
+
+  it('builds a Mailpit sender with no credentials at all', () => {
+    expect(createEmailService({ EMAIL_TRANSPORT: 'mailpit', MAILPIT_URL: 'http://mailpit:8025' })).toBeInstanceOf(EmailService);
   });
 });
