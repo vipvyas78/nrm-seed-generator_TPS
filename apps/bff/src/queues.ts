@@ -23,13 +23,17 @@ function actorFor(message: { requestedBy: string; organizationId: string; takeof
  * Mirrors BuildFlow's own redisConnection(). Both sides leave BullMQ's key prefix at its
  * default (`bull`) and Redis at db 0, which is what makes producer and consumer meet.
  */
-function redisConnection(config: WorkerConfig) {
+export function redisConnection(config: Pick<WorkerConfig, 'REDIS_URL'>) {
   const url = new URL(config.REDIS_URL);
   return {
     host: url.hostname,
     port: Number(url.port || 6379),
-    username: url.username || undefined,
-    password: url.password || undefined,
+    username: url.username ? decodeURIComponent(url.username) : undefined,
+    password: url.password ? decodeURIComponent(url.password) : undefined,
+    // `rediss://` is TLS (issue #145). Taking host and port apart dropped the scheme, so a
+    // managed Redis that only accepts TLS (Upstash) saw a plaintext handshake and the worker
+    // retried for ever in silence.
+    ...(url.protocol === 'rediss:' ? { tls: { servername: url.hostname } } : {}),
     maxRetriesPerRequest: null
   };
 }
@@ -59,7 +63,7 @@ export function startTakeoffCompletionWorker(config: WorkerConfig, tpDb: TenderP
   return new Worker(
     TAKEOFF_COMPLETION_QUEUE,
     (job) => handleTakeoffCompleted(job, tpDb),
-    { connection: redisConnection(config), concurrency: 1 }
+    { connection: redisConnection(config), concurrency: 1, drainDelay: config.BULLMQ_DRAIN_DELAY_SECONDS }
   );
 }
 
@@ -82,6 +86,6 @@ export function startTakeoffTenderWorker(config: WorkerConfig, tpDb: TenderPrepD
   return new Worker(
     TAKEOFF_TENDER_QUEUE,
     (job) => handleTakeoffTendered(job, tpDb),
-    { connection: redisConnection(config), concurrency: 1 }
+    { connection: redisConnection(config), concurrency: 1, drainDelay: config.BULLMQ_DRAIN_DELAY_SECONDS }
   );
 }

@@ -1,0 +1,177 @@
+# Deploy TPS to a cloud environment (nrm-seed-generator#145).
+#
+#   dev         manual, any branch (or nrm-seed-generator's "Deploy all to dev")
+#   staging     on push to main (deploy-staging.yml), once STAGING_ENABLED is on
+#   production  manual, from a tag, behind the environment's required reviewer
+#
+# THIS REPOSITORY IS PUBLIC. Nothing here runs on pull_request, so a fork can never reach
+# an environment's secrets, and nothing prints configuration. Secrets go from the GitHub
+# Environment straight to Cloudflare as secret bindings (`--secrets-file`, removed in the
+# same step).
+#
+# TPS deploys AFTER BuildFlow and the comms worker: server.ts asserts the `comms` schema
+# exists before serving.
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [dev, staging, production]
+        default: dev
+      ref:
+        description: Branch, tag or commit (dev accepts any branch; production a tag)
+        type: string
+        default: main
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      ref:
+        type: string
+        required: true
+
+concurrency:
+  group: deploy-tps-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Guard the environment
+        run: |
+          set -euo pipefail
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "::error::secret CLOUDFLARE_DEPLOY_TOKEN is not set in '$ENVIRONMENT'"; exit 1; }
+          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || { echo "::error::variable CLOUDFLARE_ACCOUNT_ID is not set in '$ENVIRONMENT'"; exit 1; }
+          SHA="$(git rev-parse HEAD)"
+          if [ "$ENVIRONMENT" = "production" ] && ! git describe --exact-match --tags "$SHA" >/dev/null 2>&1; then
+            echo "::error::production deploys a tagged commit only"; exit 1
+          fi
+          if [ "$ENVIRONMENT" != "dev" ]; then
+            git fetch -q origin main
+            git merge-base --is-ancestor "$SHA" origin/main || { echo "::error::$ENVIRONMENT deploys commits on main only"; exit 1; }
+          fi
+          echo "TAG=sha-${SHA:0:12}" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')/bff:sha-${SHA:0:12}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the bff image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/Dockerfile.bff
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha,scope=tps-bff
+          cache-to: type=gha,mode=max,scope=tps-bff
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install edge tooling
+        run: pnpm --dir infra/cloudflare install --ignore-workspace --frozen-lockfile
+
+      - name: Copy the image into the Cloudflare Registry
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE"
+          docker tag "$IMAGE" "tps-bff:$TAG"
+          pnpm --dir infra/cloudflare exec wrangler containers push "tps-bff:$TAG"
+
+      - name: Migrate the tps schema
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: docker run --rm -e DATABASE_URL -e DATABASE_SCHEMA=tps -w /app/apps/bff "$IMAGE" node dist/migrate.js
+
+      - name: Build the web app for this environment
+        run: |
+          set -euo pipefail
+          HOST="$(node -e "import('./infra/cloudflare/render.mjs').then(m => console.log(m.ENVIRONMENTS[process.argv[1]].host))" "$ENVIRONMENT")"
+          echo "HOST=$HOST" >> "$GITHUB_ENV"
+          pnpm install --frozen-lockfile
+          # Same-origin API path; the dev-auth bypass stays empty, so it is tree-shaken out.
+          VITE_API_URL=/tps-api VITE_MAIN_APP_URL="https://$HOST" pnpm --filter @tps/web build
+
+      - name: Render and deploy
+        working-directory: infra/cloudflare
+        env:
+          LOG_DESTINATION: ${{ vars.GRAFANA_LOG_DESTINATION }}
+          TEST_FROM_EMAIL_ACCOUNT: ${{ vars.TEST_FROM_EMAIL_ACCOUNT }}
+          TEST_TO_EMAIL_ACCOUNT: ${{ vars.TEST_TO_EMAIL_ACCOUNT }}
+          CF_ACCESS_TEAM_NAME: ${{ vars.CF_ACCESS_TEAM_NAME }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          TOKEN_ENCRYPTION_KEY: ${{ secrets.TOKEN_ENCRYPTION_KEY }}
+          BUILDFLOW_DOCUMENT_LINKS_TOKEN: ${{ secrets.BUILDFLOW_DOCUMENT_LINKS_TOKEN }}
+          BUILDFLOW_NOTIFICATIONS_TOKEN: ${{ secrets.BUILDFLOW_NOTIFICATIONS_TOKEN }}
+          WORKER_WAKE_TOKEN: ${{ secrets.WORKER_WAKE_TOKEN }}
+          INBOUND_EMAIL_TOKEN: ${{ secrets.INBOUND_EMAIL_TOKEN }}
+          INBOUND_EMAIL_SIGNING_SECRET: ${{ secrets.INBOUND_EMAIL_SIGNING_SECRET }}
+          SCHEDULED_TASKS_TOKEN: ${{ secrets.SCHEDULED_TASKS_TOKEN }}
+          SCHEDULED_TASKS_SIGNING_SECRET: ${{ secrets.SCHEDULED_TASKS_SIGNING_SECRET }}
+          CLOUDFLARE_EMAIL_TOKEN: ${{ secrets.CLOUDFLARE_EMAIL_TOKEN }}
+          CLOUDFLARE_ACCESS_TOKEN: ${{ secrets.CLOUDFLARE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          node render.mjs --env "$ENVIRONMENT" --account-id "$CLOUDFLARE_ACCOUNT_ID" --tag "$TAG" \
+            ${LOG_DESTINATION:+--log-destination "$LOG_DESTINATION"} \
+            --var "TEST_FROM_EMAIL_ACCOUNT=$TEST_FROM_EMAIL_ACCOUNT" --var "TEST_TO_EMAIL_ACCOUNT=$TEST_TO_EMAIL_ACCOUNT" \
+            --var "CF_ACCESS_TEAM_NAME=$CF_ACCESS_TEAM_NAME" --out wrangler.json
+          SECRETS_FILE="$RUNNER_TEMP/worker-secrets.json"
+          trap 'rm -f "$SECRETS_FILE"' EXIT
+          umask 077
+          python3 - "$SECRETS_FILE" <<'PY'
+          import json, os, sys
+          keys = ["DATABASE_URL", "REDIS_URL", "TOKEN_ENCRYPTION_KEY", "BUILDFLOW_DOCUMENT_LINKS_TOKEN",
+                  "BUILDFLOW_NOTIFICATIONS_TOKEN", "WORKER_WAKE_TOKEN", "INBOUND_EMAIL_TOKEN",
+                  "INBOUND_EMAIL_SIGNING_SECRET", "SCHEDULED_TASKS_TOKEN", "SCHEDULED_TASKS_SIGNING_SECRET",
+                  "CLOUDFLARE_EMAIL_TOKEN", "CLOUDFLARE_ACCESS_TOKEN"]
+          values = {k: os.environ[k] for k in keys if os.environ.get(k)}
+          with open(sys.argv[1], "w") as handle:
+              json.dump(values, handle)
+          print(f"{len(values)} secrets staged: {', '.join(sorted(values))}")
+          PY
+          pnpm exec wrangler deploy -c wrangler.json --secrets-file "$SECRETS_FILE" --message "$TAG by $GITHUB_ACTOR"
+
+      - name: Smoke test (through BuildFlow's origin)
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 36); do
+            if curl -fsS --max-time 20 "https://$HOST/tps-api/health" | grep -q '"status":"ok"'; then
+              echo "bff-tps healthy behind https://$HOST/tps-api"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::https://$HOST/tps-api/health did not answer ok (BuildFlow must be deployed to $ENVIRONMENT first)"
+          exit 1

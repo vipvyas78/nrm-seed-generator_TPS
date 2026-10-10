@@ -1,0 +1,21 @@
+# gitleaks configuration (issue #145): the default rules, plus the values that are
+# deliberately committed and are not secrets.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Committed local-only development defaults"
+# These appear in infra/docker/docker-compose.yml and .env.example on purpose: they protect
+# a database and an object store reachable only on a developer's own machine.
+# apps/bff/src/config.ts refuses every one of them when NODE_ENV=production.
+regexes = [
+  '''MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=''',
+  '''buildflow-minio-password''',
+  '''buildflow-(internal|tps|tps-notifications)-dev-token''',
+  '''tps-dev-token-key-32-chars-min''',
+]
+paths = [
+  '''(^|/)pnpm-lock\.yaml$''',
+  '''(^|/)poetry\.lock$''',
+  '''(^|/)\.terraform\.lock\.hcl$''',
+]
