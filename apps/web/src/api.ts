@@ -1,4 +1,4 @@
-import { accessToken } from './auth';
+import { accessToken, clearStoredSessionToken, loginUrl, sharesOriginWithBuildflow } from './auth';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -1079,6 +1079,13 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     if (import.meta.env.VITE_DEV_EMAIL) headers.set('x-buildflow-dev-email', import.meta.env.VITE_DEV_EMAIL);
   }
   const response = await fetch(`${baseUrl}${path}`, { ...init, headers });
+  if (response.status === 401 && sharesOriginWithBuildflow()) {
+    // No session in this tab: it was opened by URL or bookmark rather than from a BuildFlow
+    // link, so there was no opener to clone sessionStorage from. TPS has no login of its
+    // own — BuildFlow owns signing in — so send the person there and bring them back.
+    clearStoredSessionToken();
+    window.location.replace(loginUrl());
+  }
   if (!response.ok) {
     const detail = await response.json().catch(() => ({})) as { message?: string };
     throw new Error(detail.message ?? `Request failed (${response.status})`);

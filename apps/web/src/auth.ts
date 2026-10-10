@@ -45,10 +45,70 @@ export function storedSessionToken(): string | undefined {
 }
 
 export async function accessToken(): Promise<string | undefined> {
-  return storedSessionToken() ?? (await oidc?.getUser())?.access_token;
+  return storedSessionToken() ?? (await sessionFromBuildflow()) ?? (await oidc?.getUser())?.access_token;
+}
+
+export function clearStoredSessionToken(): void {
+  try { window.sessionStorage.removeItem(SESSION_TOKEN_KEY); } catch { /* nothing to clear */ }
+}
+
+/**
+ * Ask a signed-in BuildFlow tab for its session over a same-origin BroadcastChannel. The old
+ * route — inheriting sessionStorage through the opener — depends on browser rules (target=_blank
+ * is noopener by default, COOP severs openers) and a bookmark has no opener at all. The copy is
+ * kept in THIS tab's sessionStorage, so it ends with the tab like the original does.
+ */
+let pendingHandoff: Promise<string | undefined> | undefined;
+// Asked once per page load. With no BuildFlow tab to answer, every request would otherwise
+// wait out the timeout first; a tab that truly has no session ends at the 401 → /login
+// redirect in api.ts anyway, which is where signing in happens.
+let noBuildflowTabAnswered = false;
+function sessionFromBuildflow(): Promise<string | undefined> {
+  if (noBuildflowTabAnswered || typeof BroadcastChannel === 'undefined' || !sharesOriginWithBuildflow()) {
+    return Promise.resolve(undefined);
+  }
+  pendingHandoff ??= new Promise<string | undefined>((resolve) => {
+    const channel = new BroadcastChannel('buildflow-session');
+    const done = (token?: string) => {
+      clearTimeout(timer); channel.close(); pendingHandoff = undefined;
+      if (!token) noBuildflowTabAnswered = true;
+      resolve(token);
+    };
+    const timer = setTimeout(() => done(undefined), 600);
+    channel.onmessage = (event: MessageEvent) => {
+      if (event.data?.type !== 'session' || typeof event.data.token !== 'string') return;
+      try { window.sessionStorage.setItem(SESSION_TOKEN_KEY, event.data.token); } catch { /* held in memory only */ }
+      done(event.data.token);
+    };
+    channel.postMessage({ type: 'need-session' });
+  });
+  return pendingHandoff;
+}
+
+export function loginUrl(): string {
+  return `/login?next=${encodeURIComponent(window.location.pathname + window.location.search)}`;
+}
+
+// BuildFlow signed out in another tab: this tab's copy is dead, so leave rather than let the
+// next click fail with a bare 401.
+if (typeof BroadcastChannel !== 'undefined' && basePath === '/tps') {
+  const signedOut = new BroadcastChannel('buildflow-session');
+  signedOut.onmessage = (event: MessageEvent) => {
+    if (event.data?.type !== 'signed-out') return;
+    clearStoredSessionToken();
+    window.location.replace(loginUrl());
+  };
 }
 
 export async function signIn(): Promise<void> {
   if (!oidc) throw new Error('OIDC is not configured');
   await oidc.signinRedirect({ extraQueryParams: import.meta.env.VITE_OIDC_AUDIENCE ? { audience: import.meta.env.VITE_OIDC_AUDIENCE } : undefined });
+}
+
+/**
+ * True where TPS is mounted under /tps on BuildFlow's own origin, so BuildFlow's /login is
+ * reachable and its session would be visible here. On localhost (separate ports) it is not.
+ */
+export function sharesOriginWithBuildflow(): boolean {
+  return basePath === '/tps' && !(import.meta.env.VITE_DEV_SUBJECT && import.meta.env.VITE_DEV_ORGANIZATION);
 }
