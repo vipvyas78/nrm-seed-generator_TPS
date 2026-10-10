@@ -1,0 +1,37 @@
+# Refuse a commit that carries a secret (issue #145).
+#
+# A pull request is scanned over its own commits; a push to main over the commits it
+# brought in; a manual run over the whole history. Findings are redacted in the log —
+# printing the secret a scanner found would publish it a second time.
+name: Secret scan
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          RANGE=()
+          if [ "$EVENT" != "workflow_dispatch" ] && [ -n "$BASE" ] && [ "$BASE" != "0000000000000000000000000000000000000000" ]; then
+            RANGE=("--log-opts=$BASE..$HEAD")
+          fi
+          docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/gitleaks/gitleaks:v8.28.0 \
+            git --redact --no-banner --verbose --config /repo/.gitleaks.toml "${RANGE[@]}" .

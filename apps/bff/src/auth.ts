@@ -65,7 +65,9 @@ export function buildAuthenticator(config: Config, db: Database) {
     if (!header?.startsWith('Bearer ')) throw new AppError(401, 'Bearer token is required', 'UNAUTHENTICATED');
     const token = header.slice('Bearer '.length);
     try {
-      const { payload } = await jwtVerify(token, jwks!, { issuer: config.OIDC_ISSUER, audience: config.OIDC_AUDIENCE });
+      // No OIDC configured: a token that is not a local session verifies against nothing.
+      if (!jwks) throw new AppError(401, 'Token verification failed', 'INVALID_TOKEN');
+      const { payload } = await jwtVerify(token, jwks, { issuer: config.OIDC_ISSUER, audience: config.OIDC_AUDIENCE });
       const subject = payload.sub;
       const organization = stringClaim(payload, config.OIDC_ORGANIZATION_CLAIM);
       if (!subject || !organization) throw new AppError(401, 'Token is missing its subject or organization claim', 'INVALID_TOKEN');

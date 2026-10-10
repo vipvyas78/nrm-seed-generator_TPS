@@ -257,16 +257,39 @@ TPS's own tables are scoped as strictly as before. Every workflow, shortlist, IT
 
 ---
 
+## Cloud (dev / staging / production)
+
+TPS runs on Cloudflare behind BuildFlow's own Worker (nrm-seed-generator#145). It has no
+public route; BuildFlow's router hands it `/tps*` over a service binding, so both apps
+stay on one origin. The pieces:
+
+| | |
+|---|---|
+| `infra/cloudflare/` | the TPS Worker (SPA at `/tps`, API at `/tps-api`), and the `bff-tps` and `worker-tps` containers. `render.mjs` is the per-environment definition |
+| `.github/workflows/deploy.yml` | manual deploy; `production` takes a tag and a reviewer |
+| `.github/workflows/deploy-staging.yml` | every merge to `main` deploys to staging, **off until `STAGING_ENABLED=true`** |
+
+This repository is **public**, so no deploy runs on `pull_request` and no step prints
+configuration. Secrets come from the GitHub Environment (filled by
+[novamerx-infra](https://github.com/vipvyas78/novamerx-infra)'s `scripts/sync-env-secrets.sh`).
+The runbook is novamerx-infra's `docs/deployment.md`, and the secrets inventory is its
+`docs/secrets.md`.
+
+Locally, `make local-up` in novamerx-infra (or in the parent repo, which delegates to it)
+starts TPS with everything else. Mail
+goes to Mailpit (`EMAIL_TRANSPORT=mailpit`, http://localhost:8025) rather than Cloudflare.
+
 ## Deploying as containers
 
-### 1. Start the parent app first
+### 1. Start the shared infrastructure first
 
 ```bash
-# In the nrm-seed-generator directory
-docker compose up -d
+# In the novamerx-infra directory (vipvyas78/novamerx-infra)
+make infra-up
 ```
 
-This creates the `buildflow` network and the shared Postgres instance that TPS depends on.
+This creates the `buildflow` network and the shared Postgres and Redis that TPS depends on.
+The parent app's own containers are not needed for TPS to start.
 
 ### 2. Configure environment variables
 
@@ -519,11 +542,15 @@ Both repos provision actors through the issuer `buildflow-dev` and upsert on `(o
 | `WEB_ORIGIN` | Yes | `http://localhost:5175` | CORS allowed origin for the web container |
 | `PORT` | No | `3200` | BFF listen port |
 | `AUTH_DISABLED` | No | `false` | Set `true` in dev only — blocked in production |
-| `OIDC_ISSUER` | Prod | — | Required when `AUTH_DISABLED=false` |
-| `OIDC_AUDIENCE` | Prod | — | Required when `AUTH_DISABLED=false` |
-| `OIDC_JWKS_URI` | Prod | — | Required when `AUTH_DISABLED=false` |
+| `OIDC_ISSUER` | No | — | Optional: set all three or none. BuildFlow's local sessions need no OIDC (nrm-seed-generator#145) |
+| `OIDC_AUDIENCE` | No | — | Optional: set all three or none. BuildFlow's local sessions need no OIDC (nrm-seed-generator#145) |
+| `OIDC_JWKS_URI` | No | — | Optional: set all three or none. BuildFlow's local sessions need no OIDC (nrm-seed-generator#145) |
 | `SCMS_SCHEMA` | No | `scms` | Schema owned by the SCMS module, read (never written) for Step 1 shortlist candidates. Must be a bare SQL identifier. |
-| `REDIS_URL` | Worker | — | The parent platform's Redis. Required by `worker-tps`; unused by the API and migrator. |
+| `REDIS_URL` | Worker | — | The shared Redis (novamerx-infra's `redis`, BuildFlow's queues use it too). Required by `worker-tps`; unused by the API and migrator. |
+| `EMAIL_TRANSPORT` | No | `cloudflare` | `mailpit` sends every message to the local stack's Mailpit inbox (the local compose default). Refused in production |
+| `MAILPIT_URL` | No | `http://mailpit:8025` | Mailpit's HTTP API, used only with `EMAIL_TRANSPORT=mailpit` |
+| `BULLMQ_DRAIN_DELAY_SECONDS` | No | `5` | Worker: how long an idle BullMQ worker blocks on Redis between asks. Raised in the cloud, where each ask is a billed command |
+| `WORKER_HTTP_PORT` | No | — | Worker: serve `GET /internal/busy` here, so the container platform can tell an idle worker from a busy one before stopping it |
 | `BUILDFLOW_BASE_URL` | No | — | BuildFlow's BFF as reachable from this container — `http://bff:3000` on the shared network, **not** localhost. Enables emailed document links and spec-clause text. |
 | `BUILDFLOW_DOCUMENT_LINKS_TOKEN` | No | — | Shared secret for both BuildFlow internal routes. **Must equal `TPS_INTERNAL_TOKEN` on the BuildFlow side** (compose default `buildflow-tps-dev-token`) or every call 401s. Unset, the ITT still sends and says so in its review notes. |
 | `ENGINE_INTERNAL_URL` | No | — | Internal URL of the Python API |

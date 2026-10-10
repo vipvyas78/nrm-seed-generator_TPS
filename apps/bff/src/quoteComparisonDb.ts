@@ -333,7 +333,7 @@ export class QuoteComparisonDatabase {
     const rows = await this.db.query<Row>(
       `SELECT sl.package_name,
               qc.id AS comparison_id, qc.opened_at,
-              (SELECT COUNT(*)::int FROM shortlist_entries se WHERE se.shortlist_id = sl.id AND se.selected) AS expected_count,
+              (CASE WHEN sl.is_self_priced THEN 1 ELSE (SELECT COUNT(*)::int FROM shortlist_entries se WHERE se.shortlist_id = sl.id AND se.selected) END) AS expected_count,
               (SELECT COUNT(*)::int FROM tender_returns tr WHERE tr.workflow_id = sl.workflow_id AND tr.package_name = sl.package_name) AS received_count,
               ${knownReturnDeadlineSql('sl', 'ld')} AS return_deadline
          FROM shortlists sl
@@ -591,7 +591,8 @@ export class QuoteComparisonDatabase {
 
   private async updateReadiness(client: PoolClient, comparisonId: string, workflowId: string, packageName: string): Promise<void> {
     const [counts] = await this.db.query<Row>(
-      `SELECT (SELECT COUNT(*)::int FROM shortlists sl JOIN shortlist_entries se ON se.shortlist_id = sl.id AND se.selected
+      `SELECT (SELECT CASE WHEN bool_or(sl.is_self_priced) THEN 1 ELSE COUNT(se.id)::int END
+                 FROM shortlists sl LEFT JOIN shortlist_entries se ON se.shortlist_id = sl.id AND se.selected
                 WHERE sl.workflow_id = $1 AND sl.package_name = $2) AS expected_count,
               (SELECT COUNT(*)::int FROM tender_returns tr WHERE tr.workflow_id = $1 AND tr.package_name = $2) AS received_count,
               ${knownReturnDeadlineSql('sl', 'ld')} AS return_deadline

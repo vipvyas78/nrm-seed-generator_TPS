@@ -35,6 +35,11 @@ const schema = z.object({
   // deployment without these configured should not fail to boot.
   CLOUDFLARE_ACCOUNT_ID: z.string().optional(),
   CLOUDFLARE_EMAIL_TOKEN: z.string().optional(),
+  // Issue #145: `mailpit` sends every message to the local stack's Mailpit inbox instead.
+  // The default stays `cloudflare`, so no deployment changes behaviour by omission; the
+  // local compose file sets mailpit. Refused in production below.
+  EMAIL_TRANSPORT: z.enum(['cloudflare', 'mailpit']).default('cloudflare'),
+  MAILPIT_URL: z.string().url().default('http://mailpit:8025'),
   // Resolves ITT document filenames to shareable links. Optional: without it, ITT
   // documents still list, just with no link.
   DROPBOX_ACCESS_TOKEN: z.string().optional(),
@@ -120,6 +125,15 @@ const schema = z.object({
 
 export type Config = z.infer<typeof schema>;
 
+/** Values the docker-compose files commit as dev defaults (here and in the parent repo).
+ *  A production deployment presenting one has no secret at all (issue #145). */
+const DEV_DEFAULT_SECRETS: ReadonlyArray<readonly [keyof Config, string]> = [
+  ['TOKEN_ENCRYPTION_KEY', 'tps-dev-token-key-32-chars-min'],
+  ['BUILDFLOW_NOTIFICATIONS_TOKEN', 'buildflow-tps-notifications-dev-token'],
+  ['BUILDFLOW_DOCUMENT_LINKS_TOKEN', 'buildflow-tps-dev-token'],
+  ['ENGINE_INTERNAL_TOKEN', 'buildflow-internal-dev-token']
+];
+
 /**
  * The worker's own config.
  *
@@ -134,7 +148,12 @@ const workerSchema = z.object({
   DATABASE_SCHEMA: z.string().regex(/^[a-z_][a-z0-9_]*$/, 'DATABASE_SCHEMA must be a bare SQL identifier').default('tps'),
   SCMS_SCHEMA: z.string().regex(/^[a-z_][a-z0-9_]*$/, 'SCMS_SCHEMA must be a bare SQL identifier').default('scms'),
   REDIS_URL: z.string().min(1),
-  LOG_LEVEL: z.string().default('info')
+  LOG_LEVEL: z.string().default('info'),
+  // Issue #145, the same knobs BuildFlow's worker has: how long an idle BullMQ worker blocks
+  // on Redis between asks (each is a billed command on serverless Redis), and the port for
+  // GET /internal/busy, which the container platform asks before stopping this worker.
+  BULLMQ_DRAIN_DELAY_SECONDS: z.coerce.number().int().positive().default(5),
+  WORKER_HTTP_PORT: z.coerce.number().int().positive().optional()
 });
 
 export type WorkerConfig = z.infer<typeof workerSchema>;
@@ -145,8 +164,20 @@ export function loadWorkerConfig(input: NodeJS.ProcessEnv = process.env): Worker
 
 export function loadConfig(input: NodeJS.ProcessEnv = process.env): Config {
   const config = schema.parse(input);
-  if (!config.AUTH_DISABLED && (!config.OIDC_ISSUER || !config.OIDC_AUDIENCE || !config.OIDC_JWKS_URI)) {
-    throw new Error('OIDC_ISSUER, OIDC_AUDIENCE, and OIDC_JWKS_URI are required when authentication is enabled');
+  // OIDC is optional: TPS verifies BuildFlow's local sessions (issue #37) without it, and
+  // requiring it meant a local-accounts-only deployment could not boot (issue #145).
+  const oidcSet = [config.OIDC_ISSUER, config.OIDC_AUDIENCE, config.OIDC_JWKS_URI].filter(Boolean).length;
+  if (oidcSet !== 0 && oidcSet !== 3) {
+    throw new Error('OIDC_ISSUER, OIDC_AUDIENCE, and OIDC_JWKS_URI must be set together or not at all');
+  }
+  if (config.NODE_ENV === 'production') {
+    const reused = DEV_DEFAULT_SECRETS.filter(([key, value]) => config[key] === value).map(([key]) => key);
+    if (reused.length > 0) {
+      throw new Error(`${reused.join(', ')} must not use the committed development default in production`);
+    }
+    if (config.EMAIL_TRANSPORT === 'mailpit') {
+      throw new Error("EMAIL_TRANSPORT=mailpit is the local stack's inbox and must not be used in production");
+    }
   }
   if (config.TEST_EMAIL_FLAG && (!config.TEST_FROM_EMAIL_ACCOUNT || !config.TEST_TO_EMAIL_ACCOUNT)) {
     throw new Error('TEST_FROM_EMAIL_ACCOUNT and TEST_TO_EMAIL_ACCOUNT are required when TEST_EMAIL_FLAG=Y');

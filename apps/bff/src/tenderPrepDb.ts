@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { renderAddendumEmail, summariseChanges, type AddendumEmailContext } from './addendumEmail.js';
 import type { Attribution, BoqReadDatabase } from './boqReadDb.js';
 import type { BuildflowCommsAttachmentsClient } from './buildflowCommsAttachmentsClient.js';
@@ -182,6 +182,29 @@ function attributionFor(pkg: Row): Attribution {
     // its attribution has not been set. That is the honest answer, and a QS can see it.
     trade_terms: []
   };
+}
+
+/** The wizard's last step. Self Pricing is step 4, Tender Submission step 5 (migration 034). */
+export const FINAL_STEP = 5;
+
+/** One row of a self-priced package's BoQ — see normaliseSelfPricingLines. */
+export interface SelfPricingLine {
+  seq: number;
+  geCode: string | null;
+  elementCode: string | null;
+  description: string;
+  quantity: number | null;
+  /** What the app measured. Null on a line the QS added. Never edited. */
+  measuredQuantity: number | null;
+  unit: string | null;
+  isPriceable: boolean;
+  rate: number | null;
+  status: 'priced' | 'included' | 'excluded' | 'not_addressed';
+  note: string | null;
+  remarks: string | null;
+  subcontractorRef: string | null;
+  projectRef: string | null;
+  added: boolean;
 }
 
 /**
@@ -1397,7 +1420,7 @@ export class TenderPrepDatabase {
       [workflowId, actor.organizationId]
     );
     if (wf.locked_at) throw conflict('Workflow is locked');
-    if (Number(wf.current_step) >= 4) throw conflict('Already at final step');
+    if (Number(wf.current_step) >= FINAL_STEP) throw conflict('Already at final step');
     return this.db.one(
       `UPDATE workflows SET current_step = current_step + 1, updated_at = NOW() WHERE id = $1 RETURNING *`,
       [workflowId]
@@ -1520,6 +1543,15 @@ export class TenderPrepDatabase {
         `INSERT INTO route_options (organization_id, label, sort_order) VALUES ($1, $2, 10)
          ON CONFLICT (organization_id, label) DO NOTHING`,
         [actor.organizationId, defaultRoute]
+      );
+      // The self-priced route is offered to every organisation, including ones created after
+      // migration 033 seeded the existing ones. Keyed on the flag, never the label.
+      await client.query(
+        `INSERT INTO route_options (organization_id, label, sort_order, is_self_priced)
+         SELECT $1, 'Self priced', 90, TRUE
+          WHERE NOT EXISTS (SELECT 1 FROM route_options WHERE organization_id = $1 AND is_self_priced)
+         ON CONFLICT (organization_id, label) DO NOTHING`,
+        [actor.organizationId]
       );
 
       // The rule, in SQL, over the parent's public schema. `strictness` ranks the conditions
@@ -1719,7 +1751,7 @@ export class TenderPrepDatabase {
   /** Routes offered in the picker, in the client's own wording. */
   async listRouteOptions(actor: Actor): Promise<Row[]> {
     return this.db.query(
-      `SELECT label FROM route_options WHERE organization_id = $1 AND is_active ORDER BY sort_order, label`,
+      `SELECT label, is_self_priced FROM route_options WHERE organization_id = $1 AND is_active ORDER BY sort_order, label`,
       [actor.organizationId]
     );
   }
@@ -1817,15 +1849,21 @@ export class TenderPrepDatabase {
          FROM shortlists WHERE workflow_id = $1`,
       [workflowId]
     );
-    const routeOptions = (await this.listRouteOptions(actor)).map((r) => String(r.label));
+    const routeRows = await this.listRouteOptions(actor);
+    const routeOptions = routeRows.map((r) => String(r.label));
+    const selfPricedRoutes = new Set(routeRows.filter((r) => r.is_self_priced).map((r) => String(r.label)));
 
     return Promise.all(packages.map(async (pkg) => {
       const terms = (pkg.trade_terms as string[] | null) ?? [];
+      const shortlist = shortlists.find((s) => s.package_name === pkg.name);
+      // Self priced: the main contractor prices it, so there is nobody to invite and the SCMS
+      // search (and its "no supply chain" placeholder) would only be noise.
+      const chosenRoute = shortlist?.route_of_procurement ?? pkg.route_of_procurement;
+      const isSelfPriced = !pkg.is_heading && selfPricedRoutes.has(String(chosenRoute ?? ''));
       // A heading is not tendered — its breakdown is — so no candidates are fetched for it.
-      const suggested = pkg.is_heading
+      const suggested = (pkg.is_heading || isSelfPriced)
         ? []
         : await this.scms.getCandidatesForPackage(terms.length ? terms : [String(pkg.name)], perPackage);
-      const shortlist = shortlists.find((s) => s.package_name === pkg.name);
       // An authored bill on a package that has since been broken down is stranded: the
       // heading is not tendered, so nobody is asked to price those lines. Which line belongs
       // to which sub-package is a commercial decision, so this is surfaced rather than guessed.
@@ -1845,7 +1883,7 @@ export class TenderPrepDatabase {
       // yet, not an error. Surfacing a named placeholder makes that visible on the tender
       // launch table instead of an empty cell that reads like a bug. It is deliberately not
       // selectable: it has no register entry, so it cannot be shortlisted or issued an ITT.
-      const withPlaceholder = (!pkg.is_heading && suggested.length === 0)
+      const withPlaceholder = (!pkg.is_heading && !isSelfPriced && suggested.length === 0)
         ? [{
             subcontractor_id: PLACEHOLDER_SUBCONTRACTOR_ID,
             name: 'Rancon Group',
@@ -1876,6 +1914,8 @@ export class TenderPrepDatabase {
         configured_route: pkg.route_of_procurement,
         route_of_procurement: shortlist?.route_of_procurement ?? pkg.route_of_procurement,
         route_options: routeOptions,
+        self_priced_routes: [...selfPricedRoutes],
+        is_self_priced: isSelfPriced,
         trade_terms: terms,
         stranded_bill_lines: strandedBill,
         // Present only on a row derived from a released take-off. Step 1 uses the condition
@@ -2142,28 +2182,36 @@ export class TenderPrepDatabase {
     }>;
   }): Promise<Row> {
     await this.assertWorkflowAccess(actor, workflowId);
+    // The flag is read off the route option NOW and stored on the shortlist, so renaming or
+    // retiring the route later cannot change what this tender decided.
+    const selfPriced = input.routeOfProcurement
+      ? (await this.listRouteOptions(actor)).some(
+          (r) => r.is_self_priced && String(r.label) === input.routeOfProcurement)
+      : false;
     return this.db.transaction(async (client) => {
       // tender_return_deadline is deliberately absent from both the column list and the
       // DO UPDATE SET. Re-confirming a shortlist must not move a date already issued — only
       // stampTenderReturnDeadlines writes that column, and only where it is still NULL.
       const shortlist = await this.db.one(
         `INSERT INTO shortlists (workflow_id, package_name, package_seq, route_of_procurement, confirmed_at, board_override_notes,
-                                 tender_return_period_value, tender_return_period_unit)
-         VALUES ($1,$2,$3,$4,NOW(),$5,$6,$7)
+                                 tender_return_period_value, tender_return_period_unit, is_self_priced)
+         VALUES ($1,$2,$3,$4,NOW(),$5,$6,$7,$8)
          ON CONFLICT (workflow_id, package_name) DO UPDATE SET
            package_seq = EXCLUDED.package_seq,
            route_of_procurement = EXCLUDED.route_of_procurement,
            confirmed_at = NOW(),
            board_override_notes = EXCLUDED.board_override_notes,
            tender_return_period_value = EXCLUDED.tender_return_period_value,
-           tender_return_period_unit = EXCLUDED.tender_return_period_unit
+           tender_return_period_unit = EXCLUDED.tender_return_period_unit,
+           is_self_priced = EXCLUDED.is_self_priced
          RETURNING *`,
         [workflowId, input.packageName, input.packageSeq ?? null,
          input.routeOfProcurement ?? null, input.boardOverrideNotes ?? null,
-         input.tenderReturnPeriod?.value ?? null, input.tenderReturnPeriod?.unit ?? null], client
+         input.tenderReturnPeriod?.value ?? null, input.tenderReturnPeriod?.unit ?? null, selfPriced], client
       );
       await client.query(`DELETE FROM shortlist_entries WHERE shortlist_id = $1`, [shortlist.id]);
-      for (const entry of input.entries) {
+      // Nobody is invited to a self-priced package, whatever the client sent.
+      for (const entry of selfPriced ? [] : input.entries) {
         await client.query(
           `INSERT INTO shortlist_entries
              (shortlist_id, subcontractor_id, rank, performance_score, compliance_flags,
@@ -2202,12 +2250,283 @@ export class TenderPrepDatabase {
    * The placeholder firm is excluded from `candidates` for exactly that reason: it is an
    * affordance saying "nobody here", not a firm somebody declined to pick.
    */
+  // ── Self-priced packages: the main contractor's own BoQ (issues #143, #144) ──────────
+
+  private async assertSelfPriced(workflowId: string, packageName: string): Promise<void> {
+    const [row] = await this.db.query<{ is_self_priced: boolean }>(
+      `SELECT is_self_priced FROM shortlists WHERE workflow_id = $1 AND package_name = $2`,
+      [workflowId, packageName]
+    );
+    if (!row?.is_self_priced) {
+      throw conflict('This package is not self priced. Choose the Self priced route at the Tender Launch Pack step first.');
+    }
+  }
+
+  /**
+   * One line per package row. `measuredQuantity` is what the app measured and never changes;
+   * `quantity` is what the QS prices against, so a disagreement with the measurement is on the
+   * record rather than silently overwritten. Drafts written before #144 carry no
+   * `measuredQuantity`, so it is filled from the quantity they were snapshotted with.
+   */
+  private normaliseSelfPricingLines(raw: unknown): SelfPricingLine[] {
+    return (Array.isArray(raw) ? raw : []).map((l: Record<string, any>) => ({
+      seq: Number(l.seq),
+      geCode: l.geCode ?? null,
+      elementCode: l.elementCode ?? null,
+      description: String(l.description ?? ''),
+      quantity: l.quantity ?? null,
+      measuredQuantity: l.added === true ? null : (l.measuredQuantity ?? l.quantity ?? null),
+      unit: l.unit ?? null,
+      isPriceable: l.isPriceable !== false,
+      rate: l.rate ?? null,
+      status: l.status ?? 'priced',
+      note: l.note ?? null,
+      remarks: l.remarks ?? null,
+      subcontractorRef: l.subcontractorRef ?? null,
+      projectRef: l.projectRef ?? null,
+      added: l.added === true
+    }));
+  }
+
+  private selfPricingProgress(lines: SelfPricingLine[]): { priceable: number; addressed: number } {
+    const priceable = lines.filter((l) => l.isPriceable || l.added);
+    return {
+      priceable: priceable.length,
+      // Addressed = priced with a rate, or given an explicit status (included, excluded, ...).
+      addressed: priceable.filter((l) => l.status !== 'priced' || l.rate != null).length
+    };
+  }
+
+  private selfPricingHash(lines: SelfPricingLine[]): string {
+    const figures = lines.map((l) => [l.seq, l.description, l.quantity, l.unit, l.rate, l.status, l.note]);
+    return createHash('sha256').update(JSON.stringify(figures)).digest('hex');
+  }
+
+  private shapeSelfPricing(draft: Row, tendererName?: string): Row {
+    const lines = this.normaliseSelfPricingLines(draft.lines);
+    const progress = this.selfPricingProgress(lines);
+    const changed = draft.transferred_hash != null && draft.transferred_hash !== this.selfPricingHash(lines);
+    return {
+      ...draft,
+      lines,
+      ...(tendererName ? { tenderer_name: tendererName } : {}),
+      priceable_count: progress.priceable,
+      addressed_count: progress.addressed,
+      changed_since_transfer: changed
+    };
+  }
+
+  /**
+   * The bill to price, plus whatever has been saved so far. The lines are snapshotted from the
+   * ITT assembly the first time the BoQ opens, so a take-off re-run cannot change the bill
+   * under the estimator who is part-way through pricing it.
+   */
+  async getSelfPricing(actor: Actor, workflowId: string, packageName: string): Promise<Row> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    await this.assertSelfPriced(workflowId, packageName);
+    let [draft] = await this.db.query<Row>(
+      `SELECT * FROM self_pricing_drafts WHERE workflow_id = $1 AND package_name = $2`,
+      [workflowId, packageName]
+    );
+    if (!draft) {
+      const { emailPack } = await this.assemblePackageForEmail(actor, workflowId, packageName, [], null);
+      const lines = linesFromEmailPack(emailPack).map((l, i) => ({
+        seq: i + 1, ...l, measuredQuantity: l.quantity, rate: null as number | null,
+        status: 'priced', note: null as string | null, remarks: null, subcontractorRef: null,
+        projectRef: null, added: false
+      }));
+      [draft] = await this.db.query<Row>(
+        `INSERT INTO self_pricing_drafts (workflow_id, package_name, lines, updated_by)
+         VALUES ($1,$2,$3::jsonb,$4)
+         ON CONFLICT (workflow_id, package_name) DO UPDATE SET package_name = EXCLUDED.package_name
+         RETURNING *`,
+        [workflowId, packageName, JSON.stringify(lines), actor.userId]
+      );
+    }
+    return this.shapeSelfPricing(draft, await this.organizationName(actor));
+  }
+
+  /** Step 4's index: every self-priced package, how far through it the QS is. */
+  async listSelfPricing(actor: Actor, workflowId: string): Promise<Row[]> {
+    await this.assertWorkflowAccess(actor, workflowId);
+    const packages = await this.db.query<Row>(
+      `SELECT sl.package_name, sl.package_seq, d.lines, d.status, d.updated_at, d.completed_at, d.transferred_hash
+         FROM shortlists sl
+         LEFT JOIN self_pricing_drafts d ON d.workflow_id = sl.workflow_id AND d.package_name = sl.package_name
+        WHERE sl.workflow_id = $1 AND sl.is_self_priced
+        ORDER BY sl.package_seq NULLS LAST, sl.package_name`,
+      [workflowId]
+    );
+    return packages.map((p) => {
+      if (!p.lines) {
+        return { package_name: p.package_name, package_seq: p.package_seq, state: 'not_started',
+                 priceable_count: 0, addressed_count: 0, updated_at: null, completed_at: null };
+      }
+      const shaped = this.shapeSelfPricing(p);
+      const state = p.status === 'complete'
+        ? (shaped.changed_since_transfer ? 'changed_since_transfer' : 'complete')
+        : 'in_progress';
+      return { package_name: p.package_name, package_seq: p.package_seq, state,
+               priceable_count: shaped.priceable_count, addressed_count: shaped.addressed_count,
+               updated_at: p.updated_at, completed_at: p.completed_at };
+    });
+  }
+
+  /**
+   * Autosave. Takes the whole editable state and replaces it, guarded by `version` so a second
+   * tab (or a retry that overtook its predecessor) cannot silently overwrite newer work.
+   *
+   * What may change: a rate, status, note and remarks on any line; a quantity on any line (the
+   * measurement stays beside it); everything on a line the QS added. A bill line's description
+   * and unit are evidence of what was asked and are fixed. A line the QS added and then dropped
+   * from the payload is deleted; a bill line absent from the payload is kept.
+   */
+  async saveSelfPricing(actor: Actor, workflowId: string, packageName: string, input: {
+    version: number;
+    programmeWeeks: number | null; qualifications: string | null; exclusions: string | null;
+    lines: Array<{
+      seq: number | null; description?: string; quantity: number | null; unit?: string | null;
+      rate: number | null; status: SelfPricingLine['status'];
+      note: string | null; remarks?: string | null;
+      subcontractorRef?: string | null; projectRef?: string | null;
+    }>;
+  }): Promise<Row> {
+    const current = await this.getSelfPricing(actor, workflowId, packageName);
+    if (Number(current.version) !== input.version) {
+      throw conflict('This BoQ was changed elsewhere since you opened it. Reload to see the latest before editing.');
+    }
+    const stored = current.lines as SelfPricingLine[];
+    const bySeq = new Map(input.lines.filter((l) => l.seq != null).map((l) => [l.seq as number, l]));
+    let nextSeq = stored.reduce((m, l) => Math.max(m, l.seq), 0) + 1;
+
+    const merged: SelfPricingLine[] = [];
+    for (const l of stored) {
+      const edit = bySeq.get(l.seq);
+      if (!edit) {
+        if (!l.added) merged.push(l); // a bill line cannot be dropped, only an added one
+        continue;
+      }
+      merged.push({
+        ...l,
+        quantity: edit.quantity,
+        rate: edit.rate, status: edit.status, note: edit.note,
+        remarks: edit.remarks ?? null,
+        subcontractorRef: edit.subcontractorRef ?? l.subcontractorRef,
+        projectRef: edit.projectRef ?? l.projectRef,
+        ...(l.added
+          ? { description: edit.description?.trim() || l.description, unit: edit.unit ?? l.unit }
+          : {})
+      });
+    }
+    for (const l of input.lines.filter((x) => x.seq == null)) {
+      merged.push({
+        seq: nextSeq++, geCode: null, elementCode: null,
+        description: l.description?.trim() || 'New item', quantity: l.quantity,
+        measuredQuantity: null, unit: l.unit ?? null, isPriceable: true,
+        rate: l.rate, status: l.status, note: l.note, remarks: l.remarks ?? null,
+        subcontractorRef: l.subcontractorRef ?? null, projectRef: l.projectRef ?? null, added: true
+      });
+    }
+    merged.sort((a, b) => a.seq - b.seq);
+
+    const [row] = await this.db.query<Row>(
+      `UPDATE self_pricing_drafts
+          SET programme_weeks = $3, qualifications = $4, exclusions = $5, lines = $6::jsonb,
+              updated_by = $7, updated_at = NOW(), version = version + 1
+        WHERE workflow_id = $1 AND package_name = $2 AND version = $8 RETURNING *`,
+      [workflowId, packageName, input.programmeWeeks, input.qualifications, input.exclusions,
+       JSON.stringify(merged), actor.userId, input.version]
+    );
+    if (!row) throw conflict('This BoQ was changed elsewhere since you opened it. Reload to see the latest before editing.');
+    return this.shapeSelfPricing(row, current.tenderer_name as string);
+  }
+
+  /**
+   * "Save as draft": the QS says this package is priced. Validates, records it as a tender
+   * return so the comparison and history see it, and stamps the hash that later edits are
+   * measured against. The BoQ stays editable; editing after this shows "changed since
+   * transfer", and calling this again re-transfers.
+   */
+  async completeSelfPricing(actor: Actor, workflowId: string, packageName: string): Promise<Row> {
+    const draft = await this.getSelfPricing(actor, workflowId, packageName);
+    const lines = (draft.lines as SelfPricingLine[]).map((l) => ({
+      ...l,
+      total: l.rate != null && l.quantity != null ? Number(l.quantity) * Number(l.rate) : null
+    }));
+    const unaddressed = lines.filter((l) => (l.isPriceable || l.added) && l.status === 'priced' && l.rate == null);
+    if (unaddressed.length > 0) {
+      throw conflict(`${unaddressed.length} priceable line(s) have no rate. Price them, or mark them included, excluded or not addressed.`);
+    }
+    const missingNote = lines.filter((l) =>
+      (l.status === 'excluded' && !l.note?.trim()) ||
+      (!l.added && l.quantity !== l.measuredQuantity && !l.remarks?.trim()));
+    if (missingNote.length > 0) {
+      throw conflict(`${missingNote.length} line(s) are excluded or have a changed quantity and need a note or remark saying why (first: line ${missingNote[0].seq}).`);
+    }
+    const tendererName = String(draft.tenderer_name);
+    const tenderedSum = lines.filter((l) => l.status === 'priced' && l.total != null)
+      .reduce((sum, l) => sum + Number(l.total), 0);
+    return this.db.transaction(async (client) => {
+      const [ret] = await this.db.query<{ id: string }>(
+        `INSERT INTO tender_returns
+           (workflow_id, package_name, subcontractor_id, tenderer_name, received_at, tendered_sum,
+            programme_weeks, qualifications, exclusions, is_fabricated, source)
+         VALUES ($1,$2,NULL,$3,NOW(),$4,$5,$6,$7,FALSE,'self_priced')
+         ON CONFLICT (workflow_id, package_name, tenderer_name) DO UPDATE
+           SET received_at = NOW(), tendered_sum = EXCLUDED.tendered_sum,
+               programme_weeks = EXCLUDED.programme_weeks, qualifications = EXCLUDED.qualifications,
+               exclusions = EXCLUDED.exclusions, source = 'self_priced'
+         RETURNING id`,
+        [workflowId, packageName, tendererName, tenderedSum, draft.programme_weeks,
+         draft.qualifications, draft.exclusions], client
+      );
+      await this.db.query(`DELETE FROM tender_return_lines WHERE return_id = $1`, [ret.id], client);
+      if (lines.length > 0) {
+        await this.db.query(
+          `INSERT INTO tender_return_lines
+             (return_id, seq, ge_code, element_code, description, quantity, unit, rate, total,
+              status, note, added_by_tenderer)
+           SELECT $1, seq, ge, el, descr, qty, unit, rate, total, status, note, added
+             FROM unnest($2::int[], $3::text[], $4::text[], $5::text[], $6::numeric[], $7::text[],
+                         $8::numeric[], $9::numeric[], $10::text[], $11::text[], $12::boolean[])
+               AS t(seq, ge, el, descr, qty, unit, rate, total, status, note, added)`,
+          [ret.id, lines.map((l) => l.seq), lines.map((l) => l.geCode),
+           lines.map((l) => l.elementCode), lines.map((l) => l.description),
+           lines.map((l) => l.quantity), lines.map((l) => l.unit),
+           lines.map((l) => l.rate), lines.map((l) => l.total),
+           lines.map((l) => l.status), lines.map((l) => l.note),
+           lines.map((l) => l.added)], client
+        );
+      }
+      const [done] = await this.db.query<Row>(
+        `UPDATE self_pricing_drafts
+            SET status = 'complete', completed_at = NOW(), tender_return_id = $3,
+                transferred_at = NOW(), transferred_hash = $4, version = version + 1
+          WHERE workflow_id = $1 AND package_name = $2 RETURNING *`,
+        [workflowId, packageName, ret.id, this.selfPricingHash(draft.lines as SelfPricingLine[])], client
+      );
+      return { ...this.shapeSelfPricing(done, tendererName), tendered_sum: tenderedSum };
+    });
+  }
+
+  /** A self-priced package is priced by the main contractor and is never issued as an ITT. */
+  private async assertNotSelfPriced(workflowId: string, packageName: string): Promise<void> {
+    const [row] = await this.db.query<{ is_self_priced: boolean }>(
+      `SELECT is_self_priced FROM shortlists WHERE workflow_id = $1 AND package_name = $2`,
+      [workflowId, packageName]
+    );
+    if (row?.is_self_priced) {
+      throw conflict('This package is self priced, so no ITT is issued for it. Use the pricing form instead.');
+    }
+  }
+
   async listItts(actor: Actor, workflowId: string): Promise<Row[]> {
     await this.assertWorkflowAccess(actor, workflowId);
     return this.db.query(
       `SELECT sl.package_name,
               sl.package_seq,
               sl.route_of_procurement,
+              sl.is_self_priced,
               sl.confirmed_at,
               count(*) FILTER (WHERE se.selected) AS recipients,
               count(*) FILTER (WHERE se.id IS NOT NULL AND se.subcontractor_id <> $2::uuid) AS candidates,
@@ -2228,7 +2547,7 @@ export class TenderPrepDatabase {
          LEFT JOIN itt_dispatch d ON d.shortlist_entry_id = se.id
          LEFT JOIN pricing_portal_links ppl ON ppl.shortlist_entry_id = se.id
         WHERE sl.workflow_id = $1
-        GROUP BY sl.package_name, sl.package_seq, sl.route_of_procurement, sl.confirmed_at
+        GROUP BY sl.package_name, sl.package_seq, sl.route_of_procurement, sl.is_self_priced, sl.confirmed_at
         ORDER BY sl.package_seq NULLS LAST, sl.package_name`,
       [workflowId, PLACEHOLDER_SUBCONTRACTOR_ID]
     );
@@ -2516,6 +2835,7 @@ export class TenderPrepDatabase {
    */
   async draftIttEmail(actor: Actor, workflowId: string, packageName: string): Promise<IttDraft> {
     await this.assertWorkflowAccess(actor, workflowId);
+    await this.assertNotSelfPriced(workflowId, packageName);
 
     const { emailPack, tenderName, completeBundleUrl, letterContext, attachments, attachmentsOmittedOversize, recipients } =
       await this.buildIttDraft(actor, workflowId, packageName);
@@ -2629,6 +2949,7 @@ export class TenderPrepDatabase {
     to: string[]; cc: string[]; subject: string;
   }): Promise<Row> {
     await this.assertWorkflowAccess(actor, workflowId);
+    await this.assertNotSelfPriced(workflowId, packageName);
     if (!this.emailService) {
       throw conflict('Email is not configured in this environment, so this ITT cannot be sent from here.');
     }
@@ -2770,6 +3091,7 @@ export class TenderPrepDatabase {
         WHERE sl.workflow_id = $1
           AND se.selected = TRUE
           AND sl.confirmed_at IS NOT NULL
+          AND NOT sl.is_self_priced
           -- The launch table injects this sentinel for packages with no supply chain. It is
           -- never selectable, so it should not reach here; excluded anyway rather than
           -- risking an email addressed to a firm that does not exist.
@@ -2951,6 +3273,7 @@ export class TenderPrepDatabase {
    */
   async confirmAndSendItt(actor: Actor, workflowId: string, packageName: string): Promise<Row> {
     await this.assertWorkflowAccess(actor, workflowId);
+    await this.assertNotSelfPriced(workflowId, packageName);
 
     const [shortlist] = await this.db.query<{ confirmed_at: string | null }>(
       `SELECT confirmed_at FROM shortlists WHERE workflow_id = $1 AND package_name = $2`,

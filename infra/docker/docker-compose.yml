@@ -3,8 +3,9 @@
 # `docker compose down -v` here would then destroy the parent's database volume.
 name: tps
 
-# PostgreSQL is owned solely by the parent platform (nrm-seed-generator). TPS shares
-# that instance and keeps its own objects in the `tps` schema. Start the parent first.
+# PostgreSQL, Redis and the `buildflow` network are owned by the shared infra stack
+# (vipvyas78/novamerx-infra, compose project `buildflow-infra`). TPS shares that instance and
+# keeps its own objects in the `tps` schema. Start the infra first (`make infra-up` there).
 services:
   migrate-tps:
     build:
@@ -34,10 +35,17 @@ services:
     # Picks up CLOUDFLARE_*/BUILDFLOW_*/DROPBOX_*/TEST_* optional integration vars from the
     # repo-root .env. `environment:` below still wins on any key collision, so the
     # container-network overrides (DATABASE_URL, etc.) are unaffected.
+    # Optional (issue #145): the local stack starts with no .env at all.
     env_file:
-      - ../../.env
+      - path: ../../.env
+        required: false
     environment:
       NODE_ENV: ${NODE_ENV:-development}
+      # Local mail goes to the parent stack's Mailpit (http://localhost:8025), so nothing
+      # reaches a real inbox and no Cloudflare token is needed. Export
+      # EMAIL_TRANSPORT=cloudflare (with the Cloudflare email keys in .env) to send for real.
+      EMAIL_TRANSPORT: ${EMAIL_TRANSPORT:-mailpit}
+      MAILPIT_URL: http://mailpit:8025
       PORT: "3200"
       DATABASE_URL: postgresql://buildflow:buildflow@postgres:5432/buildflow
       DATABASE_SCHEMA: ${DATABASE_SCHEMA:-tps}

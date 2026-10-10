@@ -7,6 +7,7 @@ import { CommsModal } from './comms';
 import { NotificationBell } from './notifications';
 import { AddendaButton } from './addendum';
 import { QuoteComparisonPanel } from './quoteComparisonPanel';
+import { Step4SelfPricing } from './selfPricing';
 
 export function ErrorMessage({ error }: { error: unknown }) {
   return error ? <p className="error">{error instanceof Error ? error.message : 'Something went wrong'}</p> : null;
@@ -15,7 +16,7 @@ export function Busy({ children = 'Loading…' }: { children?: string }) { retur
 
 // Parsed Outputs, Employer RFIs and SoA RAG live in the take-off module, not here. A
 // completed take-off launches a workflow straight onto Tender Launch Pack.
-const STEP_TITLES = ['Tender Launch Pack', 'ITT Dispatch', 'Comparative Analysis', 'Tender Submission'];
+const STEP_TITLES = ['Tender Launch Pack', 'ITT Dispatch', 'Comparative Analysis', 'Self Pricing', 'Tender Submission'];
 const FINAL_STEP = STEP_TITLES.length;
 
 // ── AppShell ───────────────────────────────────────────────────────────────
@@ -230,7 +231,8 @@ export function TenderPrepPage() {
       {currentStep === 1 && <Step1TenderLaunchPack workflowId={workflowId} />}
       {currentStep === 2 && <Step2IttDispatch workflowId={workflowId} initialThreadId={deepLinkThreadId} openRfi={openRfi} />}
       {currentStep === 3 && <QuoteComparisonPanel workflowId={workflowId} />}
-      {currentStep === 4 && <Step4Submission workflowId={workflowId} />}
+      {currentStep === 4 && <Step4SelfPricing workflowId={workflowId} />}
+      {currentStep === 5 && <Step4Submission workflowId={workflowId} />}
     </section>
   </div>;
 }
@@ -290,6 +292,8 @@ export function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowI
   const [open, setOpen] = useState(true);
   // The route is chosen the same way the subcontractors are: offered, then picked.
   const [route, setRoute] = useState(row.route_of_procurement);
+  // Self priced: the main contractor prices it, so there is nobody to invite.
+  const selfPriced = !row.is_heading && (row.self_priced_routes ?? []).includes(route);
   // How long this package is tendered for. The value is held as a STRING, because an empty
   // box is the only way to say "not decided" — and because the unit picker is never empty,
   // "a unit with no number" cannot be expressed at all, which is the pairing rule the
@@ -318,7 +322,7 @@ export function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowI
       tenderReturnPeriod: periodNumber === null ? null : { value: periodNumber, unit: periodUnit },
       // Everything shown, not just the ticks — the record has to answer "who was
       // considered", not only "who was chosen".
-      entries: row.subcontractors
+      entries: selfPriced ? [] : row.subcontractors
         .filter((s) => !s.off_register)
         .map((s, i) => ({
           subcontractorId: s.subcontractor_id,
@@ -348,9 +352,13 @@ export function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowI
   const periodInvalid = periodNumber !== null && (periodNumber < 1 || periodNumber > periodMax);
 
   const dirty = (() => {
-    const saved = new Set(row.subcontractors.filter((s) => s.selected).map((s) => s.subcontractor_id));
-    if (saved.size !== picked.size) return true;
-    for (const id of picked) if (!saved.has(id)) return true;
+    // A self-priced package invites nobody, so the server returns no firms and the ticks
+    // left in local state are not a pending edit.
+    if (!selfPriced) {
+      const saved = new Set(row.subcontractors.filter((s) => s.selected).map((s) => s.subcontractor_id));
+      if (saved.size !== picked.size) return true;
+      for (const id of picked) if (!saved.has(id)) return true;
+    }
     if (route !== row.route_of_procurement) return true;
     if (periodNumber !== (row.tender_return_period_value ?? null)) return true;
     // The unit only counts where a value exists: flipping the picker over an empty box
@@ -358,6 +366,25 @@ export function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowI
     if (periodNumber !== null && periodUnit !== (row.tender_return_period_unit ?? 'weeks')) return true;
     return notes.trim() !== (row.board_override_notes ?? '').trim();
   })();
+
+  // Confirm/Update lives outside the subcontractor table, because a self-priced package has
+  // no table and still has to be confirmed before the QS can price it.
+  const actions = <>
+    <div className="pkg-actions">
+      <input
+        className="pkg-notes"
+        value={notes}
+        onChange={(e) => setNotes(e.target.value)}
+        placeholder="Meeting notes / override reason (optional)…"
+      />
+      {!selfPriced && <span className="muted">{picked.size} selected</span>}
+      <button className="small" onClick={() => save.mutate()} disabled={!dirty || periodInvalid || save.isPending}>
+        {save.isPending ? 'Saving…' : row.confirmed_at ? 'Update' : 'Confirm'}
+      </button>
+      {row.confirmed_at && !dirty && <span className="badge badge-green">Confirmed</span>}
+    </div>
+    <ErrorMessage error={save.error} />
+  </>;
 
   return <tr className={`pkg-row ${row.is_heading ? 'pkg-heading' : ''} ${row.is_sub_package ? 'pkg-child' : ''}`}>
     <td className="pkg-seq">{row.display_ref}</td>
@@ -447,7 +474,18 @@ export function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowI
       {row.is_heading
         ? <p className="muted tiny">Tendered as its sub-packages below.</p>
         : null}
-      {row.is_heading ? null : row.subcontractors.length === 0
+      {selfPriced ? <div>
+          <p className="muted tiny">Self priced — no subcontractors are invited. The QS prices this package in-house.</p>
+          {actions}
+          <div style={{ marginTop: 6 }}>
+            {row.confirmed_at && row.is_self_priced && !dirty
+              ? <Link className="button-link" to={`/self-pricing/${workflowId}?package=${encodeURIComponent(row.package_name)}`}>
+                  Enter prices
+                </Link>
+              : <span className="muted tiny">Confirm to start pricing.</span>}
+          </div>
+        </div> : null}
+      {selfPriced || row.is_heading ? null : row.subcontractors.length === 0
         ? <p className="muted">No firms in the register match {row.trade_terms.map((t) => `“${t}”`).join(', ')}.</p>
         : open && <>
           <table className="sub-table">
@@ -489,20 +527,7 @@ export function PackageRow({ row, workflowId }: { row: LaunchTableRow; workflowI
               </tr>)}
             </tbody>
           </table>
-          <div className="pkg-actions">
-            <input
-              className="pkg-notes"
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              placeholder="Meeting notes / override reason (optional)…"
-            />
-            <span className="muted">{picked.size} selected</span>
-            <button className="small" onClick={() => save.mutate()} disabled={!dirty || periodInvalid || save.isPending}>
-              {save.isPending ? 'Saving…' : row.confirmed_at ? 'Update' : 'Confirm'}
-            </button>
-            {row.confirmed_at && !dirty && <span className="badge badge-green">Confirmed</span>}
-          </div>
-          <ErrorMessage error={save.error} />
+          {actions}
         </>}
     </td>
   </tr>;
@@ -1211,8 +1236,11 @@ function Step2IttDispatch({ workflowId, initialThreadId, openRfi }: {
             <td><strong>{r.package_name}</strong></td>
             <td className="tiny">{r.route_of_procurement ?? '—'}</td>
             <td>
-              {r.recipients}
-              {Number(r.recipients) === 0 && <div className="tiny" style={{ color: '#d97706', marginTop: 4 }}>
+              {r.is_self_priced ? <span className="badge badge-blue">Self priced</span> : r.recipients}
+              {r.is_self_priced && <div className="tiny muted" style={{ marginTop: 4 }}>
+                priced in-house — no ITT is issued
+              </div>}
+              {!r.is_self_priced && Number(r.recipients) === 0 && <div className="tiny" style={{ color: '#d97706', marginTop: 4 }}>
                 {Number(r.candidates) === 0
                   ? 'no firm in the register carries this trade — build the supply chain'
                   : 'confirmed without inviting anyone — reopen the package and pick'}
@@ -1247,8 +1275,9 @@ function Step2IttDispatch({ workflowId, initialThreadId, openRfi }: {
             <td>
               <button
                 className="small"
-                disabled={!r.confirmed_at || Number(r.recipients) === 0 || (confirm.isPending && confirm.variables === r.package_name)}
+                disabled={!r.confirmed_at || r.is_self_priced || Number(r.recipients) === 0 || (confirm.isPending && confirm.variables === r.package_name)}
                 title={!r.confirmed_at ? 'Confirm the package at Step 1 first'
+                  : r.is_self_priced ? 'Self priced — fill in the pricing form instead of issuing an ITT'
                   : Number(r.recipients) === 0 ? 'Nobody is invited to this package, so there is no ITT to send'
                   : undefined}
                 onClick={() => confirm.mutate(r.package_name)}
