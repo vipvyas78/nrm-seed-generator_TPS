@@ -270,23 +270,26 @@ stay on one origin. The pieces:
 | `.github/workflows/deploy-staging.yml` | every merge to `main` deploys to staging, **off until `STAGING_ENABLED=true`** |
 
 This repository is **public**, so no deploy runs on `pull_request` and no step prints
-configuration. Secrets come from the GitHub Environment (filled by the parent repo's
-`scripts/sync-env-secrets.sh`). The runbook is the parent repo's `docs/deployment.md`, and
-the secrets inventory is its `docs/secrets.md`.
+configuration. Secrets come from the GitHub Environment (filled by
+[novamerx-infra](https://github.com/vipvyas78/novamerx-infra)'s `scripts/sync-env-secrets.sh`).
+The runbook is novamerx-infra's `docs/deployment.md`, and the secrets inventory is its
+`docs/secrets.md`.
 
-Locally, `make local-up` in the parent repo starts TPS with everything else, offline. Mail
+Locally, `make local-up` in novamerx-infra (or in the parent repo, which delegates to it)
+starts TPS with everything else. Mail
 goes to Mailpit (`EMAIL_TRANSPORT=mailpit`, http://localhost:8025) rather than Cloudflare.
 
 ## Deploying as containers
 
-### 1. Start the parent app first
+### 1. Start the shared infrastructure first
 
 ```bash
-# In the nrm-seed-generator directory
-docker compose up -d
+# In the novamerx-infra directory (vipvyas78/novamerx-infra)
+make infra-up
 ```
 
-This creates the `buildflow` network and the shared Postgres instance that TPS depends on.
+This creates the `buildflow` network and the shared Postgres and Redis that TPS depends on.
+The parent app's own containers are not needed for TPS to start.
 
 ### 2. Configure environment variables
 
@@ -543,7 +546,7 @@ Both repos provision actors through the issuer `buildflow-dev` and upsert on `(o
 | `OIDC_AUDIENCE` | No | — | Optional: set all three or none. BuildFlow's local sessions need no OIDC (nrm-seed-generator#145) |
 | `OIDC_JWKS_URI` | No | — | Optional: set all three or none. BuildFlow's local sessions need no OIDC (nrm-seed-generator#145) |
 | `SCMS_SCHEMA` | No | `scms` | Schema owned by the SCMS module, read (never written) for Step 1 shortlist candidates. Must be a bare SQL identifier. |
-| `REDIS_URL` | Worker | — | The parent platform's Redis. Required by `worker-tps`; unused by the API and migrator. |
+| `REDIS_URL` | Worker | — | The shared Redis (novamerx-infra's `redis`, BuildFlow's queues use it too). Required by `worker-tps`; unused by the API and migrator. |
 | `EMAIL_TRANSPORT` | No | `cloudflare` | `mailpit` sends every message to the local stack's Mailpit inbox (the local compose default). Refused in production |
 | `MAILPIT_URL` | No | `http://mailpit:8025` | Mailpit's HTTP API, used only with `EMAIL_TRANSPORT=mailpit` |
 | `BULLMQ_DRAIN_DELAY_SECONDS` | No | `5` | Worker: how long an idle BullMQ worker blocks on Redis between asks. Raised in the cloud, where each ask is a billed command |
