@@ -1564,6 +1564,10 @@ export class TenderPrepDatabase {
                   m.wp_code, w.label, w.sort_order, m.wp_scope_condition
              FROM public.nrm_sub_element_work_package m
              JOIN public.work_package_config w ON w.wp_code = m.wp_code AND w.is_active
+                                              -- Priced in-house by the estimating team, never tendered
+                                              -- (BuildFlow issue #96). Manual alone cannot say so:
+                                              -- SETUP, SCAFF and GEN are Manual and ARE tendered.
+                                              AND NOT w.is_in_house
             WHERE m.wp_code IS NOT NULL
             ORDER BY m.wp_code,
                      CASE m.wp_scope_condition
@@ -2162,6 +2166,24 @@ export class TenderPrepDatabase {
   }
 
   /**
+   * A package the estimating team prices in-house is never tendered (BuildFlow issue #96,
+   * `work_package_config.is_in_house`). `buildPackagesFromTakeoff` no longer derives one, but
+   * a shortlist can already exist from before that rule — so this refuses at the three places
+   * an ITT could still leave: confirming a shortlist, confirming-and-sending, and send-all.
+   * By package NAME, because that is what `shortlists` carries (migration 016's own note).
+   */
+  private async isInHousePackage(organizationId: string, packageName: string): Promise<boolean> {
+    const rows = await this.db.query(
+      `SELECT 1 FROM package_config pc
+         JOIN public.work_package_config w ON w.wp_code = pc.wp_code
+        WHERE pc.organization_id = $1 AND pc.name = $2 AND w.is_in_house
+        LIMIT 1`,
+      [organizationId, packageName]
+    );
+    return rows.length > 0;
+  }
+
+  /**
    * Records what the tender launch meeting decided for one package.
    *
    * Every firm put in front of the meeting is stored, not just the chosen ones, with the
@@ -2182,6 +2204,9 @@ export class TenderPrepDatabase {
     }>;
   }): Promise<Row> {
     await this.assertWorkflowAccess(actor, workflowId);
+    if (await this.isInHousePackage(actor.organizationId, input.packageName)) {
+      throw conflict(`${input.packageName} is priced in-house by the estimating team and is not tendered.`);
+    }
     // The flag is read off the route option NOW and stored on the shortlist, so renaming or
     // retiring the route later cannot change what this tender decided.
     const selfPriced = input.routeOfProcurement
@@ -2547,9 +2572,13 @@ export class TenderPrepDatabase {
          LEFT JOIN itt_dispatch d ON d.shortlist_entry_id = se.id
          LEFT JOIN pricing_portal_links ppl ON ppl.shortlist_entry_id = se.id
         WHERE sl.workflow_id = $1
+          -- Never tendered, so never listed for dispatch (BuildFlow issue #96).
+          AND NOT EXISTS (SELECT 1 FROM package_config pc
+                            JOIN public.work_package_config w ON w.wp_code = pc.wp_code
+                           WHERE pc.organization_id = $3 AND pc.name = sl.package_name AND w.is_in_house)
         GROUP BY sl.package_name, sl.package_seq, sl.route_of_procurement, sl.is_self_priced, sl.confirmed_at
         ORDER BY sl.package_seq NULLS LAST, sl.package_name`,
-      [workflowId, PLACEHOLDER_SUBCONTRACTOR_ID]
+      [workflowId, PLACEHOLDER_SUBCONTRACTOR_ID, actor.organizationId]
     );
   }
 
@@ -3096,8 +3125,13 @@ export class TenderPrepDatabase {
           -- never selectable, so it should not reach here; excluded anyway rather than
           -- risking an email addressed to a firm that does not exist.
           AND se.subcontractor_id <> $2
+          -- An in-house package is never tendered; a shortlist left over from before that
+          -- rule must not send (BuildFlow issue #96).
+          AND NOT EXISTS (SELECT 1 FROM package_config pc
+                            JOIN public.work_package_config w ON w.wp_code = pc.wp_code
+                           WHERE pc.organization_id = $3 AND pc.name = sl.package_name AND w.is_in_house)
         ORDER BY se.subcontractor_id, sl.package_seq NULLS LAST, sl.package_name`,
-      [workflowId, PLACEHOLDER_SUBCONTRACTOR_ID]
+      [workflowId, PLACEHOLDER_SUBCONTRACTOR_ID, actor.organizationId]
     );
 
     if (entries.length === 0) {
@@ -3273,6 +3307,9 @@ export class TenderPrepDatabase {
    */
   async confirmAndSendItt(actor: Actor, workflowId: string, packageName: string): Promise<Row> {
     await this.assertWorkflowAccess(actor, workflowId);
+    if (await this.isInHousePackage(actor.organizationId, packageName)) {
+      throw conflict(`${packageName} is priced in-house by the estimating team and is not tendered.`);
+    }
     await this.assertNotSelfPriced(workflowId, packageName);
 
     const [shortlist] = await this.db.query<{ confirmed_at: string | null }>(

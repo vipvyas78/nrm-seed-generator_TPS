@@ -471,6 +471,17 @@ package for — 196 of Reading's 525 — and for items naming a code
 075). The two never overlap and every line carries `attributed_by`, so a thin bill and a
 take-off that resolved nothing cannot be mistaken for each other.
 
+### In-house packages are never tendered
+
+`WP-PRELIM-STAFF`, `-INSURANCES`, `-PLANT` and `-RUNNING` are priced by the estimating team
+from a predefined bill (BuildFlow issue #96), so `public.work_package_config.is_in_house`
+(the parent's migration 100) keeps them out of the tender. `buildPackagesFromTakeoff` joins
+`AND NOT w.is_in_house`, which is what `wp_scope_condition = 'Manual'` could not do — SETUP,
+SCAFF and GEN are `Manual` and are tendered. A shortlist created before that rule is still
+guarded by package name: `savePackageSelection` and `confirmAndSendItt` refuse it,
+`sendIttsForWorkflow` skips it and `listItts` omits it. The parent's migration must be applied
+first, since this reads a column it adds.
+
 ---
 
 ## Wiring the TPS frontend into the parent app
